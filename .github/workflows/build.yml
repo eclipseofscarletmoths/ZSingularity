@@ -1,0 +1,81 @@
+name: Build Tweak
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "**.m"
+      - "**.h"
+      - ".github/workflows/build.yml"
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-26
+    permissions: 
+      contents: write
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app
+
+      - name: Resolve iOS SDK path
+        id: sdk
+        run: echo "path=$(xcrun --sdk iphoneos --show-sdk-path)" >> "$GITHUB_OUTPUT"
+
+      # All four .m files compile as one dylib in a single clang
+      # invocation - small enough project that per-file .o caching
+      # isn't worth the extra steps. Headers (FPS120LinkWatcher.h,
+      # IL2CppBridge.h, DebugConsole.h) don't need separate
+      # compilation; they're pulled in via #import.
+      #
+      # -fobjc-arc is required: FPS120LinkWatcher.h and the other
+      # files use ARC-style `strong`/`assign` property attributes.
+      #
+      # Adjust -miphoneos-version-min if your deployment target
+      # differs - 15.0 covers all ProMotion (120Hz-capable) devices.
+      - name: Compile tweak dylib
+        run: |
+          clang \
+            -dynamiclib \
+            -fobjc-arc \
+            -fmodules \
+            -isysroot "${{ steps.sdk.outputs.path }}" \
+            -arch arm64 \
+            -miphoneos-version-min=15.0 \
+            -framework Foundation \
+            -framework UIKit \
+            -framework QuartzCore \
+            -framework CoreText \
+            -framework UniformTypeIdentifiers \
+            -install_name "@rpath/ZSingularity.dylib" \
+            fps120.m \
+            IL2CppBridge.m \
+            GraphicsDebugOverlay.m \
+            GDScripts.m \
+            ZSyslogController.m \
+            BankTransplant.m \
+            -lc++ \
+            -o ZSingularity.dylib
+
+      # Ad-hoc sign so the dylib is well-formed on its own; patch-ipa.yml
+      # presumably re-signs/embeds it into the app bundle's signature
+      # anyway when it injects into the executable via insert_dylib.
+      - name: Ad-hoc codesign
+        run: codesign -f -s - ZSingularity.dylib
+
+      - name: Verify architecture
+        run: lipo -info ZSingularity.dylib
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: ZSingularity.dylib
+          tag_name: build-${{ github.run_number }}
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
