@@ -1,4 +1,5 @@
 #import "PatchManifestNetworkPOC.h"
+#import "ZTweakLog.h"
 
 #import <objc/runtime.h>
 
@@ -40,7 +41,7 @@ static BOOL PMIsTargetTask(NSURLSessionDataTask *task) {
     // least once. If this never prints anything, the hook itself isn't
     // firing (see the +install log line) - that's a different problem
     // than the URL not matching, and worth ruling out first.
-    NSLog(@"[PatchManifestNetworkPOC] observed request host=%@ path=%@ match=%@",
+    ZLog(@"[PatchManifestNetworkPOC] observed request host=%@ path=%@ match=%@",
           host, path, match ? @"YES" : @"NO");
 
     return match;
@@ -56,20 +57,20 @@ static NSData *PMPatchManifestData(NSData *input) {
                                                options:NSJSONReadingMutableContainers
                                                  error:&jsonError];
     if (![root isKindOfClass:[NSMutableDictionary class]]) {
-        NSLog(@"[PatchManifestNetworkPOC] target response wasn't JSON: %@", jsonError);
+        ZLog(@"[PatchManifestNetworkPOC] target response wasn't JSON: %@", jsonError);
         return input;
     }
 
     NSMutableDictionary *manifest = (NSMutableDictionary *)root;
     NSMutableDictionary *files = manifest[@"Files"];
     if (![files isKindOfClass:[NSMutableDictionary class]]) {
-        NSLog(@"[PatchManifestNetworkPOC] manifest has no Files dictionary");
+        ZLog(@"[PatchManifestNetworkPOC] manifest has no Files dictionary");
         return input;
     }
 
     NSMutableDictionary *entry = files[kTargetBank];
     if (![entry isKindOfClass:[NSMutableDictionary class]]) {
-        NSLog(@"[PatchManifestNetworkPOC] target bank entry not found");
+        ZLog(@"[PatchManifestNetworkPOC] target bank entry not found");
         return input;
     }
 
@@ -91,11 +92,11 @@ static NSData *PMPatchManifestData(NSData *input) {
                                                        options:0
                                                          error:&encodeError];
     if (!output) {
-        NSLog(@"[PatchManifestNetworkPOC] JSON serialization failed: %@", encodeError);
+        ZLog(@"[PatchManifestNetworkPOC] JSON serialization failed: %@", encodeError);
         return input;
     }
 
-    NSLog(@"[PatchManifestNetworkPOC] patched %@: Hash %@ -> %@, Size %llu -> %lu",
+    ZLog(@"[PatchManifestNetworkPOC] patched %@: Hash %@ -> %@, Size %llu -> %lu",
           kTargetBank,
           oldHash,
           kDesiredMD5,
@@ -167,7 +168,7 @@ static void PMDidComplete(id self,
             (NSURLSessionDataTask *)task,
             patched);
     } else if (buffer.length > kMaxManifestBytes) {
-        NSLog(@"[PatchManifestNetworkPOC] response exceeded %lu-byte safety cap; forwarding nothing",
+        ZLog(@"[PatchManifestNetworkPOC] response exceeded %lu-byte safety cap; forwarding nothing",
               (unsigned long)kMaxManifestBytes);
     }
 
@@ -217,7 +218,7 @@ static NSArray<NSString *> *PMFindCandidateDelegateClassNames(void) {
         gDelegateClass = NSClassFromString(@"UnityWebRequestDelegate");
         if (!gDelegateClass) {
             NSArray<NSString *> *candidates = PMFindCandidateDelegateClassNames();
-            NSLog(@"[PatchManifestNetworkPOC] UnityWebRequestDelegate class not found. "
+            ZLog(@"[PatchManifestNetworkPOC] UnityWebRequestDelegate class not found. "
                   @"Classes implementing both NSURLSessionDataDelegate methods we need: %@. "
                   @"If this list is non-empty, set gDelegateClass to the right one of these "
                   @"(usually the Unity/UnityEngine-prefixed one) and rerun. If it's empty, "
@@ -233,7 +234,7 @@ static NSArray<NSString *> *PMFindCandidateDelegateClassNames(void) {
         Method didReceiveMethod = class_getInstanceMethod(gDelegateClass, didReceiveSEL);
         Method didCompleteMethod = class_getInstanceMethod(gDelegateClass, didCompleteSEL);
         if (!didReceiveMethod || !didCompleteMethod) {
-            NSLog(@"[PatchManifestNetworkPOC] required NSURLSession delegate methods not found on %@",
+            ZLog(@"[PatchManifestNetworkPOC] required NSURLSession delegate methods not found on %@",
                   NSStringFromClass(gDelegateClass));
             return;
         }
@@ -248,7 +249,7 @@ static NSArray<NSString *> *PMFindCandidateDelegateClassNames(void) {
         method_setImplementation(didCompleteMethod, (IMP)PMDidComplete);
         gInstalled = YES;
 
-        NSLog(@"[PatchManifestNetworkPOC] installed on %@", NSStringFromClass(gDelegateClass));
+        ZLog(@"[PatchManifestNetworkPOC] installed on %@", NSStringFromClass(gDelegateClass));
     }
 }
 
@@ -276,7 +277,7 @@ static NSArray<NSString *> *PMFindCandidateDelegateClassNames(void) {
         gOrigDidComplete = NULL;
         gInstalled = NO;
 
-        NSLog(@"[PatchManifestNetworkPOC] uninstalled");
+        ZLog(@"[PatchManifestNetworkPOC] uninstalled");
     }
 }
 
@@ -291,5 +292,21 @@ static NSArray<NSString *> *PMFindCandidateDelegateClassNames(void) {
 // startup poll) is safe and keeps this POC self-contained.
 __attribute__((constructor))
 static void PMNetworkPOCConstructor(void) {
+    // This line is the decisive signal. It fires the instant this
+    // translation unit's constructor runs, before any class lookup,
+    // any swizzling, or any request has to occur - so if this never
+    // shows up in the Verbose syslog filter, the problem is upstream
+    // of everything else in this file (dylib not injected/loaded, this
+    // .m not linked into the built dylib, etc). If this DOES show up
+    // but "installed on ..." (see +install below) never follows, the
+    // problem is narrowed to delegate-class resolution. If "installed
+    // on ..." shows up but "observed request host=..." never follows,
+    // the problem is narrowed further still (see PMIsTargetTask) - most
+    // likely that the matched class's didReceiveData/didCompleteWithError
+    // methods are simply never invoked for this task (e.g. the task was
+    // started with a completion-handler API, which bypasses session
+    // delegate callbacks entirely regardless of which class implements
+    // them - see the README note added alongside this build).
+    ZLog(@"[PatchManifestNetworkPOC] constructor fired - dylib loaded and this file is running");
     [PatchManifestNetworkPOC install];
 }
