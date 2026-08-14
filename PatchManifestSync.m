@@ -1,138 +1,171 @@
-// PatchManifestSync.m — see PatchManifestSync.h for the why.
+// PatchManifestSync.m
 
 #import "PatchManifestSync.h"
-#import "IL2CppBridge.h"
+#import <dispatch/dispatch.h>
 #import "ZTweakLog.h"
 
 NSString * const PatchManifestSyncErrorDomain = @"PatchManifestSyncErrorDomain";
 
-// Cached across calls, same reasoning as GDScripts.m's g_classCache/
-// g_methodCache: class/method lookups are stable for the process
-// lifetime once resolved, and this can plausibly be called more than
-// once per session (a swap, then later a restore).
-static void *g_configClass;
-static void *g_infoManagerClass;
-static const void *g_configGetInstance;
-static const void *g_configGetEncryptKey;
-static const void *g_configGetEncryptIV;
-static const void *g_generatePatchInfoFileFmod;
+static NSString * const kTargetFMODPath = @"Assets/Sound/FMODBuilds/Mobile/BGM_Default_S7_3.assets.bank";
+static NSString * const kPatchedMD5 = @"fbe98ef9f57aff80c58ada46c4f8af92";
+static const unsigned long long kPatchedSize = 57408616ULL;
+static NSTimeInterval const kPollInterval = 0.10;
+static dispatch_once_t g_trackerOnce;
 
-static NSError *PMSError(PatchManifestSyncErrorCode code, NSString *message) {
-    return [NSError errorWithDomain:PatchManifestSyncErrorDomain
-                                code:code
-                            userInfo:@{NSLocalizedDescriptionKey: message}];
+static NSString *PMSManifestRoot(void) {
+    NSString *library = NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES).firstObject;
+    if (library.length == 0) return nil;
+    return [library stringByAppendingPathComponent:@"Caches/com.ProjectMoon.LimbusCompany/fsCachedData"];
+}
+
+static BOOL PMSLooksLikeFMODManifest(NSDictionary *json) {
+    if (![json isKindOfClass:[NSDictionary class]]) return NO;
+    if (![json[@"Version"] isKindOfClass:[NSString class]]) return NO;
+    if (![json[@"Files"] isKindOfClass:[NSDictionary class]]) return NO;
+    NSDictionary *files = json[@"Files"];
+    return [files[kTargetFMODPath] isKindOfClass:[NSDictionary class]];
+}
+
+static NSArray<NSString *> *PMSCandidateFiles(NSString *root) {
+    NSDirectoryEnumerator *enumerator = [[NSFileManager defaultManager] enumeratorAtPath:root];
+    if (!enumerator) return @[];
+
+    NSMutableArray<NSString *> *out = [NSMutableArray array];
+    NSString *relative = nil;
+    while ((relative = enumerator.nextObject)) {
+        NSString *full = [root stringByAppendingPathComponent:relative];
+        BOOL isDir = NO;
+        if (![[NSFileManager defaultManager] fileExistsAtPath:full isDirectory:&isDir] || isDir) continue;
+
+        NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:full error:NULL];
+        unsigned long long size = [attrs fileSize];
+        // The real manifest in the supplied cache is ~355 KB. Keep a wide
+        // bound so this still catches an updated manifest without blindly
+        // loading arbitrary multi-megabyte cache blobs.
+        if (size == 0 || size > 2 * 1024 * 1024) continue;
+        [out addObject:full];
+    }
+    return out;
+}
+
+static BOOL PMSPatchManifestFile(NSString *path) {
+    NSData *data = [NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:NULL];
+    if (!data || data.length == 0) return NO;
+
+    NSError *jsonError = nil;
+    id obj = [NSJSONSerialization JSONObjectWithData:data options:NSJSONReadingMutableContainers error:&jsonError];
+    if (!PMSLooksLikeFMODManifest(obj)) return NO;
+
+    NSMutableDictionary *root = (NSMutableDictionary *)obj;
+    NSMutableDictionary *files = [root[@"Files"] mutableCopy];
+    NSMutableDictionary *entry = [files[kTargetFMODPath] mutableCopy];
+    if (!entry) return NO;
+
+    NSString *oldHash = [entry[@"Hash"] isKindOfClass:[NSString class]] ? entry[@"Hash"] : nil;
+    NSNumber *oldSize = [entry[@"Size"] isKindOfClass:[NSNumber class]] ? entry[@"Size"] : nil;
+
+    if ([oldHash isEqualToString:kPatchedMD5] && oldSize.unsignedLongLongValue == kPatchedSize) {
+        return NO;
+    }
+
+    entry[@"Hash"] = kPatchedMD5;
+    entry[@"Size"] = @(kPatchedSize);
+    files[kTargetFMODPath] = entry;
+    root[@"Files"] = files;
+
+    // Preserve the game's normal JSON semantics rather than attempting to
+    // hand-edit the bytes. The cache entry is plain UTF-8 JSON in the supplied
+    // cache, and NSJSONSerialization keeps this robust across key ordering.
+    NSError *writeError = nil;
+    NSData *patched = [NSJSONSerialization dataWithJSONObject:root options:0 error:&writeError];
+    if (!patched) {
+        ZLog(@"[PatchManifestSync] JSON serialization failed for %@: %@", path, writeError);
+        return NO;
+    }
+
+    // Atomic replacement: write a sibling temp file, preserve the existing
+    // file attributes where possible, then replace the original.
+    NSString *tmp = [path stringByAppendingFormat:@".zsingularity.%@.tmp", NSUUID.UUID.UUIDString];
+    if (![patched writeToFile:tmp options:NSDataWritingAtomic error:&writeError]) {
+        ZLog(@"[PatchManifestSync] failed writing temporary manifest %@: %@", tmp, writeError);
+        return NO;
+    }
+
+    NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:NULL];
+    if (attrs) {
+        [[NSFileManager defaultManager] setAttributes:@{
+            NSFileProtectionKey: attrs[NSFileProtectionKey] ?: NSFileProtectionNone,
+            NSFilePosixPermissions: attrs[NSFilePosixPermissions] ?: @0644
+        } ofItemAtPath:tmp error:NULL];
+    }
+
+    BOOL ok = [[NSFileManager defaultManager] replaceItemAtURL:[NSURL fileURLWithPath:path]
+                                                 withItemAtURL:[NSURL fileURLWithPath:tmp]
+                                                backupItemName:nil
+                                                       options:NSFileManagerItemReplacementUsingNewMetadataOnly
+                                              resultingItemURL:NULL
+                                                         error:&writeError];
+    if (!ok) {
+        // ReplaceItem can fail on some cache implementations; fall back to a
+        // direct move only if the original has disappeared between reads.
+        [[NSFileManager defaultManager] removeItemAtPath:tmp error:NULL];
+        ZLog(@"[PatchManifestSync] atomic replacement failed for %@: %@", path, writeError);
+        return NO;
+    }
+
+    ZLog(@"[PatchManifestSync] patched fresh FMOD manifest %@: %@ / %llu -> %@ / %llu",
+         path,
+         oldHash ?: @"<missing>",
+         oldSize.unsignedLongLongValue,
+         kPatchedMD5,
+         kPatchedSize);
+    return YES;
+}
+
+static void PMSScanOnce(void) {
+    NSString *root = PMSManifestRoot();
+    if (root.length == 0) return;
+
+    BOOL isDir = NO;
+    if (![[NSFileManager defaultManager] fileExistsAtPath:root isDirectory:&isDir] || !isDir) return;
+
+    NSArray<NSString *> *candidates = PMSCandidateFiles(root);
+    for (NSString *path in candidates) {
+        @autoreleasepool {
+            (void)PMSPatchManifestFile(path);
+        }
+    }
 }
 
 @implementation PatchManifestSync
 
-+ (BOOL)resyncFmodPatchManifestWithError:(NSError **)error {
-    if (![IL2CppBridge resolveSymbols]) {
-        if (error) *error = PMSError(PatchManifestSyncErrorBridgeUnavailable,
-            @"IL2CppBridge couldn't resolve libil2cpp symbols - can't reach TextAssetPatch at all on this build.");
-        return NO;
-    }
++ (void)startManifestTracker {
+    dispatch_once(&g_trackerOnce, ^{
+        ZLog(@"[PatchManifestSync] starting FMOD manifest tracker");
 
-    // --- Resolve classes (cached) ---
-    if (!g_configClass) {
-        g_configClass = [IL2CppBridge classNamed:"TextAssetPatchConfig"
-                                       inNamespace:"TextAssetPatch"
-                                  assemblyContains:"Assembly-CSharp"];
-    }
-    if (!g_infoManagerClass) {
-        g_infoManagerClass = [IL2CppBridge classNamed:"TextAssetPatchInfoManager"
-                                            inNamespace:"TextAssetPatch"
-                                       assemblyContains:"Assembly-CSharp"];
-    }
-    if (!g_configClass || !g_infoManagerClass) {
-        if (error) *error = PMSError(PatchManifestSyncErrorClassNotFound,
-            @"TextAssetPatch.TextAssetPatchConfig or TextAssetPatchInfoManager wasn't found in Assembly-CSharp. "
-             "Either this game version renamed/moved them, or this build doesn't ship this slice of TextAssetPatch "
-             "- check ZLog Verbose output; IL2CppBridge logs symbol-resolution failures separately from this.");
-        return NO;
-    }
+        dispatch_queue_t queue = dispatch_get_global_queue(QOS_CLASS_UTILITY, 0);
+        dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue);
+        if (!timer) {
+            ZLog(@"[PatchManifestSync] failed to create tracker timer");
+            return;
+        }
 
-    // --- Resolve methods (cached) ---
-    if (!g_configGetInstance) {
-        g_configGetInstance = [IL2CppBridge methodOnClass:g_configClass name:"get_Instance" argCount:0];
-    }
-    if (!g_configGetEncryptKey) {
-        g_configGetEncryptKey = [IL2CppBridge methodOnClass:g_configClass name:"get_EncryptKey" argCount:0];
-    }
-    if (!g_configGetEncryptIV) {
-        g_configGetEncryptIV = [IL2CppBridge methodOnClass:g_configClass name:"get_EncryptIV" argCount:0];
-    }
-    if (!g_generatePatchInfoFileFmod) {
-        g_generatePatchInfoFileFmod = [IL2CppBridge methodOnClass:g_infoManagerClass
-                                                               name:"GeneratePatchInfoFileFmod"
-                                                           argCount:2];
-    }
-    if (!g_configGetInstance || !g_configGetEncryptKey || !g_configGetEncryptIV || !g_generatePatchInfoFileFmod) {
-        if (error) *error = PMSError(PatchManifestSyncErrorMethodNotFound,
-            @"One of get_Instance/get_EncryptKey/get_EncryptIV/GeneratePatchInfoFileFmod wasn't found by name+argcount "
-             "on an otherwise-resolved class. A game update likely changed a signature this relies on.");
-        return NO;
-    }
+        uint64_t interval = (uint64_t)(kPollInterval * (double)NSEC_PER_SEC);
+        dispatch_source_set_timer(timer,
+                                  dispatch_time(DISPATCH_TIME_NOW, 0),
+                                  interval,
+                                  20 * NSEC_PER_MSEC);
+        dispatch_source_set_event_handler(timer, ^{
+            PMSScanOnce();
+        });
+        dispatch_source_set_cancel_handler(timer, ^{});
+        dispatch_resume(timer);
 
-    // --- TextAssetPatchConfig.Instance ---
-    void *exc = NULL;
-    void *configInstance = [IL2CppBridge invokeMethod:g_configGetInstance onInstance:NULL args:NULL outException:&exc];
-    if (exc || !configInstance) {
-        if (error) *error = PMSError(PatchManifestSyncErrorConfigInstanceUnavailable,
-            @"TextAssetPatchConfig.Instance returned null. Likely called before TextAssetPatch's own boot-time init "
-             "ran - retry once the game is actually at the main menu (BankTransplant's Mods-panel entry point "
-             "already implies this in practice, since the panel isn't reachable any earlier).");
-        return NO;
-    }
-
-    // --- EncryptKey / EncryptIV ---
-    // These come back as live IL2CPP System.String* objects. They're
-    // passed straight back into GeneratePatchInfoFileFmod below as-is -
-    // no need to round-trip through NSString, which also sidesteps
-    // needing an NSString->IL2CPP-String conversion helper that
-    // IL2CppBridge doesn't currently expose (only the reverse exists).
-    void *encryptKeyStr = [IL2CppBridge invokeMethod:g_configGetEncryptKey onInstance:configInstance args:NULL outException:&exc];
-    if (exc) {
-        if (error) *error = PMSError(PatchManifestSyncErrorKeyOrIVUnavailable, @"TextAssetPatchConfig.EncryptKey getter threw.");
-        return NO;
-    }
-    void *encryptIVStr = [IL2CppBridge invokeMethod:g_configGetEncryptIV onInstance:configInstance args:NULL outException:&exc];
-    if (exc) {
-        if (error) *error = PMSError(PatchManifestSyncErrorKeyOrIVUnavailable, @"TextAssetPatchConfig.EncryptIV getter threw.");
-        return NO;
-    }
-    if (!encryptKeyStr || !encryptIVStr) {
-        if (error) *error = PMSError(PatchManifestSyncErrorKeyOrIVUnavailable,
-            @"TextAssetPatchConfig.EncryptKey/EncryptIV read back null - config instance exists but isn't fully populated yet.");
-        return NO;
-    }
-
-    // --- GeneratePatchInfoFileFmod(encryptKey, encryptIV) ---
-    // Static method - onInstance:NULL. Per IL2CppBridge.h's args
-    // convention, reference-type params go into the args slot as the
-    // object pointer itself (see GDScripts.m's GetComponent(Type) call
-    // for the same pattern with a Type object), not a pointer-to-pointer.
-    //
-    // UNVERIFIED (see PatchManifestSync.h's header comment in full):
-    // this is presumed to be a build-time tool method never previously
-    // exercised at runtime in a live player. exc being set here is the
-    // expected failure signature if that presumption is wrong and it
-    // has an editor-only dependency - IL2CppBridge already ZLogs the
-    // exception itself (see invokeMethod:onInstance:args:outException:),
-    // so nothing extra is logged here beyond this call's own outcome.
-    void *args[2] = { encryptKeyStr, encryptIVStr };
-    [IL2CppBridge invokeMethod:g_generatePatchInfoFileFmod onInstance:NULL args:args outException:&exc];
-    if (exc) {
-        if (error) *error = PMSError(PatchManifestSyncErrorGenerateCallFailed,
-            @"TextAssetPatchInfoManager.GeneratePatchInfoFileFmod threw an IL2CPP exception. Check ZLog Verbose "
-             "output for IL2CppBridge's own exception log line. If this is consistently reproducible, this method "
-             "likely isn't safely callable outside the Unity Editor on this game version, and this whole approach "
-             "needs to fall back to something else (see PatchManifestSync.h's header notes on the alternatives this "
-             "was chosen over).");
-        return NO;
-    }
-
-    ZLog(@"[PatchManifestSync] resynced local FMOD patch manifest against current on-disk state");
-    return YES;
+        // Keep the source retained for the life of the process via a static.
+        // The dispatch source itself is intentionally never cancelled.
+        static dispatch_source_t s_timer;
+        s_timer = timer;
+    });
 }
 
 @end
