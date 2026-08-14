@@ -9,6 +9,9 @@
 
 static const NSUInteger kMaxManifestBytes = 32ULL * 1024ULL * 1024ULL;
 
+static NSString *const kTargetHostSuffix = @"limbus-company.com";
+static NSString *const kTargetPathSuffix = @"/manifest";
+
 static IMP gOrigDidReceiveData;
 static IMP gOrigDidComplete;
 static Class gDelegateClass;
