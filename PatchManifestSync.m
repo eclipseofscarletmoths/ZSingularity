@@ -51,8 +51,9 @@ static BOOL PMIsRegularFile(NSString *path, NSDictionary<NSFileAttributeKey, id>
     }
 
     NSNumber *type = attrs[NSFileType];
+    NSNumber *fileSize = attrs[NSFileSize];
     return [type isEqual:NSFileTypeRegular] &&
-           (attrs[NSFileSize].unsignedLongLongValue <= (32ULL * 1024ULL * 1024ULL));
+           (fileSize.unsignedLongLongValue <= (32ULL * 1024ULL * 1024ULL));
 }
 
 static NSDictionary *PMReadJSONFile(NSString *path) {
