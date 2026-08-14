@@ -1,4 +1,4 @@
-#import "PatchManifestNetworkPOC.h"
+#import "PatchManifestSync.h"
 
 #import <objc/runtime.h>
 
