@@ -9,8 +9,11 @@
 
 static const NSUInteger kMaxManifestBytes = 32ULL * 1024ULL * 1024ULL;
 
-static NSString *const kTargetHostSuffix = @"limbus-company.com";
-static NSString *const kTargetPathSuffix = @"/manifest";
+// Keep the network interception scoped to the game's manifest endpoint.
+// Once that manifest is intercepted, every entry in its Files dictionary is
+// rewritten; there is deliberately no per-file/bank matching anymore.
+static NSString * const kTargetHostSuffix = @"limbuscompanycdn.org";
+static NSString * const kTargetPathSuffix = @"FmodPatchInfo.json";
 
 static IMP gOrigDidReceiveData;
 static IMP gOrigDidComplete;
