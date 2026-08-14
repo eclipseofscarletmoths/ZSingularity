@@ -5,7 +5,7 @@
 
 @interface VorbisSetupTable ()
 @property (nonatomic, strong) NSData *backingData;
-@property (nonatomic, assign) NSMapTable<NSNumber *, NSValue *> *offsets; // crc32 -> {offset, length} packed in an NSValue(NSRange)
+@property (nonatomic, strong) NSMapTable<NSNumber *, NSValue *> *offsets; // crc32 -> {offset, length} packed in an NSValue(NSRange)
 @end
 
 @implementation VorbisSetupTable
