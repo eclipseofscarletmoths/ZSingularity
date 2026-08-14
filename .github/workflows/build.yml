@@ -58,6 +58,11 @@ jobs:
             GDScripts.m \
             ZSyslogController.m \
             BankTransplant.m \
+            FADPCMCodec.m \
+            FSB5HeaderRebuild.m \
+            FSB5SampleHeaderIO.m \
+            FSB5VorbisExtract.m \
+            VorbisSetupTable.m \
             -lc++ \
             -o ZSingularity.dylib
 
