@@ -311,7 +311,7 @@ static int bt_reencode_bank(const char *original_path, const char *modded_path, 
     }
 
 #ifndef BT_HAVE_LIBVORBIS
-    *outCode = BankTransplantErrorVorbisDecodeFailed; // no libvorbis linked - see this file's build note
+    *outCode = BankTransplantErrorVorbisNotLinked; // <vorbis/codec.h> not found - this is a build-config problem, not a bad sample
     goto done;
 #else
     decoded_pcm    = (int16_t **)calloc(modded_count, sizeof(int16_t *));
@@ -575,10 +575,12 @@ static NSString * const kBTVorbisSetupResourceName = @"FSB5VorbisSetupTable.bin"
             return @"Refused to re-encode: the two banks' FSB5 sample name tables don't match, so they're not the same bank/build.";
         case BankTransplantErrorModdedNotVorbis:
             return @"The picked bank's samples aren't Vorbis-coded - nothing to re-encode.";
+        case BankTransplantErrorVorbisNotLinked:
+            return @"This build has no Vorbis decoder linked in at all (<vorbis/codec.h> wasn't found at compile time) - check that build.yml's -I/-L flags for vendor/ogg and vendor/vorbis-src actually ran before this compile step, and that libogg.a/libvorbis.a built successfully.";
         case BankTransplantErrorVorbisSetupUnknown:
             return @"A sample's Vorbis setup data isn't in the bundled preset table, so it can't be decoded. See VorbisSetupTable.h.";
         case BankTransplantErrorVorbisDecodeFailed:
-            return @"libvorbis failed to decode a sample - or isn't linked into this build at all. See BankTransplant.m's build note.";
+            return @"libvorbis is linked and ran, but rejected this sample's packet stream - a real decode failure (bad packet framing, wrong setup packet for this crc32, or similar), not a build/link problem.";
         case BankTransplantErrorBackupFailed:
             return @"Couldn't create a backup of the stock bank before touching it.";
         case BankTransplantErrorWriteFailed:
