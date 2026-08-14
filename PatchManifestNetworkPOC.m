@@ -41,7 +41,7 @@ static BOOL PMIsTargetTask(NSURLSessionDataTask *task) {
     // least once. If this never prints anything, the hook itself isn't
     // firing (see the +install log line) - that's a different problem
     // than the URL not matching, and worth ruling out first.
-    ZLog(@"[PatchManifestNetworkPOC] observed request host=%@ path=%@ match=%@",
+    NSLog(@"[PatchManifestNetworkPOC] observed request host=%@ path=%@ match=%@",
           host, path, match ? @"YES" : @"NO");
 
     return match;
