@@ -5,6 +5,7 @@
 #import <UIKit/UIKit.h>
 #import <AudioToolbox/AudioToolbox.h>
 #import <mach-o/dyld.h>
+#import <pthread.h>
 
 // NOTE: this used to be compared against url.host, which only ever
 // contains the bare hostname (e.g. "downloadfmod.limbuscompanycdn.org").
@@ -343,19 +344,49 @@ static void PMNetworkPOCConstructor(void) {
     });
 }
 
-static void PMTryInstallIfNeeded(void) {
-    @synchronized ([PatchManifestNetworkPOC class]) {
-        if (gInstalled) return;
-    }
-    [PatchManifestNetworkPOC install];
-}
+// Replaces the old _dyld_register_func_for_add_image approach, which
+// called +install (and therefore PMFindCandidateDelegateClassNames's
+// full objc_getClassList scan) once per loaded Mach-O image - often
+// 100-300+ times during a normal launch, each rescanning every
+// currently-loaded ObjC class. That's O(images x classes) run inline
+// on dyld's own loading path, which is what produced the ~20s black
+// screen / watchdog kill with no .ips: startup never got a chance to
+// finish before the OS gave up on it.
+//
+// Same fix pattern as fps120.m's background_worker: a detached pthread
+// doing a cheap, cheap-per-iteration poll with a real sleep between
+// attempts. NSClassFromString is a symbol-table lookup, not a scan, so
+// polling it every 200ms is negligible. The expensive diagnostic scan
+// only ever runs once, and only if the class still hasn't shown up
+// after a real timeout - at that point something IS actually wrong
+// and the candidate dump is worth its cost.
+static const int kPMPollIntervalUsec = 200 * 1000;
+static const int kPMMaxPollAttempts = 150; // ~30s
 
-static void PMImageAddedCallback(const struct mach_header *mh, intptr_t vmaddr_slide) {
-    PMTryInstallIfNeeded();
+static void *PMBackgroundWorker(void *arg) {
+    (void)arg;
+
+    for (int attempt = 0; attempt < kPMMaxPollAttempts; attempt++) {
+        if (NSClassFromString(@"UnityWebRequestDelegate")) {
+            [PatchManifestNetworkPOC install];
+            return NULL;
+        }
+        usleep(kPMPollIntervalUsec);
+    }
+
+    // Timed out for real (not just "hasn't loaded yet") - now it's
+    // worth paying for the diagnostic scan, once, to see what actually
+    // exists.
+    ZLog(@"[PatchManifestNetworkPOC] UnityWebRequestDelegate never appeared after %ds of polling; "
+          @"running one-shot diagnostic scan", (kPMMaxPollAttempts * kPMPollIntervalUsec) / 1000000);
+    [PatchManifestNetworkPOC install];
+    return NULL;
 }
 
 __attribute__((constructor))
 static void PMNetworkPOCConstructor2(void) {
-    NSLog(@"[PatchManifestNetworkPOC] constructor fired");
-    _dyld_register_func_for_add_image(PMImageAddedCallback);
+    NSLog(@"[PatchManifestNetworkPOC] constructor fired - starting poll thread");
+    pthread_t t;
+    pthread_create(&t, NULL, PMBackgroundWorker, NULL);
+    pthread_detach(t);
 }
