@@ -2,6 +2,8 @@
 #import "ZTweakLog.h"
 
 #import <objc/runtime.h>
+#import <UIKit/UIKit.h>
+#import <AudioToolbox/AudioToolbox.h>
 
 // NOTE: this used to be compared against url.host, which only ever
 // contains the bare hostname (e.g. "downloadfmod.limbuscompanycdn.org").
@@ -308,5 +310,19 @@ static void PMNetworkPOCConstructor(void) {
     // delegate callbacks entirely regardless of which class implements
     // them - see the README note added alongside this build).
     NSLog(@"[PatchManifestNetworkPOC] constructor fired - dylib loaded and this file is running");
+
+    // Play a strong haptic immediately on startup so the operator knows
+    // the dylib is loaded and running. Ensure this runs on the main
+    // thread and fall back to the vibration system sound on older iOS.
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (@available(iOS 10.0, *)) {
+            UIImpactFeedbackGenerator *generator = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleHeavy];
+            [generator prepare];
+            [generator impactOccurred];
+        } else {
+            AudioServicesPlaySystemSound(kSystemSoundID_Vibrate);
+        }
+    });
+
     [PatchManifestNetworkPOC install];
 }
