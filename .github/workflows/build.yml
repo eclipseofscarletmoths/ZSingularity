@@ -153,18 +153,18 @@ jobs:
             -I vendor/vorbis-src/include \
             -install_name "@rpath/ZSingularity.dylib" \
             fps120.m \
+            ZCrashLogger.m \
             IL2CppBridge.m \
             GraphicsDebugOverlay.m \
             GDScripts.m \
             ZSyslogController.m \
-            ZCrashLogger.m \
             BankTransplant.m \
             PatchManifestSync.m \
             FADPCMCodec.m \
             FSB5HeaderRebuild.m \
             FSB5SampleHeaderIO.m \
             FSB5VorbisExtract.m \
-            VorbisSetupTable.m \ 
+            VorbisSetupTable.m \
             -Lbuild/vorbis -Lbuild/ogg \
             -lvorbis -logg \
             -lc++ \
