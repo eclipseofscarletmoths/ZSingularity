@@ -27,7 +27,9 @@
 #import <stdint.h>
 #import <string.h>
 #import <stdlib.h>
+#import <math.h>
 #import <dispatch/dispatch.h> // dispatch_apply - parallelizes the per-sample decode+encode loop below
+#import <AVFAudio/AVFAudio.h> // AVAudioConverter: high-quality sample-rate conversion on-device
 
 #if __has_include(<vorbis/codec.h>)
 #import <vorbis/codec.h>
@@ -111,6 +113,9 @@ static int bt_find_wrapper_info(const BTBuf *bank, BTWrapperInfo *info) {
 typedef struct {
     char name[64];
     uint8_t header[FSB5_STOCK_HEADER_BYTES];
+    int32_t num_samples;
+    int32_t sample_rate;
+    int32_t channels;
 } BTStockSample;
 
 // Stock's FSB5 is mode 16 (FADPCM), fixed 16-byte headers - much simpler
@@ -136,6 +141,11 @@ static int bt_read_stock_fadpcm_samples(const uint8_t *fsb5, size_t fsb5_len,
 
     for (int32_t i = 0; i < num_samples; i++) {
         memcpy(out[i].header, fsb5 + base + (size_t)i * FSB5_STOCK_HEADER_BYTES, FSB5_STOCK_HEADER_BYTES);
+        FSB5BaseHeaderFields base_fields;
+        if (fsb5_read_base_header(out[i].header, &base_fields) != 0) return -1;
+        out[i].num_samples = (int32_t)base_fields.num_samples;
+        out[i].sample_rate = (int32_t)base_fields.frequency_hz;
+        out[i].channels = (int32_t)base_fields.channels;
 
         uint32_t rel = bt_rd_u32(fsb5 + name_table_base + (size_t)i * 4);
         size_t s = name_table_base + rel;
@@ -280,6 +290,126 @@ fail_headers:
 }
 #endif
 
+#pragma mark - PCM resampling (decoded Vorbis rate -> Mobile 24 kHz)
+
+// Resamples interleaved signed-16-bit PCM to the exact sample count expected by
+// the stock Mobile header. AVAudioConverter performs the actual sample-rate
+// conversion (including the required low-pass filtering for 44.1/48 kHz ->
+// 24 kHz); we then trim/pad to the stock count so the rebuilt FSB5 header can
+// remain byte-for-byte compatible in its sample-count field.
+//
+// Returns malloc'd interleaved PCM16, or NULL on failure. The caller owns the
+// returned buffer. `source_channels` must match the decoded PCM layout.
+static int16_t *bt_resample_pcm_to_24khz(const int16_t *input,
+                                         size_t input_sample_count,
+                                         int source_sample_rate,
+                                         int source_channels,
+                                         size_t target_sample_count) {
+    if (!input || input_sample_count == 0 || source_sample_rate <= 0 ||
+        source_channels <= 0 || source_channels > 8 || target_sample_count == 0) {
+        return NULL;
+    }
+
+    // No conversion is needed when the source is already 24 kHz, but still
+    // normalize the buffer to the exact target length requested by the stock
+    // Mobile header (crop or silence-pad as necessary).
+    size_t target_frames_for_converter = target_sample_count;
+
+    AVAudioFormat *sourceFormat = [[AVAudioFormat alloc]
+        initWithCommonFormat:AVAudioPCMFormatInt16
+        sampleRate:(double)source_sample_rate
+        channels:(AVAudioChannelCount)source_channels
+        interleaved:YES];
+    AVAudioFormat *targetFormat = [[AVAudioFormat alloc]
+        initWithCommonFormat:AVAudioPCMFormatInt16
+        sampleRate:24000.0
+        channels:(AVAudioChannelCount)source_channels
+        interleaved:YES];
+    if (!sourceFormat || !targetFormat) return NULL;
+
+    AVAudioConverter *converter = [[AVAudioConverter alloc]
+        initFromFormat:sourceFormat toFormat:targetFormat];
+    if (!converter) return NULL;
+
+    AVAudioPCMBuffer *inputBuffer = [[AVAudioPCMBuffer alloc]
+        initWithPCMFormat:sourceFormat
+        frameCapacity:(AVAudioFrameCount)input_sample_count];
+    if (!inputBuffer) return NULL;
+    inputBuffer.frameLength = (AVAudioFrameCount)input_sample_count;
+
+    // The converter's interleaved Int16 buffer is represented by one
+    // AudioBuffer containing all channels, so the copy is contiguous.
+    AudioBufferList *inputABL = inputBuffer.mutableAudioBufferList;
+    if (!inputABL || inputABL->mNumberBuffers != 1 ||
+        !inputABL->mBuffers[0].mData) return NULL;
+    memcpy(inputABL->mBuffers[0].mData,
+           input,
+           input_sample_count * (size_t)source_channels * sizeof(int16_t));
+
+    // Give the converter a little headroom for its internal resampling
+    // latency/rounding, then normalize the result to the exact Mobile frame
+    // count requested by the caller.
+    double ratio = 24000.0 / (double)source_sample_rate;
+    size_t converted_capacity = (size_t)ceil((double)input_sample_count * ratio) + 1024;
+    if (converted_capacity < target_frames_for_converter + 1024) {
+        converted_capacity = target_frames_for_converter + 1024;
+    }
+    if (converted_capacity > UINT32_MAX) return NULL;
+
+    AVAudioPCMBuffer *outputBuffer = [[AVAudioPCMBuffer alloc]
+        initWithPCMFormat:targetFormat
+        frameCapacity:(AVAudioFrameCount)converted_capacity];
+    if (!outputBuffer) return NULL;
+
+    __block BOOL suppliedInput = NO;
+    NSError *conversionError = nil;
+    AVAudioConverterOutputStatus status = [converter
+        convertToBuffer:outputBuffer
+        error:&conversionError
+        withInputFromBlock:^AVAudioBuffer *(AVAudioPacketCount inNumberOfPackets,
+                                            AVAudioConverterInputStatus *outStatus) {
+            (void)inNumberOfPackets;
+            if (suppliedInput) {
+                *outStatus = AVAudioConverterInputStatus_EndOfStream;
+                return nil;
+            }
+            suppliedInput = YES;
+            *outStatus = AVAudioConverterInputStatus_HaveData;
+            return inputBuffer;
+        }];
+
+    if (status == AVAudioConverterOutputStatus_Error || conversionError ||
+        outputBuffer.frameLength == 0) {
+        if (conversionError) {
+            ZLog(@"[BankTransplant] 24 kHz resample failed: %@", conversionError);
+        } else {
+            ZLog(@"[BankTransplant] 24 kHz resample failed with converter status %ld", (long)status);
+        }
+        return NULL;
+    }
+
+    AudioBufferList *outputABL = outputBuffer.mutableAudioBufferList;
+    if (!outputABL || outputABL->mNumberBuffers != 1 ||
+        !outputABL->mBuffers[0].mData) return NULL;
+
+    int16_t *result = (int16_t *)calloc(target_sample_count * (size_t)source_channels,
+                                        sizeof(int16_t));
+    if (!result) return NULL;
+
+    size_t produced = outputBuffer.frameLength;
+    if (produced > target_sample_count) produced = target_sample_count;
+    memcpy(result,
+           outputABL->mBuffers[0].mData,
+           produced * (size_t)source_channels * sizeof(int16_t));
+
+    if (produced != target_sample_count) {
+        ZLog(@"[BankTransplant] 24 kHz converter produced %zu frames; padded %zu frames to stock target %zu",
+             produced, target_sample_count - produced, target_sample_count);
+    }
+
+    return result;
+}
+
 #pragma mark - Re-encode pipeline (replaces bt_transplant_bank)
 
 // Decodes+encodes every modded sample in parallel via dispatch_apply.
@@ -299,7 +429,8 @@ fail_headers:
 // encountered on failure (which one "first" is is nondeterministic under
 // concurrency, but any real failure here indicates every sample should be
 // treated as failed anyway, so which index reported it doesn't matter).
-static BankTransplantErrorCode bt_reencode_all_samples(FSB5VorbisSample *modded, int modded_count,
+static BankTransplantErrorCode bt_reencode_all_samples(const BTStockSample *stock,
+                                                         FSB5VorbisSample *modded, int modded_count,
                                                          VorbisSetupTable *setupTable,
                                                          int16_t **decoded_pcm, size_t *decoded_counts,
                                                          uint8_t **encoded_fadpcm, size_t *encoded_bytes) {
@@ -321,22 +452,58 @@ static BankTransplantErrorCode bt_reencode_all_samples(FSB5VorbisSample *modded,
         int16_t *pcm = bt_vorbis_decode_packets(modded[i].packet_stream, modded[i].packet_stream_len,
                                                   setup, setup_len, modded[i].channels, modded[i].sample_rate, &sample_count);
         if (!pcm) { per_item_code[i] = BankTransplantErrorVorbisDecodeFailed; return; }
-        decoded_pcm[i] = pcm;
-        decoded_counts[i] = sample_count;
+        // The desktop bank can be 48 kHz or 44.1 kHz while Mobile's stock
+        // FADPCM bank is 24 kHz. Convert the decoded interleaved PCM before
+        // encoding so the generated FADPCM payload has the same timebase as
+        // the Mobile bank. Use the stock sample count as the exact target so
+        // the sample header's num_samples field can remain identical to stock.
+        int ch = modded[i].channels > 0 ? modded[i].channels : 1;
+        size_t target_sample_count = (size_t)stock[i].num_samples;
+        if (target_sample_count == 0) {
+            free(pcm);
+            per_item_code[i] = BankTransplantErrorWriteFailed;
+            return;
+        }
+
+        int16_t *resampled = bt_resample_pcm_to_24khz(pcm, sample_count,
+                                                      modded[i].sample_rate,
+                                                      ch, target_sample_count);
+        free(pcm);
+        if (!resampled) {
+            per_item_code[i] = BankTransplantErrorResampleFailed;
+            return;
+        }
+
+        decoded_pcm[i] = resampled;
+        decoded_counts[i] = target_sample_count;
 
         // FADPCM encode is mono-per-channel-stream (FADPCMCodec.h); for
         // stereo, de-interleave, encode each channel's frame stream
         // independently, then concatenate - per Overview.md §6's note
         // that FADPCM stereo is per-channel frames, not sample-interleaved.
-        int ch = modded[i].channels > 0 ? modded[i].channels : 1;
-        size_t frames_per_ch = fadpcm_frame_count(sample_count);
+        size_t frames_per_ch = fadpcm_frame_count(target_sample_count);
         size_t total_bytes = frames_per_ch * FADPCM_FRAME_BYTES * ch;
         uint8_t *enc = (uint8_t *)malloc(total_bytes);
+        if (!enc) {
+            free(resampled);
+            decoded_pcm[i] = NULL;
+            decoded_counts[i] = 0;
+            per_item_code[i] = BankTransplantErrorWriteFailed;
+            return;
+        }
 
-        int16_t *mono = (int16_t *)malloc(sample_count * sizeof(int16_t));
+        int16_t *mono = (int16_t *)malloc(target_sample_count * sizeof(int16_t));
+        if (!mono) {
+            free(enc);
+            free(resampled);
+            decoded_pcm[i] = NULL;
+            decoded_counts[i] = 0;
+            per_item_code[i] = BankTransplantErrorWriteFailed;
+            return;
+        }
         for (int c = 0; c < ch; c++) {
-            for (size_t s = 0; s < sample_count; s++) mono[s] = pcm[s * ch + c];
-            fadpcm_encode(mono, sample_count, enc + (size_t)c * frames_per_ch * FADPCM_FRAME_BYTES);
+            for (size_t s = 0; s < target_sample_count; s++) mono[s] = resampled[s * ch + c];
+            fadpcm_encode(mono, target_sample_count, enc + (size_t)c * frames_per_ch * FADPCM_FRAME_BYTES);
         }
         free(mono);
 
@@ -401,7 +568,7 @@ static int bt_reencode_bank(const char *original_path, const char *modded_path, 
     encoded_bytes  = (size_t *)calloc(modded_count, sizeof(size_t));
 
     {
-        BankTransplantErrorCode reencode_err = bt_reencode_all_samples(modded, modded_count, setupTable,
+        BankTransplantErrorCode reencode_err = bt_reencode_all_samples(stock, modded, modded_count, setupTable,
                                                                          decoded_pcm, decoded_counts,
                                                                          encoded_fadpcm, encoded_bytes);
         if (reencode_err != 0) { *outCode = reencode_err; goto done; }
@@ -637,6 +804,8 @@ static NSString * const kBTVorbisSetupResourceName = @"FSB5VorbisSetupTable.bin"
             return @"A sample's Vorbis setup data isn't in the bundled preset table, so it can't be decoded. See VorbisSetupTable.h.";
         case BankTransplantErrorVorbisDecodeFailed:
             return @"libvorbis is linked and ran, but rejected this sample's packet stream - a real decode failure (bad packet framing, wrong setup packet for this crc32, or similar), not a build/link problem.";
+        case BankTransplantErrorResampleFailed:
+            return @"Vorbis decoding succeeded, but the decoded PCM could not be resampled to the Mobile 24 kHz target format.";
         case BankTransplantErrorBackupFailed:
             return @"Couldn't create a backup of the stock bank before touching it.";
         case BankTransplantErrorWriteFailed:

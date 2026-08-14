@@ -144,6 +144,7 @@ jobs:
             -arch arm64 \
             -miphoneos-version-min=15.0 \
             -framework Foundation \
+            -framework AVFAudio \
             -framework UIKit \
             -framework QuartzCore \
             -framework CoreText \

@@ -48,6 +48,7 @@ typedef NS_ENUM(NSInteger, BankTransplantErrorCode) {
     BankTransplantErrorVorbisNotLinked,      // <vorbis/codec.h> wasn't found at compile time - BT_HAVE_LIBVORBIS never got defined, so this build has no decoder at all regardless of any sample's content
     BankTransplantErrorVorbisSetupUnknown,   // a sample's crc32 wasn't found in the bundled known-setup-packet table (see FSB5VorbisExtract.h) - can't decode without FMOD's own preset codebook for it
     BankTransplantErrorVorbisDecodeFailed,   // libvorbis IS linked and ran, but rejected/errored on this specific sample's packet stream - a real decode failure, not a build problem
+    BankTransplantErrorResampleFailed,       // decoded PCM could not be converted to the 24 kHz Mobile target format
     BankTransplantErrorBackupFailed,         // couldn't create the one-time backup of the original before touching it
     BankTransplantErrorWriteFailed,          // re-encode succeeded but writing/swapping the result on disk failed
 };
