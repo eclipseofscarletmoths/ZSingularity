@@ -27,6 +27,23 @@ static IMP gOrigDidComplete;
 static Class gDelegateClass;
 static BOOL gInstalled;
 
+
+static void PMFileLog(NSString *fmt, ...) {
+    va_list args; va_start(args, fmt);
+    NSString *msg = [[NSString alloc] initWithFormat:fmt arguments:args];
+    va_end(args);
+    NSString *line = [NSString stringWithFormat:@"%@ %@\n", [NSDate date], msg];
+    NSString *path = @"/var/mobile/Documents/pmnet.log"; // pull via Filza/scp after a login
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+    if (!fh) {
+        [NSFileManager.defaultManager createFileAtPath:path contents:nil attributes:nil];
+        fh = [NSFileHandle fileHandleForWritingAtPath:path];
+    }
+    [fh seekToEndOfFile];
+    [fh writeData:[line dataUsingEncoding:NSUTF8StringEncoding]];
+    [fh closeFile];
+}
+
 static NSMutableDictionary<NSNumber *, NSMutableData *> *gBuffers;
 static dispatch_queue_t gStateQueue;
 
