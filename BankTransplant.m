@@ -10,7 +10,7 @@
 // sample, re-encodes to FADPCM (FADPCMCodec.h), and rebuilds each
 // sample's header against stock's own (FSB5HeaderRebuild.h) instead.
 //
-// BUILD NOTE: this file needs libvorbis (vorbis/codec.h) linked in to
+// BUILD NOTE this file needs libvorbis (vorbis/codec.h) linked in to
 // do anything - without it, bt_vorbis_decode_packets always fails with
 // BankTransplantErrorVorbisDecodeFailed. It also needs
 // FSB5SampleHeaderIO.m's two functions actually implemented (currently
