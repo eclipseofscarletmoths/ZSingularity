@@ -24,6 +24,7 @@
 #import "FSB5SampleHeaderIO.h"
 #import "FSB5HeaderRebuild.h"
 #import "VorbisSetupTable.h"
+#import "PatchManifestSync.h"
 #import <stdint.h>
 #import <string.h>
 #import <stdlib.h>
@@ -740,6 +741,21 @@ static NSString * const kBTVorbisSetupResourceName = @"FSB5VorbisSetupTable.bin"
     }
 
     ZLog(@"[BankTransplant] re-encoded modded Vorbis samples to FADPCM, swapped %@ in place", fileName);
+
+    // Best-effort - see PatchManifestSync.h. A failure here does NOT
+    // undo or invalidate the swap above; it just means the swapped file
+    // is only known-good for TextAssetPatch's integrity gate for the
+    // CURRENT session (that gate already passed before this code path
+    // is reachable at all - see the Mods-panel-only entry point this
+    // method has). A failed resync means the NEXT cold boot's check may
+    // flag it again, same as it would have before this file existed.
+    NSError *syncErr = nil;
+    if (![PatchManifestSync resyncFmodPatchManifestWithError:&syncErr]) {
+        ZLog(@"[BankTransplant] swapped %@, but local patch manifest resync failed (%@) - swap is only "
+              "guaranteed to survive TextAssetPatch's integrity check for the CURRENT session, not the next cold boot",
+              fileName, syncErr.localizedDescription);
+    }
+
     return YES;
 }
 
@@ -779,6 +795,19 @@ static NSString * const kBTVorbisSetupResourceName = @"FSB5VorbisSetupTable.bin"
             ZLog(@"[BankTransplant] restore: couldn't swap %@ back in: %@", originalPath.lastPathComponent, replaceErr.localizedDescription);
         }
     }
+
+    // One resync for the whole directory, same reasoning as the swap
+    // path above - restored files are back to stock bytes, so this just
+    // brings the local manifest back in line with that, same best-effort
+    // treatment (a failure here doesn't undo the restore itself).
+    if (restored > 0) {
+        NSError *syncErr = nil;
+        if (![PatchManifestSync resyncFmodPatchManifestWithError:&syncErr]) {
+            ZLog(@"[BankTransplant] restored %ld bank(s), but local patch manifest resync failed (%@)",
+                  (long)restored, syncErr.localizedDescription);
+        }
+    }
+
     return restored;
 }
 
