@@ -55,7 +55,9 @@ jobs:
           git checkout 65b355cc20171010ecabf245e7b339aeab8ddbb9
           cd -
 
+          
              cmake -S "$SRC" -B "$BUILD" \
+            -DCMAKE_POLICY_CMP0091=NEW
             -G "Unix Makefiles" \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_SYSTEM_NAME=iOS \
@@ -94,7 +96,8 @@ jobs:
           git clone --depth 1 --branch "v${VORBIS_VERSION}" \
             https://github.com/xiph/vorbis.git "$SRC"
 
-          cmake -S "$SRC" -B "$BUILD" \
+             cmake -S "$SRC" -B "$BUILD" \
+            -DCMAKE_POLICY_CMP0091=NEW
             -G "Unix Makefiles" \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_SYSTEM_NAME=iOS \
