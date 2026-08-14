@@ -4,6 +4,7 @@
 #import <objc/runtime.h>
 #import <UIKit/UIKit.h>
 #import <AudioToolbox/AudioToolbox.h>
+#import <mach-o/dyld.h>
 
 // NOTE: this used to be compared against url.host, which only ever
 // contains the bare hostname (e.g. "downloadfmod.limbuscompanycdn.org").
@@ -341,7 +342,7 @@ static void PMNetworkPOCConstructor(void) {
         }
     });
 }
-#import <mach-o/dyld.h>
+
 static void PMTryInstallIfNeeded(void) {
     @synchronized ([PatchManifestNetworkPOC class]) {
         if (gInstalled) return;
