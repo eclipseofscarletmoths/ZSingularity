@@ -2,7 +2,7 @@
 
 #import <objc/runtime.h>
 
-static NSString * const kTargetHost = @"downloadfmod.limbuscompanycdn.org/f20260813_S8pD8WWQc4i0MQKT1X1W";
+static NSString * const kTargetHost = @"https://downloadfmod.limbuscompanycdn.org/f20260813_S8pD8WWQc4i0MQKT1X1W";
 static NSString * const kTargetPath = @"/Assets/Sound/FmodPatchInfo.json";
 static NSString * const kTargetBank = @"Assets/Sound/FMODBuilds/Mobile/BGM_Default_S7_3.assets.bank";
 static NSString * const kDesiredMD5 = @"fbe98ef9f57aff80ada46c4f8af92";
