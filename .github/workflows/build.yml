@@ -128,10 +128,16 @@ jobs:
       # -L + -lvorbis -logg link the static libs built above (order
       # matters here - vorbis's objects reference ogg's, so -lvorbis
       # has to come first for the linker to know it needs -logg's symbols).
+      # -O2: this step previously built at clang's default -O0. Fine for
+      # everything except FADPCMCodec.m's encoder, whose innermost loop
+      # (8 coefs x 16 shifts x 32 samples, per 32-sample group) depends on
+      # fadpcm_decode_sample actually getting inlined - at -O0 the re-encode
+      # of a real bank was taking minutes; this should get most of that back.
       - name: Compile tweak dylib
         run: |
           clang \
             -dynamiclib \
+            -O2 \
             -fobjc-arc \
             -fmodules \
             -isysroot "${{ steps.sdk.outputs.path }}" \

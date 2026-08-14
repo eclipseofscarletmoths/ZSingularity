@@ -2717,23 +2717,57 @@ static const CGFloat kContentFadeHeight = 22;
     [presenter presentViewController:picker animated:YES completion:nil];
 }
 
+// bt_reencode_bank (called inside +transplantAndSwapModdedBankAtURL:error:)
+// decodes+re-encodes real audio and can legitimately run for a while even
+// with -O2 and the dispatch_apply parallelization in BankTransplant.m -
+// this delegate callback is UIKit main-thread code, so calling it
+// synchronously here would freeze the whole game's UI for that entire
+// duration with zero feedback (not even a spinner - just a dead app).
+// Instead: show an indeterminate "working" alert immediately, do the
+// actual work on a background queue, then hop back to main to dismiss it
+// and show the real result.
 - (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
     NSURL *moddedURL = urls.firstObject;
     if (!moddedURL) return;
 
-    NSError *error = nil;
-    BOOL ok = [BankTransplant transplantAndSwapModdedBankAtURL:moddedURL error:&error];
+    UIViewController *presenter = gd_key_window().rootViewController;
+    UIAlertController *working = [UIAlertController alertControllerWithTitle:@"Re-encoding…"
+                                                                       message:@"Decoding Vorbis and re-encoding to FADPCM. This can take a while on a full bank."
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+    UIActivityIndicatorView *spinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
+    spinner.translatesAutoresizingMaskIntoConstraints = NO;
+    [working.view addSubview:spinner];
+    [spinner startAnimating];
+    [NSLayoutConstraint activateConstraints:@[
+        [spinner.centerXAnchor constraintEqualToAnchor:working.view.centerXAnchor],
+        [spinner.bottomAnchor constraintEqualToAnchor:working.view.bottomAnchor constant:-16],
+    ]];
+    if (presenter) [presenter presentViewController:working animated:YES completion:nil];
 
-    UINotificationFeedbackGenerator *haptic = [UINotificationFeedbackGenerator new];
-    if (ok) {
-        [haptic notificationOccurred:UINotificationFeedbackTypeSuccess];
-        [self gd_presentModsAlertWithTitle:@"Bank Swapped"
-                                    message:[NSString stringWithFormat:@"%@ was spliced onto the stock wrapper and swapped in. Restart the game for it to take effect.", moddedURL.lastPathComponent]];
-    } else {
-        [haptic notificationOccurred:UINotificationFeedbackTypeError];
-        [self gd_presentModsAlertWithTitle:@"Transplant Failed"
-                                    message:error.localizedDescription ?: @"Unknown error."];
-    }
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSError *error = nil;
+        BOOL ok = [BankTransplant transplantAndSwapModdedBankAtURL:moddedURL error:&error];
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            void (^showResult)(void) = ^{
+                UINotificationFeedbackGenerator *haptic = [UINotificationFeedbackGenerator new];
+                if (ok) {
+                    [haptic notificationOccurred:UINotificationFeedbackTypeSuccess];
+                    [self gd_presentModsAlertWithTitle:@"Bank Swapped"
+                                                message:[NSString stringWithFormat:@"%@ was spliced onto the stock wrapper and swapped in. Restart the game for it to take effect.", moddedURL.lastPathComponent]];
+                } else {
+                    [haptic notificationOccurred:UINotificationFeedbackTypeError];
+                    [self gd_presentModsAlertWithTitle:@"Transplant Failed"
+                                                message:error.localizedDescription ?: @"Unknown error."];
+                }
+            };
+            if (working.presentingViewController) {
+                [working dismissViewControllerAnimated:YES completion:showResult];
+            } else {
+                showResult();
+            }
+        });
+    });
 }
 
 // Restores every stock bank under Assets/Sound/FMODBuilds/Mobile that's

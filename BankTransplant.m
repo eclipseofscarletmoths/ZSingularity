@@ -27,6 +27,7 @@
 #import <stdint.h>
 #import <string.h>
 #import <stdlib.h>
+#import <dispatch/dispatch.h> // dispatch_apply - parallelizes the per-sample decode+encode loop below
 
 #if __has_include(<vorbis/codec.h>)
 #import <vorbis/codec.h>
@@ -329,15 +330,30 @@ static int bt_reencode_bank(const char *original_path, const char *modded_path, 
     encoded_fadpcm = (uint8_t **)calloc(modded_count, sizeof(uint8_t *));
     encoded_bytes  = (size_t *)calloc(modded_count, sizeof(size_t));
 
-    for (int i = 0; i < modded_count; i++) {
+    // Each sample's decode+encode is fully independent of every other
+    // sample's (separate libvorbis state on the stack in
+    // bt_vorbis_decode_packets, separate scratch buffers here) - the only
+    // shared thing touched is setupTable, which is read-only after
+    // +loadFromResourceNamed:error: returns, so concurrent
+    // -setupPacketForCRC32:length: calls are safe. dispatch_apply blocks
+    // the calling thread until every iteration completes, so the
+    // sequential code below this loop (which depends on every entry being
+    // filled in) still doesn't need to change.
+    //
+    // Per-item failures are recorded into per_item_code[i] instead of
+    // goto-ing out of the block (goto can't cross a block boundary), and
+    // checked once dispatch_apply returns.
+    BankTransplantErrorCode *per_item_code = (BankTransplantErrorCode *)calloc(modded_count, sizeof(BankTransplantErrorCode));
+    dispatch_apply((size_t)modded_count, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t i_) {
+        int i = (int)i_;
         size_t setup_len = 0;
         const uint8_t *setup = [setupTable setupPacketForCRC32:modded[i].setup_crc32 length:&setup_len];
-        if (!setup) { *outCode = BankTransplantErrorVorbisSetupUnknown; goto done; }
+        if (!setup) { per_item_code[i] = BankTransplantErrorVorbisSetupUnknown; return; }
 
         size_t sample_count = 0;
         int16_t *pcm = bt_vorbis_decode_packets(modded[i].packet_stream, modded[i].packet_stream_len,
                                                   setup, setup_len, modded[i].channels, modded[i].sample_rate, &sample_count);
-        if (!pcm) { *outCode = BankTransplantErrorVorbisDecodeFailed; goto done; }
+        if (!pcm) { per_item_code[i] = BankTransplantErrorVorbisDecodeFailed; return; }
         decoded_pcm[i] = pcm;
         decoded_counts[i] = sample_count;
 
@@ -359,7 +375,11 @@ static int bt_reencode_bank(const char *original_path, const char *modded_path, 
 
         encoded_fadpcm[i] = enc;
         encoded_bytes[i] = total_bytes;
+    });
+    for (int i = 0; i < modded_count; i++) {
+        if (per_item_code[i] != 0) { *outCode = per_item_code[i]; free(per_item_code); goto done; }
     }
+    free(per_item_code);
 
     // Rebuild headers + assemble new FSB5 data region, in stock's
     // sample order (already name-matched 1:1 against modded above).
