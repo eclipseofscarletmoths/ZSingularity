@@ -119,16 +119,13 @@ typedef struct {
 static int bt_read_stock_fadpcm_samples(const uint8_t *fsb5, size_t fsb5_len,
                                           BTStockSample *out, int max_samples, int *out_count) {
     if (fsb5_len < 0x3C) return -1;
-    int32_t version            = (int32_t)bt_rd_u32(fsb5 + 4);
-    int32_t num_samples        = (int32_t)bt_rd_u32(fsb5 + 8);
-    int32_t sample_headers_sz  = (int32_t)bt_rd_u32(fsb5 + 12);
-    int32_t name_table_sz      = (int32_t)bt_rd_u32(fsb5 + 16);
-    int32_t data_sz            = (int32_t)bt_rd_u32(fsb5 + 20);
-    int32_t mode               = (int32_t)bt_rd_u32(fsb5 + 24);
-
-NSLog(@"[BankTransplant] FSB5 v=%d samples=%d headers=%d names=%d data=%d mode=%d",
-      version, num_samples, sample_headers_sz,
-      name_table_sz, data_sz, mode);
+    // Field order is signature(4)/version(4)/numSamples(4)/sampleHeadersSize(4)/
+    // nameTableSize(4)/dataSize(4)/mode(4) - mode is at +24, not +4 (that's
+    // version, always 1). Confirmed against the real Original/Modded sample
+    // banks: +4 reads back 1 for both, +24 reads back 16/15 as expected.
+    int32_t mode              = (int32_t)bt_rd_u32(fsb5 + 24);
+    int32_t num_samples       = (int32_t)bt_rd_u32(fsb5 + 8);
+    int32_t sample_headers_sz = (int32_t)bt_rd_u32(fsb5 + 12);
     if (mode != 16) return -1; // stock should already be FADPCM
     if (num_samples <= 0 || num_samples > max_samples) return -1;
     if ((size_t)sample_headers_sz != (size_t)num_samples * FSB5_STOCK_HEADER_BYTES) return -1; // fixed-size assumption from §1
@@ -158,37 +155,20 @@ NSLog(@"[BankTransplant] FSB5 v=%d samples=%d headers=%d names=%d data=%d mode=%
 
 #ifdef BT_HAVE_LIBVORBIS
 // Decodes one FSB5-framed Vorbis sample (length-prefixed packets, per
-// FSB5VorbisExtract.h) to interleaved PCM16. The bundled setup table contains
-// the raw FMOD Vorbis setup packet for the sample's CRC32. The identification
-// header is rebuilt here from the FSB5 sample metadata, matching python-fsb5's
-// reconstruction convention (channels/frequency, 256/2048 block sizes).
-// FSB5 doesn't carry a separate comment packet, so an empty one is synthesized
-// here (libvorbis's header chain requires exactly three: identification,
-// comment, setup). Returns malloc'd PCM (caller frees) and sample count via
-// *out_count, or NULL on failure.
+// FSB5VorbisExtract.h) to interleaved PCM16, given the identification+
+// setup packets looked up by crc32. Returns malloc'd PCM (caller frees)
+// and sample count via *out_count, or NULL on failure.
 static int16_t *bt_vorbis_decode_packets(const uint8_t *packet_stream, size_t packet_stream_len,
-                                          const uint8_t *setup_packet, size_t setup_packet_len,
-                                          int sample_rate, int channels, size_t *out_sample_count) {
-    // Build Vorbis identification header:
-    //   0x01 + 'vorbis'
-    //   version = 0
-    //   channels = sample metadata
-    //   sample rate = sample metadata
-    //   bitrates = 0
-    //   blocksize_0 = 2^8 (256), blocksize_1 = 2^11 (2048)
-    //   framing flag = 1
-    // This is the same header shape used by python-fsb5's rebuild_id_header.
-    if (channels <= 0 || channels > 255 || sample_rate <= 0) return NULL;
-    static const size_t kVorbisIdentificationBytes = 30;
-    uint8_t identification[kVorbisIdentificationBytes] = {0};
-    memcpy(identification, "\x01vorbis", 7);
-    // version at [7..10] remains zero.
-    identification[11] = (uint8_t)channels;
-    bt_wr_u32(identification + 12, (uint32_t)sample_rate);
-    // [16..27] bitrate_maximum/nominal/minimum remain zero.
-    identification[28] = (uint8_t)((8u & 0x0Fu) | ((11u & 0x0Fu) << 4));
-    identification[29] = 1;
-
+                                          const uint8_t *setup_packets, size_t setup_packets_len,
+                                          int channels, int sample_rate, size_t *out_sample_count) {
+    // setup_packets is the raw Vorbis SETUP packet only (crc32-keyed,
+    // straight out of VorbisSetupTable) - not an id+setup pair. FMOD's
+    // presets only key the setup packet (the big codebook data); the
+    // identification packet is small and fully derivable from data we
+    // already have (channels/sample_rate), so it's synthesized below
+    // rather than looked up. FSB5 doesn't carry a separate comment
+    // packet either, so an empty one is synthesized too (libvorbis's
+    // header chain requires exactly three: identification, comment, setup).
     vorbis_info vi; vorbis_info_init(&vi);
     vorbis_comment vc; vorbis_comment_init(&vc);
     vorbis_dsp_state vd;
@@ -196,14 +176,34 @@ static int16_t *bt_vorbis_decode_packets(const uint8_t *packet_stream, size_t pa
 
     ogg_packet header_id = {0}, header_comment = {0}, header_setup = {0};
 
-    header_id.packet = (unsigned char *)identification;
-    header_id.bytes = kVorbisIdentificationBytes;
-    header_id.b_o_s = 1;
+    if (setup_packets_len == 0) goto fail_headers;
+    header_setup.packet = (unsigned char *)setup_packets;
+    header_setup.bytes = (long)setup_packets_len;
 
-    if (setup_packet_len < 7 || setup_packet[0] != 0x05 ||
-        memcmp(setup_packet + 1, "vorbis", 6) != 0) goto fail_headers;
-    header_setup.packet = (unsigned char *)setup_packet;
-    header_setup.bytes = setup_packet_len;
+    // Standard 30-byte Vorbis identification header, synthesized from
+    // channels/sample_rate rather than looked up - see this function's
+    // header comment. blocksize_0=8/blocksize_1=11 (packed as 0xB8) is
+    // FSB5's fixed default; worth cross-checking against python-fsb5's
+    // generate_vorbis_headers() before trusting on real audio, same as
+    // any other binary layout in this project - not guessed at lightly,
+    // but not independently re-derived from first principles here either.
+    uint8_t id_buf[30];
+    id_buf[0] = 0x01;
+    memcpy(id_buf + 1, "vorbis", 6);
+    uint32_t ver = 0;
+    memcpy(id_buf + 7, &ver, 4);                          // vorbis_version = 0
+    id_buf[11] = (uint8_t)channels;
+    uint32_t sr = (uint32_t)sample_rate;
+    memcpy(id_buf + 12, &sr, 4);
+    uint32_t zero = 0;
+    memcpy(id_buf + 16, &zero, 4);                        // bitrate_maximum
+    memcpy(id_buf + 20, &zero, 4);                        // bitrate_nominal
+    memcpy(id_buf + 24, &zero, 4);                        // bitrate_minimum
+    id_buf[28] = 0xB8;                                    // blocksize_0=8, blocksize_1=11
+    id_buf[29] = 0x01;                                    // framing flag
+    header_id.packet = id_buf;
+    header_id.bytes = sizeof(id_buf);
+    header_id.b_o_s = 1;
 
     static const unsigned char empty_comment[] = { 3, 'v','o','r','b','i','s', 0,0,0,0 };
     header_comment.packet = (unsigned char *)empty_comment;
@@ -327,7 +327,7 @@ static int bt_reencode_bank(const char *original_path, const char *modded_path, 
 
         size_t sample_count = 0;
         int16_t *pcm = bt_vorbis_decode_packets(modded[i].packet_stream, modded[i].packet_stream_len,
-                                                  setup, setup_len, modded[i].sample_rate, modded[i].channels, &sample_count);
+                                                  setup, setup_len, modded[i].channels, modded[i].sample_rate, &sample_count);
         if (!pcm) { *outCode = BankTransplantErrorVorbisDecodeFailed; goto done; }
         decoded_pcm[i] = pcm;
         decoded_counts[i] = sample_count;

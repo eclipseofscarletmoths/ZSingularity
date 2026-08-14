@@ -1,4 +1,4 @@
-// FSB5VorbisExtract.m — see FSB5VorbisExtract.h. Depends on
+// FSB5VorbisExtract.m -- see FSB5VorbisExtract.h. Depends on
 // fsb5_read_base_header (FSB5SampleHeaderIO.h) being filled in before
 // this can walk real sample headers - see that file's comment.
 
@@ -51,7 +51,12 @@ int fsb5_extract_vorbis_samples(const uint8_t *fsb5, size_t fsb5_len,
     if (fsb5_len < 0x3C) return -1;
     if (memcmp(fsb5, "FSB5", 4) != 0) return -1;
 
-    int32_t mode              = (int32_t)rd_u32(fsb5 + 4);
+    // Field order is signature(4)/version(4)/numSamples(4)/sampleHeadersSize(4)/
+    // nameTableSize(4)/dataSize(4)/mode(4) - mode is at +24, not +4 (that's
+    // version, always 1). Same offset bug as bt_read_stock_fadpcm_samples in
+    // BankTransplant.m, confirmed against the real sample banks: +4 reads back
+    // 1 for both Original/Modded, +24 reads back 16/15 as expected.
+    int32_t mode              = (int32_t)rd_u32(fsb5 + 24);
     int32_t num_samples_total = (int32_t)rd_u32(fsb5 + 8);
     int32_t sample_headers_sz = (int32_t)rd_u32(fsb5 + 12);
     int32_t name_table_sz     = (int32_t)rd_u32(fsb5 + 16);
