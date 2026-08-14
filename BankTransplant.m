@@ -282,6 +282,76 @@ fail_headers:
 
 #pragma mark - Re-encode pipeline (replaces bt_transplant_bank)
 
+// Decodes+encodes every modded sample in parallel via dispatch_apply.
+// Pulled out of bt_reencode_bank into its own function because a block
+// literal that captures a __strong variable (setupTable) opens an
+// ARC-managed lifetime scope that a C `goto` cannot jump forward past -
+// bt_reencode_bank has several early-exit `goto done;` statements before
+// this point, and having the block inline there made all of them illegal
+// ("jump enters lifetime of block which strongly captures a variable").
+// Keeping the block in a separate function sidesteps that entirely: this
+// function has no goto/label of its own, and the caller only needs one
+// `goto done;` for the whole call, which doesn't cross anything.
+//
+// Writes into decoded_pcm/decoded_counts/encoded_fadpcm/encoded_bytes
+// (each already calloc'd by the caller to modded_count entries) and
+// returns 0 on success, or the first per-item BankTransplantErrorCode
+// encountered on failure (which one "first" is is nondeterministic under
+// concurrency, but any real failure here indicates every sample should be
+// treated as failed anyway, so which index reported it doesn't matter).
+static BankTransplantErrorCode bt_reencode_all_samples(FSB5VorbisSample *modded, int modded_count,
+                                                         VorbisSetupTable *setupTable,
+                                                         int16_t **decoded_pcm, size_t *decoded_counts,
+                                                         uint8_t **encoded_fadpcm, size_t *encoded_bytes) {
+    // Each sample's decode+encode is fully independent of every other
+    // sample's (separate libvorbis state on the stack in
+    // bt_vorbis_decode_packets, separate scratch buffers here) - the only
+    // shared thing touched is setupTable, which is read-only after
+    // +loadFromResourceNamed:error: returns, so concurrent
+    // -setupPacketForCRC32:length: calls are safe. dispatch_apply blocks
+    // the calling thread until every iteration completes.
+    BankTransplantErrorCode *per_item_code = (BankTransplantErrorCode *)calloc((size_t)modded_count, sizeof(BankTransplantErrorCode));
+    dispatch_apply((size_t)modded_count, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t i_) {
+        int i = (int)i_;
+        size_t setup_len = 0;
+        const uint8_t *setup = [setupTable setupPacketForCRC32:modded[i].setup_crc32 length:&setup_len];
+        if (!setup) { per_item_code[i] = BankTransplantErrorVorbisSetupUnknown; return; }
+
+        size_t sample_count = 0;
+        int16_t *pcm = bt_vorbis_decode_packets(modded[i].packet_stream, modded[i].packet_stream_len,
+                                                  setup, setup_len, modded[i].channels, modded[i].sample_rate, &sample_count);
+        if (!pcm) { per_item_code[i] = BankTransplantErrorVorbisDecodeFailed; return; }
+        decoded_pcm[i] = pcm;
+        decoded_counts[i] = sample_count;
+
+        // FADPCM encode is mono-per-channel-stream (FADPCMCodec.h); for
+        // stereo, de-interleave, encode each channel's frame stream
+        // independently, then concatenate - per Overview.md §6's note
+        // that FADPCM stereo is per-channel frames, not sample-interleaved.
+        int ch = modded[i].channels > 0 ? modded[i].channels : 1;
+        size_t frames_per_ch = fadpcm_frame_count(sample_count);
+        size_t total_bytes = frames_per_ch * FADPCM_FRAME_BYTES * ch;
+        uint8_t *enc = (uint8_t *)malloc(total_bytes);
+
+        int16_t *mono = (int16_t *)malloc(sample_count * sizeof(int16_t));
+        for (int c = 0; c < ch; c++) {
+            for (size_t s = 0; s < sample_count; s++) mono[s] = pcm[s * ch + c];
+            fadpcm_encode(mono, sample_count, enc + (size_t)c * frames_per_ch * FADPCM_FRAME_BYTES);
+        }
+        free(mono);
+
+        encoded_fadpcm[i] = enc;
+        encoded_bytes[i] = total_bytes;
+    });
+
+    BankTransplantErrorCode result = 0;
+    for (int i = 0; i < modded_count; i++) {
+        if (per_item_code[i] != 0) { result = per_item_code[i]; break; }
+    }
+    free(per_item_code);
+    return result;
+}
+
 static int bt_reencode_bank(const char *original_path, const char *modded_path, const char *out_path,
                              VorbisSetupTable *setupTable,
                              BankTransplantErrorCode *outCode) {
@@ -330,56 +400,12 @@ static int bt_reencode_bank(const char *original_path, const char *modded_path, 
     encoded_fadpcm = (uint8_t **)calloc(modded_count, sizeof(uint8_t *));
     encoded_bytes  = (size_t *)calloc(modded_count, sizeof(size_t));
 
-    // Each sample's decode+encode is fully independent of every other
-    // sample's (separate libvorbis state on the stack in
-    // bt_vorbis_decode_packets, separate scratch buffers here) - the only
-    // shared thing touched is setupTable, which is read-only after
-    // +loadFromResourceNamed:error: returns, so concurrent
-    // -setupPacketForCRC32:length: calls are safe. dispatch_apply blocks
-    // the calling thread until every iteration completes, so the
-    // sequential code below this loop (which depends on every entry being
-    // filled in) still doesn't need to change.
-    //
-    // Per-item failures are recorded into per_item_code[i] instead of
-    // goto-ing out of the block (goto can't cross a block boundary), and
-    // checked once dispatch_apply returns.
-    BankTransplantErrorCode *per_item_code = (BankTransplantErrorCode *)calloc(modded_count, sizeof(BankTransplantErrorCode));
-    dispatch_apply((size_t)modded_count, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(size_t i_) {
-        int i = (int)i_;
-        size_t setup_len = 0;
-        const uint8_t *setup = [setupTable setupPacketForCRC32:modded[i].setup_crc32 length:&setup_len];
-        if (!setup) { per_item_code[i] = BankTransplantErrorVorbisSetupUnknown; return; }
-
-        size_t sample_count = 0;
-        int16_t *pcm = bt_vorbis_decode_packets(modded[i].packet_stream, modded[i].packet_stream_len,
-                                                  setup, setup_len, modded[i].channels, modded[i].sample_rate, &sample_count);
-        if (!pcm) { per_item_code[i] = BankTransplantErrorVorbisDecodeFailed; return; }
-        decoded_pcm[i] = pcm;
-        decoded_counts[i] = sample_count;
-
-        // FADPCM encode is mono-per-channel-stream (FADPCMCodec.h); for
-        // stereo, de-interleave, encode each channel's frame stream
-        // independently, then concatenate - per Overview.md §6's note
-        // that FADPCM stereo is per-channel frames, not sample-interleaved.
-        int ch = modded[i].channels > 0 ? modded[i].channels : 1;
-        size_t frames_per_ch = fadpcm_frame_count(sample_count);
-        size_t total_bytes = frames_per_ch * FADPCM_FRAME_BYTES * ch;
-        uint8_t *enc = (uint8_t *)malloc(total_bytes);
-
-        int16_t *mono = (int16_t *)malloc(sample_count * sizeof(int16_t));
-        for (int c = 0; c < ch; c++) {
-            for (size_t s = 0; s < sample_count; s++) mono[s] = pcm[s * ch + c];
-            fadpcm_encode(mono, sample_count, enc + (size_t)c * frames_per_ch * FADPCM_FRAME_BYTES);
-        }
-        free(mono);
-
-        encoded_fadpcm[i] = enc;
-        encoded_bytes[i] = total_bytes;
-    });
-    for (int i = 0; i < modded_count; i++) {
-        if (per_item_code[i] != 0) { *outCode = per_item_code[i]; free(per_item_code); goto done; }
+    {
+        BankTransplantErrorCode reencode_err = bt_reencode_all_samples(modded, modded_count, setupTable,
+                                                                         decoded_pcm, decoded_counts,
+                                                                         encoded_fadpcm, encoded_bytes);
+        if (reencode_err != 0) { *outCode = reencode_err; goto done; }
     }
-    free(per_item_code);
 
     // Rebuild headers + assemble new FSB5 data region, in stock's
     // sample order (already name-matched 1:1 against modded above).
