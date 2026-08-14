@@ -157,13 +157,14 @@ jobs:
             GraphicsDebugOverlay.m \
             GDScripts.m \
             ZSyslogController.m \
+            ZCrashLogger.m
             BankTransplant.m \
             PatchManifestSync.m \
             FADPCMCodec.m \
             FSB5HeaderRebuild.m \
             FSB5SampleHeaderIO.m \
             FSB5VorbisExtract.m \
-            VorbisSetupTable.m \
+            VorbisSetupTable.m \ 
             -Lbuild/vorbis -Lbuild/ogg \
             -lvorbis -logg \
             -lc++ \
