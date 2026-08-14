@@ -107,6 +107,8 @@ jobs:
             -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
             -DCMAKE_INSTALL_PREFIX="$PREFIX" \
             -DCMAKE_PREFIX_PATH="$PREFIX" \
+            -DOGG_LIBRARY="$PREFIX/lib/libogg.a" \
+            -DOGG_INCLUDE_DIR="$PREFIX/include" \
             -DPKG_CONFIG_PATH="$PREFIX/lib/pkgconfig:$PREFIX/share/pkgconfig" \
             -DBUILD_SHARED_LIBS=OFF \
             -DBUILD_TESTING=OFF \
