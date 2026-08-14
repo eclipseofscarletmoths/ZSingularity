@@ -2,10 +2,19 @@
 
 #import <objc/runtime.h>
 
-static NSString * const kTargetHost = @"https://downloadfmod.limbuscompanycdn.org/f20260813_S8pD8WWQc4i0MQKT1X1W";
-static NSString * const kTargetPath = @"/Assets/Sound/FmodPatchInfo.json";
+// NOTE: this used to be compared against url.host, which only ever
+// contains the bare hostname (e.g. "downloadfmod.limbuscompanycdn.org").
+// A full "https://host/path" string can never match .host, so
+// PMIsTargetTask() was unconditionally returning NO and nothing was
+// ever intercepted regardless of what the game actually requested.
+static NSString * const kTargetHostSuffix = @"limbuscompanycdn.org";
+// The path we actually observed included a build-dated token segment
+// ("/f20260813_S8pD8WWQc4i0MQKT1X1W/...") ahead of the real filename.
+// That token is almost certainly per-build/per-session and will change
+// on the next patch, so match on the filename instead of the full path.
+static NSString * const kTargetPathSuffix = @"FmodPatchInfo.json";
 static NSString * const kTargetBank = @"Assets/Sound/FMODBuilds/Mobile/BGM_Default_S7_3.assets.bank";
-static NSString * const kDesiredMD5 = @"fbe98ef9f57aff80ada46c4f8af92";
+static NSString * const kDesiredMD5 = @"fbe98ef9f57aff80c58ada46c4f8af92";
 static const NSUInteger kDesiredSize = 57408616;
 
 static const NSUInteger kMaxManifestBytes = 32ULL * 1024ULL * 1024ULL;
@@ -25,7 +34,16 @@ static BOOL PMIsTargetTask(NSURLSessionDataTask *task) {
     NSString *host = url.host.lowercaseString ?: @"";
     NSString *path = url.path ?: @"";
 
-    return [host isEqualToString:kTargetHost] && [path isEqualToString:kTargetPath];
+    BOOL match = [host hasSuffix:kTargetHostSuffix] && [path hasSuffix:kTargetPathSuffix];
+
+    // Log every request that reaches this delegate, matched or not, at
+    // least once. If this never prints anything, the hook itself isn't
+    // firing (see the +install log line) - that's a different problem
+    // than the URL not matching, and worth ruling out first.
+    NSLog(@"[PatchManifestNetworkPOC] observed request host=%@ path=%@ match=%@",
+          host, path, match ? @"YES" : @"NO");
+
+    return match;
 }
 
 static NSData *PMPatchManifestData(NSData *input) {
@@ -157,6 +175,39 @@ static void PMDidComplete(id self,
         self, _cmd, session, task, error);
 }
 
+// "UnityWebRequestDelegate" is a guess, not a name confirmed to exist in
+// this build. Unity's iOS UnityWebRequest backend has used different
+// internal class names across engine versions, and Limbus Company's
+// symbols are stripped, so there's no way to know the literal name
+// without checking on-device. This walks every loaded Objective-C class
+// and logs the ones that actually implement both delegate methods we
+// need to hook, so the real name (whatever it is) shows up in the
+// device console/syslog.
+static NSArray<NSString *> *PMFindCandidateDelegateClassNames(void) {
+    NSMutableArray<NSString *> *candidates = [NSMutableArray array];
+
+    SEL didReceiveSEL = @selector(URLSession:dataTask:didReceiveData:);
+    SEL didCompleteSEL = @selector(URLSession:task:didCompleteWithError:);
+
+    int count = objc_getClassList(NULL, 0);
+    if (count <= 0) return candidates;
+
+    Class *classes = (Class *)malloc(sizeof(Class) * (unsigned long)count);
+    if (!classes) return candidates;
+
+    count = objc_getClassList(classes, count);
+    for (int i = 0; i < count; i++) {
+        Class cls = classes[i];
+        if (class_getInstanceMethod(cls, didReceiveSEL) &&
+            class_getInstanceMethod(cls, didCompleteSEL)) {
+            [candidates addObject:NSStringFromClass(cls)];
+        }
+    }
+
+    free(classes);
+    return candidates;
+}
+
 @implementation PatchManifestNetworkPOC
 
 + (void)install {
@@ -165,7 +216,14 @@ static void PMDidComplete(id self,
 
         gDelegateClass = NSClassFromString(@"UnityWebRequestDelegate");
         if (!gDelegateClass) {
-            NSLog(@"[PatchManifestNetworkPOC] UnityWebRequestDelegate class not found");
+            NSArray<NSString *> *candidates = PMFindCandidateDelegateClassNames();
+            NSLog(@"[PatchManifestNetworkPOC] UnityWebRequestDelegate class not found. "
+                  @"Classes implementing both NSURLSessionDataDelegate methods we need: %@. "
+                  @"If this list is non-empty, set gDelegateClass to the right one of these "
+                  @"(usually the Unity/UnityEngine-prefixed one) and rerun. If it's empty, "
+                  @"the delegate methods may not be exposed as ObjC methods at all in this "
+                  @"build (e.g. a pure C/CFNetwork backend) and this approach needs a different "
+                  @"hook point entirely.", candidates);
             return;
         }
 
@@ -223,3 +281,15 @@ static void PMDidComplete(id self,
 }
 
 @end
+
+// Nothing in the rest of the project ever called +[PatchManifestNetworkPOC
+// install] - that's the actual reason no requests were being detected at
+// all, independent of the two bugs above. Unlike the IL2CPP-touching
+// hooks elsewhere in this project, this one only needs Foundation/the ObjC
+// runtime, both available from process attach, so installing from a plain
+// constructor here (rather than wiring it into fps120.m's IL2CPP-gated
+// startup poll) is safe and keeps this POC self-contained.
+__attribute__((constructor))
+static void PMNetworkPOCConstructor(void) {
+    [PatchManifestNetworkPOC install];
+}

@@ -16,7 +16,7 @@ NSString * const PatchManifestSyncErrorDomain = @"PatchManifestSyncErrorDomain";
 static NSString * const kManifestRelativePath =
     @"Assets/Sound/FMODBuilds/Mobile/BGM_Default_S7_3.assets.bank";
 static NSString * const kDesiredMD5 =
-    @"fbe98ef9f57aff80ada46c4f8af92";
+    @"fbe98ef9f57aff80c58ada46c4f8af92";
 static const NSUInteger kDesiredSize = 57408616;
 
 static dispatch_queue_t gPatchQueue;
