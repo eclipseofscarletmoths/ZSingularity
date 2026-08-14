@@ -119,9 +119,16 @@ typedef struct {
 static int bt_read_stock_fadpcm_samples(const uint8_t *fsb5, size_t fsb5_len,
                                           BTStockSample *out, int max_samples, int *out_count) {
     if (fsb5_len < 0x3C) return -1;
-    int32_t mode              = (int32_t)bt_rd_u32(fsb5 + 24);
-    int32_t num_samples       = (int32_t)bt_rd_u32(fsb5 + 8);
-    int32_t sample_headers_sz = (int32_t)bt_rd_u32(fsb5 + 12);
+    int32_t version            = (int32_t)bt_rd_u32(fsb5 + 4);
+    int32_t num_samples        = (int32_t)bt_rd_u32(fsb5 + 8);
+    int32_t sample_headers_sz  = (int32_t)bt_rd_u32(fsb5 + 12);
+    int32_t name_table_sz      = (int32_t)bt_rd_u32(fsb5 + 16);
+    int32_t data_sz            = (int32_t)bt_rd_u32(fsb5 + 20);
+    int32_t mode               = (int32_t)bt_rd_u32(fsb5 + 24);
+
+NSLog(@"[BankTransplant] FSB5 v=%d samples=%d headers=%d names=%d data=%d mode=%d",
+      version, num_samples, sample_headers_sz,
+      name_table_sz, data_sz, mode);
     if (mode != 16) return -1; // stock should already be FADPCM
     if (num_samples <= 0 || num_samples > max_samples) return -1;
     if ((size_t)sample_headers_sz != (size_t)num_samples * FSB5_STOCK_HEADER_BYTES) return -1; // fixed-size assumption from §1
