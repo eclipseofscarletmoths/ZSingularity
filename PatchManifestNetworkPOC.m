@@ -329,7 +329,6 @@ static void PMNetworkPOCConstructor(void) {
     // them - see the README note added alongside this build).
     NSLog(@"[PatchManifestNetworkPOC] constructor fired - dylib loaded and this file is running");
 
-        
     // Play a strong haptic immediately on startup so the operator knows
     // the dylib is loaded and running. Ensure this runs on the main
     // thread and fall back to the vibration system sound on older iOS.
@@ -342,13 +341,13 @@ static void PMNetworkPOCConstructor(void) {
             AudioServicesPlaySystemSound(kSystemSoundID_Vibrate);
         }
     });
-    
+}
 
 static void PMTryInstallIfNeeded(void) {
     @synchronized ([PatchManifestNetworkPOC class]) {
         if (gInstalled) return;
     }
-    [PatchManifestNetworkPOC install]; // your existing method; already no-ops safely if class not found
+    [PatchManifestNetworkPOC install];
 }
 
 static void PMImageAddedCallback(const struct mach_header *mh, intptr_t vmaddr_slide) {
@@ -356,9 +355,7 @@ static void PMImageAddedCallback(const struct mach_header *mh, intptr_t vmaddr_s
 }
 
 __attribute__((constructor))
-static void PMNetworkPOCConstructor(void) {
+static void PMNetworkPOCConstructor2(void) {
     NSLog(@"[PatchManifestNetworkPOC] constructor fired");
     _dyld_register_func_for_add_image(PMImageAddedCallback);
-}
-
 }
