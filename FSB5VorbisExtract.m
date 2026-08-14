@@ -1,6 +1,4 @@
-// FSB5VorbisExtract.m -- see FSB5VorbisExtract.h. Depends on
-// fsb5_read_base_header (FSB5SampleHeaderIO.h) being filled in before
-// this can walk real sample headers - see that file's comment.
+// FSB5VorbisExtract.m -- see FSB5VorbisExtract.h.
 
 #import "FSB5VorbisExtract.h"
 #import "FSB5SampleHeaderIO.h"
@@ -82,7 +80,7 @@ int fsb5_extract_vorbis_samples(const uint8_t *fsb5, size_t fsb5_len,
         if (cursor + 8 > name_table_base) return -1;
 
         FSB5BaseHeaderFields base;
-        if (fsb5_read_base_header(fsb5 + cursor, &base) != 0) return -1; // see FSB5SampleHeaderIO.h
+        if (fsb5_read_base_header(fsb5 + cursor, &base) != 0) return -1;
 
         size_t after_base = cursor + 8;
         uint32_t crc32 = 0;

@@ -7,8 +7,14 @@
 #import <string.h>
 
 const FadpcmCoef fadpcm_coefs[FADPCM_NUM_COEFS] = {
-    {0, 0}, {0, 0}, {0, 0}, {0, 0},
-    {60, 0}, {122, 60}, {115, 52}, {98, 55},
+    {0, 0},
+    {60, 0},
+    {122, 60},
+    {115, 52},
+    {98, 55},
+    {0, 0},
+    {0, 0},
+    {0, 0},
 };
 
 static inline int16_t clamp16(int64_t v) {
@@ -43,8 +49,10 @@ void fadpcm_decode(const uint8_t *frames, size_t frame_count, int16_t *out_pcm) 
         for (int g = 0; g < FADPCM_GROUPS_PER_FRAME; g++) {
             int coef_idx    = (frame[g / 2] >> ((g % 2) * 4)) & 0xF;
             int shift_factor = (frame[4 + g / 2] >> ((g % 2) * 4)) & 0xF;
-            int16_t coef1 = fadpcm_coefs[coef_idx % FADPCM_NUM_COEFS].coef1; // "%7" wrap per Overview.md is suspect for idx 7; kept as documented
-            int16_t coef2 = fadpcm_coefs[coef_idx % FADPCM_NUM_COEFS].coef2;
+            // FMOD/vgmstream folds coefficient indices 7+ back into the
+            // seven defined entries (index 7 therefore repeats index 0).
+            int16_t coef1 = fadpcm_coefs[coef_idx % 7].coef1;
+            int16_t coef2 = fadpcm_coefs[coef_idx % 7].coef2;
 
             const uint8_t *group = frame + 12 + g * 16;
             int16_t *out = out_pcm + f * FADPCM_SAMPLES_PER_FRAME + g * FADPCM_SAMPLES_PER_GROUP;

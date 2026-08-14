@@ -22,19 +22,11 @@
 //       sample = clamp16((scaled - pred) >> 6)
 //       hist2 = hist1; hist1 = sample
 //
-// KNOWN GAP - coefficient table: Overview.md confirms the table has 8
-// entries, mostly {0,0}, with four nonzero entries {60,0}, {122,60},
-// {115,52}, {98,55} - but does NOT confirm which index holds which
-// value (that mapping wasn't in the source material this was built
-// from). FADPCM_COEFS below is a placeholder ordering (zeros first,
-// then the four nonzero entries in the order Overview.md listed them)
-// - it is NOT verified bit-for-bit and must be checked against a known
-// decoder (vgmstream's fadpcm.c table, or a hex dump of a real FADPCM
-// frame's index nibbles vs. its own decoded output) before this is
-// trusted for anything beyond round-trip self-tests. Get this wrong
-// and encoded audio will decode to noise on-device while still round-
-// tripping fine against this file's own decoder, so don't treat a
-// passing self-test as proof the table is correct.
+// Coefficient ordering matches the FMOD FADPCM decoder used by
+// vgmstream: index 0 is {0,0}; indices 1..4 are {60,0}, {122,60},
+// {115,52}, {98,55}; indices 5..6 are {0,0}. Index 7 folds back
+// to index 0 in the decoder, so it is also represented by a zero pair.
+
 
 #import <stdint.h>
 #import <stddef.h>
@@ -51,7 +43,6 @@ extern "C" {
 
 typedef struct { int16_t coef1, coef2; } FadpcmCoef;
 
-// See "KNOWN GAP" above - placeholder ordering, unverified.
 extern const FadpcmCoef fadpcm_coefs[FADPCM_NUM_COEFS];
 
 // Encodes mono PCM16 into consecutive FADPCM frames. sample_count may be

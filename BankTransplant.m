@@ -13,9 +13,8 @@
 // BUILD NOTE this file needs libvorbis (vorbis/codec.h) linked in to
 // do anything - without it, bt_vorbis_decode_packets always fails with
 // BankTransplantErrorVorbisDecodeFailed. It also needs
-// FSB5SampleHeaderIO.m's two functions actually implemented (currently
-// stubs - see that file) before any real bank will get past
-// BankTransplantErrorWriteFailed. Both are called out here again
+// FSB5SampleHeaderIO.m supplies the packed-header parser/writer used during
+// extraction and rebuild. Both are called out here again
 // because this is the file that will surface those failures at runtime.
 
 #import "BankTransplant.h"
@@ -355,11 +354,15 @@ static int bt_reencode_bank(const char *original_path, const char *modded_path, 
     // Rebuild headers + assemble new FSB5 data region, in stock's
     // sample order (already name-matched 1:1 against modded above).
     static uint8_t new_headers[BT_MAX_SAMPLES][FSB5_STOCK_HEADER_BYTES];
+    // FSB5 sample offsets are stored in 16-byte units, so every sample
+    // start must be 16-byte aligned. FADPCM frame sizes are 140 bytes and
+    // therefore do not preserve alignment by themselves.
     size_t running_offset = 0;
     for (int i = 0; i < stock_count; i++) {
+        running_offset = (running_offset + 15U) & ~((size_t)15U);
         if (fsb5_rebuild_sample_header(stock[i].header, (uint32_t)running_offset, (uint32_t)encoded_bytes[i],
                                         decoded_pcm[i], decoded_counts[i], new_headers[i]) != 0) {
-            *outCode = BankTransplantErrorWriteFailed; // FSB5SampleHeaderIO not implemented yet - see that file
+            *outCode = BankTransplantErrorWriteFailed;
             goto done;
         }
         running_offset += encoded_bytes[i];
@@ -389,10 +392,16 @@ static int bt_reencode_bank(const char *original_path, const char *modded_path, 
     }
     memcpy(fsb5_out + fsb5_header_len + sample_headers_len, fsb5_o + fsb5_header_len + sample_headers_len, name_table_len); // name table, verbatim
     size_t data_write_off = fsb5_header_len + sample_headers_len + name_table_len;
+    size_t data_cursor = 0;
     for (int i = 0; i < stock_count; i++) {
-        memcpy(fsb5_out + data_write_off, encoded_fadpcm[i], encoded_bytes[i]);
-        data_write_off += encoded_bytes[i];
+        size_t aligned = (data_cursor + 15U) & ~((size_t)15U);
+        if (aligned > data_cursor) {
+            memset(fsb5_out + data_write_off + data_cursor, 0, aligned - data_cursor);
+        }
+        memcpy(fsb5_out + data_write_off + aligned, encoded_fadpcm[i], encoded_bytes[i]);
+        data_cursor = aligned + encoded_bytes[i];
     }
+    running_offset = data_cursor;
     bt_wr_u32(fsb5_out + 20, (uint32_t)running_offset); // FSB5 dataSize field
 
     bt_wr_u32(out + 4,                              (uint32_t)(wrapper_len - 8 + new_fsb5_len)); // RIFF size
@@ -573,7 +582,7 @@ static NSString * const kBTVorbisSetupResourceName = @"FSB5VorbisSetupTable.bin"
         case BankTransplantErrorBackupFailed:
             return @"Couldn't create a backup of the stock bank before touching it.";
         case BankTransplantErrorWriteFailed:
-            return @"Re-encode or swap-in failed while writing to disk - possibly FSB5SampleHeaderIO's unimplemented base-header plug point, see that file.";
+            return @"Re-encode or swap-in failed while writing the rebuilt FSB5 bank.";
     }
     return @"Unknown bank transplant failure.";
 }

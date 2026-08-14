@@ -64,6 +64,7 @@ jobs:
             FSB5VorbisExtract.m \
             VorbisSetupTable.m \
             -lc++ \
+            -Wl,-sectcreate,__DATA,__fsb5setup,FSB5VorbisSetupTable.bin \
             -o ZSingularity.dylib
 
       # Ad-hoc sign so the dylib is well-formed on its own; patch-ipa.yml

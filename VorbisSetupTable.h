@@ -1,8 +1,8 @@
 // VorbisSetupTable.h
 //
-// FSB5's Vorbis sample headers store only a crc32 of the Vorbis
-// identification+setup (codebook) packet pair, not the packets
-// themselves - per Overview.md §6, confirmed against python-fsb5
+// FSB5's Vorbis sample headers store only a crc32 identifying the Vorbis
+// setup packet; the setup packet itself is supplied by the external preset table.
+// Confirmed against python-fsb5.
 // (MIT-licensed, the reference FSB5-modding library): decoding requires
 // looking that crc32 up against a table of FMOD's own preset
 // setup-headers, which python-fsb5's maintainers had to dump directly

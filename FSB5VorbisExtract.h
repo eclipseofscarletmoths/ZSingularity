@@ -30,7 +30,7 @@ typedef struct {
     int32_t  sample_rate;
     int32_t  channels;       // 1 or 2
     uint32_t setup_crc32;
-    uint32_t data_offset;     // byte offset of this sample's data within the FSB5 data region, per FSB5SampleHeaderIO's (currently unimplemented) base-header decode
+    uint32_t data_offset;     // byte offset of this sample's data within the FSB5 data region, decoded from the FSB5 packed base header
     const uint8_t *packet_stream; // points into the caller's FSB5 buffer - not owned
     size_t   packet_stream_len;
 } FSB5VorbisSample;
