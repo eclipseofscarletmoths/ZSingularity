@@ -4,6 +4,7 @@
 #import <objc/runtime.h>
 #import <UIKit/UIKit.h>
 #import <AudioToolbox/AudioToolbox.h>
+#import <mach-o/dyld.h>
 
 // NOTE: this used to be compared against url.host, which only ever
 // contains the bare hostname (e.g. "downloadfmod.limbuscompanycdn.org").
@@ -328,6 +329,25 @@ static void PMNetworkPOCConstructor(void) {
     // them - see the README note added alongside this build).
     NSLog(@"[PatchManifestNetworkPOC] constructor fired - dylib loaded and this file is running");
 
+
+static void PMTryInstallIfNeeded(void) {
+    @synchronized ([PatchManifestNetworkPOC class]) {
+        if (gInstalled) return;
+    }
+    [PatchManifestNetworkPOC install]; // your existing method; already no-ops safely if class not found
+}
+
+static void PMImageAddedCallback(const struct mach_header *mh, intptr_t vmaddr_slide) {
+    PMTryInstallIfNeeded();
+}
+
+__attribute__((constructor))
+static void PMNetworkPOCConstructor(void) {
+    NSLog(@"[PatchManifestNetworkPOC] constructor fired");
+    _dyld_register_func_for_add_image(PMImageAddedCallback);
+}
+
+        
     // Play a strong haptic immediately on startup so the operator knows
     // the dylib is loaded and running. Ensure this runs on the main
     // thread and fall back to the vibration system sound on older iOS.
