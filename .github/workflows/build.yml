@@ -81,23 +81,23 @@ jobs:
           done
           ar rcs libogg.a bitwise.o framing.o
 
-      # Full lib/*.c minus vorbisfile.c (stdio-based stream/page
-      # demuxing API we don't use - BankTransplant.m feeds raw packets
-      # straight from FSB5's own length-prefixed stream, bypassing
-      # ogg_sync/ogg_stream entirely). Everything else is kept, including
-      # the encoder-side files (analysis.c, vorbisenc.c, psy.c, etc.) -
-      # registry.c's backend tables reference both encode and decode
-      # sides, and trimming further risks link errors for the sake of a
-      # few hundred KB in a dylib nobody's shipping to the App Store.
+      # Explicit source list, not a glob over lib/*.c: libvorbis's lib/
+      # directory also contains psytune.c (a standalone offline psy-
+      # model tuning tool with its own main() - never part of the
+      # actual library, just shipped alongside it) which a glob picks
+      # up and fails to compile. This list is libvorbis's own
+      # lib/Makefile.am SOURCES, minus vorbisfile.c - that's the
+      # stdio-based stream/page demuxing API, unneeded since
+      # BankTransplant.m feeds raw packets straight off FSB5's own
+      # length-prefixed stream, bypassing ogg_sync/ogg_stream entirely.
       - name: Build libvorbis (arm64, iphoneos)
         run: |
           mkdir -p build/vorbis
           cd build/vorbis
           SRC="$GITHUB_WORKSPACE/vendor/vorbis-src/lib"
+          FILES="analysis bitrate block codebook envelope floor0 floor1 info lookup lpc lsp mapping0 mdct psy registry res0 sharedbook smallft synthesis vorbisenc window"
           OBJS=()
-          for f in "$SRC"/*.c; do
-            name=$(basename "$f" .c)
-            [ "$name" = "vorbisfile" ] && continue
+          for name in $FILES; do
             clang -c -O2 \
               -isysroot "${{ steps.sdk.outputs.path }}" \
               -arch arm64 \
@@ -105,7 +105,7 @@ jobs:
               -I "$GITHUB_WORKSPACE/vendor/ogg/include" \
               -I "$GITHUB_WORKSPACE/vendor/vorbis-src/include" \
               -I "$SRC" \
-              "$f" \
+              "$SRC/$name.c" \
               -o "$name.o"
             OBJS+=("$name.o")
           done
