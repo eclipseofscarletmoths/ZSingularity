@@ -50,10 +50,12 @@ jobs:
           BUILD="$RUNNER_TEMP/libogg-build"
 
           rm -rf "$SRC" "$BUILD"
-          git clone --depth 1 --branch "v${OGG_VERSION}" \
-            https://github.com/xiph/ogg.git "$SRC"
+          git clone https://github.com/xiph/ogg.git "$SRC"
+          cd "$SRC"
+          git checkout 65b355cc20171010ecabf245e7b339aeab8ddbb9
+          cd -
 
-          cmake -S "$SRC" -B "$BUILD" \
+             cmake -S "$SRC" -B "$BUILD" \
             -G "Unix Makefiles" \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_SYSTEM_NAME=iOS \
