@@ -114,9 +114,6 @@ typedef NS_ENUM(NSInteger, PatchManifestSyncErrorCode) {
 // treat it as the swap having failed.
 + (BOOL)resyncFmodPatchManifestWithError:(NSError **)error;
 
-// Starts the cache watcher immediately when the dylib loads.
-+ (void)startManifestTracker;
-
 @end
 
 NS_ASSUME_NONNULL_END
