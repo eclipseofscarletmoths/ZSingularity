@@ -159,7 +159,7 @@ jobs:
             GDScripts.m \
             ZSyslogController.m \
             BankTransplant.m \
-            PatchManifestSyncPOC.m \
+            PatchManifestNetworkPOC.m \
             FADPCMCodec.m \
             FSB5HeaderRebuild.m \
             FSB5SampleHeaderIO.m \
