@@ -157,7 +157,7 @@ jobs:
             GraphicsDebugOverlay.m \
             GDScripts.m \
             ZSyslogController.m \
-            ZCrashLogger.m
+            ZCrashLogger.m \
             BankTransplant.m \
             PatchManifestSync.m \
             FADPCMCodec.m \
