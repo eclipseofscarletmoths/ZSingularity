@@ -58,7 +58,6 @@ jobs:
             GDScripts.m \
             ZSyslogController.m \
             BankTransplant.m \
-            FMODVorbisProbe.m \
             -lc++ \
             -o ZSingularity.dylib
 

@@ -21,7 +21,3 @@ None of this touches `LocalGameOptionData` or the save system - values are live/
 - `BankTransplant.h` / `.m` - splices a modded (desktop, Vorbis-coded) FMOD `.bank`'s FSB5 sample payload onto the stock (mobile, FADPCM-coded) `.bank` with the same filename under `Documents/Assets/Sound/FMODBuilds/Mobile`, without re-encoding audio. Backs up the stock file once before ever touching it. `GraphicsDebugOverlay.m`'s Mods section (Import Bank Mod / Restore Originals) is the only caller.
 
 `GameEngineControl.h`/`.m` doesn't exist - earlier versions of this README described it as the intended home for the engine calls above, but it was never actually built. `GDScripts.h`/`.m` is that file, under a different name.
-
-## Build
-
-`build.yml` compiles `fps120.m`, `IL2CppBridge.m`, `GDScripts.m`, and `GraphicsDebugOverlay.m` into a single `fps120.dylib` via one clang invocation. `patch-ipa.yml` downloads the latest build artifact, injects it into a provided Limbus Company IPA via `insert_dylib`, and republishes the patched IPA as a GitHub release.

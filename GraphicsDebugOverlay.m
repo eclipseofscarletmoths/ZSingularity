@@ -187,7 +187,6 @@
 #import "ZSyslogController.h" // FPS120Controller + every non-UI engine script this file used to own directly - see that file's header
 #import "ZTweakLog.h"
 #import "BankTransplant.h"
-#import "FMODVorbisProbe.h"
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h> // UTType-based UIDocumentPickerViewController init, for the Mods section's "Import Bank Mod" button
 #import "GDEmbeddedFont.h" // kExcelsiorSansTTF / kExcelsiorSansTTFLength - see that file's header
 
@@ -1893,8 +1892,6 @@ static UIView *gd_make_title_block(void) {
 @property (nonatomic, assign) CGFloat panelWidth;
 @property (nonatomic, strong) NSTimer *postFXReapplyTimer;
 @property (nonatomic, strong) NSTimer *saveDebounceTimer;      // coalesces rapid slider-drag changes into one JSON write
-@property (nonatomic, assign) BOOL pendingVorbisProbe;          // disambiguates the shared file picker: Import Bank Mod vs Probe Vorbis Support
-@property (nonatomic, copy) NSString *lastVorbisProbeResult;    // for the "Copy Last Result" button; nil until a probe has run
 @property (nonatomic, strong) UIVisualEffectView *syslogHandleGlass;
 @property (nonatomic, strong) UIView *syslogHandle;
 @property (nonatomic, strong) UILabel *syslogHandleLabel;
@@ -2582,22 +2579,6 @@ static const CGFloat kContentFadeHeight = 22;
     [restoreBanksButton addTarget:self action:@selector(restoreOriginalBanksTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.stack addArrangedSubview:modsRow];
 
-    // Probe Vorbis Support: FMODVorbisProbe.h/.m - independent of the
-    // splice above. Picks a desktop-coded (Vorbis) .bank, pulls its
-    // FSB5 blob out unmodified, and hands it straight to the game's own
-    // live FMOD_SYSTEM via FMOD_System_CreateSound, bypassing the bank/
-    // Addressables pipeline (and whatever in it triggers the download
-    // prompt on a swapped bank) entirely. Answers "does this device's
-    // FMOD have Vorbis at all" on its own, independent of that pipeline.
-    GDRow *probeRow = gd_make_button_pair_row(
-        @"Probe Vorbis Support", [UIColor colorWithRed:0.42 green:0.62 blue:1.0 alpha:1.0],
-        @"Copy Last Result", [UIColor colorWithRed:0.6 green:0.6 blue:0.6 alpha:1.0]);
-    UIButton *probeButton = objc_getAssociatedObject(probeRow, "gd_button_left");
-    [probeButton addTarget:self action:@selector(probeVorbisSupportTapped) forControlEvents:UIControlEventTouchUpInside];
-    UIButton *copyProbeResultButton = objc_getAssociatedObject(probeRow, "gd_button_right");
-    [copyProbeResultButton addTarget:self action:@selector(copyLastVorbisProbeResultTapped) forControlEvents:UIControlEventTouchUpInside];
-    [self.stack addArrangedSubview:probeRow];
-
     // --- Config ---
     // Native Liquid Glass, sized to match every other row/button on the
     // panel (see gd_make_button_row). Deliberately the very last thing
@@ -2718,21 +2699,6 @@ static const CGFloat kContentFadeHeight = 22;
 // content type rather than filtering by extension - UIDocumentPickerViewController
 // doesn't offer filename-extension filtering separately from UTType.
 - (void)importBankModTapped {
-    self.pendingVorbisProbe = NO;
-    [self gd_presentBankFilePicker];
-}
-
-// See FMODVorbisProbe.h for what this actually tests and why it's
-// independent of the splice/Addressables path above. Shares the same
-// file picker as Import Bank Mod (both want a desktop-coded/Vorbis
-// .bank) - documentPicker:didPickDocumentsAtURLs: below dispatches on
-// pendingVorbisProbe to tell the two apart.
-- (void)probeVorbisSupportTapped {
-    self.pendingVorbisProbe = YES;
-    [self gd_presentBankFilePicker];
-}
-
-- (void)gd_presentBankFilePicker {
     UIDocumentPickerViewController *picker;
     if (@available(iOS 14.0, *)) {
         picker = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTTypeData, UTTypeItem]];
@@ -2745,7 +2711,7 @@ static const CGFloat kContentFadeHeight = 22;
 
     UIViewController *presenter = gd_key_window().rootViewController;
     if (!presenter) {
-        ZLog(@"[Mods] no root view controller to present the file picker from");
+        ZLog(@"[BankTransplant] no root view controller to present the file picker from");
         return;
     }
     [presenter presentViewController:picker animated:YES completion:nil];
@@ -2754,11 +2720,6 @@ static const CGFloat kContentFadeHeight = 22;
 - (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
     NSURL *moddedURL = urls.firstObject;
     if (!moddedURL) return;
-
-    if (self.pendingVorbisProbe) {
-        [self gd_runVorbisProbeOnURL:moddedURL];
-        return;
-    }
 
     NSError *error = nil;
     BOOL ok = [BankTransplant transplantAndSwapModdedBankAtURL:moddedURL error:&error];
@@ -2773,34 +2734,6 @@ static const CGFloat kContentFadeHeight = 22;
         [self gd_presentModsAlertWithTitle:@"Transplant Failed"
                                     message:error.localizedDescription ?: @"Unknown error."];
     }
-}
-
-- (void)gd_runVorbisProbeOnURL:(NSURL *)moddedURL {
-    NSString *resultDescription = nil;
-    NSError *error = nil;
-    BOOL ok = [FMODVorbisProbe probeVorbisSupportWithModdedBankAtURL:moddedURL
-                                                    resultDescription:&resultDescription
-                                                                error:&error];
-
-    UINotificationFeedbackGenerator *haptic = [UINotificationFeedbackGenerator new];
-    if (!ok) {
-        [haptic notificationOccurred:UINotificationFeedbackTypeError];
-        [self gd_presentModsAlertWithTitle:@"Probe Couldn't Run"
-                                    message:error.localizedDescription ?: @"Unknown error."];
-        return;
-    }
-
-    self.lastVorbisProbeResult = resultDescription;
-    BOOL passed = [resultDescription hasPrefix:@"FMOD_OK"];
-    [haptic notificationOccurred:passed ? UINotificationFeedbackTypeSuccess : UINotificationFeedbackTypeWarning];
-    [self gd_presentModsAlertWithTitle:passed ? @"Vorbis Supported" : @"Vorbis Not Supported"
-                                message:resultDescription];
-}
-
-- (void)copyLastVorbisProbeResultTapped {
-    UIPasteboard.generalPasteboard.string = self.lastVorbisProbeResult ?: @"No probe has run yet.";
-    UIImpactFeedbackGenerator *haptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
-    [haptic impactOccurred];
 }
 
 // Restores every stock bank under Assets/Sound/FMODBuilds/Mobile that's

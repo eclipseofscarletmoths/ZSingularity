@@ -1,22 +1,35 @@
 // BankTransplant.h
 //
-// ObjC entry point around the chunk-walking splice described in
-// bank_transplant.c: takes a desktop-coded (Vorbis) modded .bank picked
-// by the user, finds the stock mobile-coded (FADPCM) .bank with the same
-// filename under this app's own FMOD build directory, and swaps only the
-// trailing FSB5 sample payload onto the stock file's FEV/RIFF wrapper -
-// the wrapper (GUIDs, event list, sample name table) is per-project, not
-// per-platform, so it's byte-identical between builds except for three
-// length fields this rewrites. No Vorbis/FADPCM re-encoding happens here.
+// REPURPOSED from the original wrapper-splice approach (see git history /
+// README for the old version) to an audio re-encode pipeline. The old
+// approach spliced a desktop-coded (Vorbis) modded bank's *entire* FSB5
+// blob - its own sample headers, name table, and data - onto the stock
+// mobile bank's FEV/RIFF wrapper, unchanged. That kept the payload
+// Vorbis-coded, which meant two independent things had to hold for it to
+// work: whatever integrity check gates a swapped bank file had to accept
+// it, AND the mobile FMOD runtime had to have a Vorbis decoder linked in
+// - both unconfirmed, per the project notes.
 //
-// This is theory-stage, per the project notes: whether a spliced file
-// actually plays depends on the mobile FMOD runtime having Vorbis linked
-// in, which hasn't been confirmed on-device yet.
+// This version drops the header-transplant/splice logic entirely. Instead
+// it decodes the modded bank's Vorbis sample data to PCM, re-encodes that
+// PCM to FADPCM (FADPCMCodec.h/.m), and rebuilds each sample's FSB5
+// header by cloning the STOCK file's own existing FADPCM header for that
+// sample name and patching only what changes with re-encoded content
+// (data offset/size, peak-normalization value) - see FSB5HeaderRebuild.h.
+// The result is structurally an ordinary FADPCM bank in the stock file's
+// own shape, not a splice of someone else's header table, which sidesteps
+// both open questions above: no Vorbis decode is required on-device, and
+// the file is closer to what a real FADPCM build looks like.
 //
-// Every write to the game's own bank file is preceded by a one-time,
-// never-overwritten backup (<name>.bank.orig-bak) so +restoreAllBackedUpBanksWithError:
-// can always get back to the untouched stock file regardless of how many
-// times a bank has since been re-swapped.
+// This does NOT remove every unknown - see FSB5HeaderRebuild.h and
+// FSB5VorbisExtract.h for what's still unverified (the coefficient table
+// mapping and the FSB5 packed-header bit layout) before treating output
+// from this pipeline as trustworthy on-device.
+//
+// Every write to the game's own bank file is still preceded by a
+// one-time, never-overwritten backup (<name>.bank.orig-bak) so
+// +restoreAllBackedUpBanksWithError: can always get back to the untouched
+// stock file regardless of how many times a bank has since been re-swapped.
 
 #import <Foundation/Foundation.h>
 
@@ -26,13 +39,16 @@ extern NSString * const BankTransplantErrorDomain;
 
 typedef NS_ENUM(NSInteger, BankTransplantErrorCode) {
     BankTransplantErrorCantReadModded = 1,
-    BankTransplantErrorOriginalNotFound,   // no file with the modded bank's name under the Mobile FMOD build directory
+    BankTransplantErrorOriginalNotFound,     // no file with the modded bank's name under the Mobile FMOD build directory
     BankTransplantErrorCantReadOriginal,
-    BankTransplantErrorBadOriginalWrapper, // original doesn't parse as a RIFF/FEV bank with an SNDH+SND wrapper
-    BankTransplantErrorBadModdedWrapper,   // modded doesn't parse the same way
-    BankTransplantErrorSampleSetMismatch,  // sample name tables differ between the two FSB5 blobs - refused, not spliced
-    BankTransplantErrorBackupFailed,       // couldn't create the one-time backup of the original before touching it
-    BankTransplantErrorWriteFailed,        // splice succeeded but writing/swapping the result on disk failed
+    BankTransplantErrorBadOriginalWrapper,   // stock doesn't parse as a RIFF/FEV bank with an SNDH+SND wrapper
+    BankTransplantErrorBadModdedWrapper,     // modded doesn't parse the same way
+    BankTransplantErrorSampleSetMismatch,    // sample name tables differ between the two FSB5 blobs - refused, not re-encoded
+    BankTransplantErrorModdedNotVorbis,      // modded's FSB5 mode isn't 15 (Vorbis) - nothing to re-encode
+    BankTransplantErrorVorbisSetupUnknown,   // a sample's crc32 wasn't found in the bundled known-setup-packet table (see FSB5VorbisExtract.h) - can't decode without FMOD's own preset codebook for it
+    BankTransplantErrorVorbisDecodeFailed,   // libvorbis rejected/errored on a sample's packet stream
+    BankTransplantErrorBackupFailed,         // couldn't create the one-time backup of the original before touching it
+    BankTransplantErrorWriteFailed,          // re-encode succeeded but writing/swapping the result on disk failed
 };
 
 @interface BankTransplant : NSObject
@@ -47,10 +63,16 @@ typedef NS_ENUM(NSInteger, BankTransplantErrorCode) {
 // This starts/stops that access itself; callers don't need to.
 //
 // Looks up moddedURL.lastPathComponent under +mobileFMODBuildsDirectory,
-// backs that file up on first touch, splices the modded FSB5 payload onto
-// its wrapper, and atomically replaces it in place. Returns NO and fills
-// error on any failure (nothing on disk is modified in that case, aside
-// from the backup, which is always safe to have made).
+// backs that file up on first touch, decodes every Vorbis sample in the
+// modded bank to PCM, re-encodes each to FADPCM, rebuilds sample headers
+// against the stock file's own header table, and atomically replaces the
+// stock bank in place. Returns NO and fills error on any failure (nothing
+// on disk is modified in that case, aside from the backup, which is
+// always safe to have made).
+//
+// This can legitimately be slow (real Vorbis decode + a from-scratch
+// analysis-by-synthesis ADPCM encoder, per-sample, on-device) - callers
+// should not run it on the main thread for anything but tiny test banks.
 + (BOOL)transplantAndSwapModdedBankAtURL:(NSURL *)moddedURL
                                     error:(NSError **)error;
 
