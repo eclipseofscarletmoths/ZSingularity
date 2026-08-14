@@ -168,4 +168,9 @@ static void PMSScanOnce(void) {
     });
 }
 
++ (BOOL)resyncFmodPatchManifestWithError:(NSError **)error {
+    // TODO: POC stub - implement actual manifest resync
+    return YES;
+}
+
 @end
