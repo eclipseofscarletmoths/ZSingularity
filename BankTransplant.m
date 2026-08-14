@@ -204,7 +204,17 @@ static int16_t *bt_vorbis_decode_packets(const uint8_t *packet_stream, size_t pa
     header_id.bytes = sizeof(id_buf);
     header_id.b_o_s = 1;
 
-    static const unsigned char empty_comment[] = { 3, 'v','o','r','b','i','s', 0,0,0,0 };
+    static const unsigned char empty_comment[] = {
+        3, 'v','o','r','b','i','s',   // packet type 3, "vorbis" magic
+        0,0,0,0,                      // vendor_length = 0 (no vendor string follows)
+        0,0,0,0,                      // user_comment_list_length = 0 (no comments follow)
+        1,                            // framing bit
+    };                                 // 16 bytes total - the previous 11-byte version
+                                        // was missing user_comment_list_length and the
+                                        // framing bit, which is almost certainly why
+                                        // libvorbis was rejecting every sample: this
+                                        // header gets fed to vorbis_synthesis_headerin
+                                        // before the real setup packet ever does.
     header_comment.packet = (unsigned char *)empty_comment;
     header_comment.bytes = sizeof(empty_comment);
 
