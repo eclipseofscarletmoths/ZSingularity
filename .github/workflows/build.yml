@@ -57,7 +57,7 @@ jobs:
 
           
              cmake -S "$SRC" -B "$BUILD" \
-            -DCMAKE_POLICY_CMP0091=NEW
+            -DCMAKE_POLICY_CMP0091=NEW \
             -G "Unix Makefiles" \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_SYSTEM_NAME=iOS \
@@ -97,7 +97,7 @@ jobs:
             https://github.com/xiph/vorbis.git "$SRC"
 
              cmake -S "$SRC" -B "$BUILD" \
-            -DCMAKE_POLICY_CMP0091=NEW
+            -DCMAKE_POLICY_CMP0091=NEW \
             -G "Unix Makefiles" \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_SYSTEM_NAME=iOS \
