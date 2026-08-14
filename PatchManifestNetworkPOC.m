@@ -41,7 +41,7 @@ static BOOL PMIsTargetTask(NSURLSessionDataTask *task) {
     // least once. If this never prints anything, the hook itself isn't
     // firing (see the +install log line) - that's a different problem
     // than the URL not matching, and worth ruling out first.
-    NSLog(@"[PatchManifestNetworkPOC] observed request host=%@ path=%@ match=%@",
+    ZLog(@"[PatchManifestNetworkPOC] observed request host=%@ path=%@ match=%@",
           host, path, match ? @"YES" : @"NO");
 
     return match;
@@ -307,6 +307,6 @@ static void PMNetworkPOCConstructor(void) {
     // started with a completion-handler API, which bypasses session
     // delegate callbacks entirely regardless of which class implements
     // them - see the README note added alongside this build).
-    ZLog(@"[PatchManifestNetworkPOC] constructor fired - dylib loaded and this file is running");
+    NSLog(@"[PatchManifestNetworkPOC] constructor fired - dylib loaded and this file is running");
     [PatchManifestNetworkPOC install];
 }
