@@ -7,13 +7,22 @@
 #import <mach-o/dyld.h>
 #import <pthread.h>
 
-static const NSUInteger kMaxManifestBytes = 32ULL * 1024ULL * 1024ULL;
-
-// Keep the network interception scoped to the game's manifest endpoint.
-// Once that manifest is intercepted, every entry in its Files dictionary is
-// rewritten; there is deliberately no per-file/bank matching anymore.
+// NOTE: this used to be compared against url.host, which only ever
+// contains the bare hostname (e.g. "downloadfmod.limbuscompanycdn.org").
+// A full "https://host/path" string can never match .host, so
+// PMIsTargetTask() was unconditionally returning NO and nothing was
+// ever intercepted regardless of what the game actually requested.
 static NSString * const kTargetHostSuffix = @"limbuscompanycdn.org";
+// The path we actually observed included a build-dated token segment
+// ("/f20260813_S8pD8WWQc4i0MQKT1X1W/...") ahead of the real filename.
+// That token is almost certainly per-build/per-session and will change
+// on the next patch, so match on the filename instead of the full path.
 static NSString * const kTargetPathSuffix = @"FmodPatchInfo.json";
+static NSString * const kTargetBank = @"Assets/Sound/FMODBuilds/Mobile/BGM_Default_S7_3.assets.bank";
+static NSString * const kDesiredMD5 = @"fbe98ef9f57aff80c58ada46c4f8af92";
+static const NSUInteger kDesiredSize = 57408616;
+
+static const NSUInteger kMaxManifestBytes = 32ULL * 1024ULL * 1024ULL;
 
 static IMP gOrigDidReceiveData;
 static IMP gOrigDidComplete;
@@ -80,31 +89,24 @@ static NSData *PMPatchManifestData(NSData *input) {
         return input;
     }
 
-    NSUInteger patchedCount = 0;
-    NSUInteger skippedCount = 0;
-
-    // Rewrite every manifest file entry. We intentionally do not match on
-    // filenames, paths, hashes, or sizes here: every entry gets the same
-    // zeroed integrity metadata.
-    for (NSString *path in files.allKeys) {
-        id rawEntry = files[path];
-        if (![rawEntry isKindOfClass:[NSMutableDictionary class]]) {
-            skippedCount++;
-            continue;
-        }
-
-        NSMutableDictionary *entry = (NSMutableDictionary *)rawEntry;
-
-        entry[@"Hash"] = @"0";
-        entry[@"Size"] = @0;
-        entry[@"Crc"] = @0;
-        patchedCount++;
-    }
-
-    if (patchedCount == 0) {
-        ZLog(@"[PatchManifestNetworkPOC] Files dictionary contained no mutable entries");
+    NSMutableDictionary *entry = files[kTargetBank];
+    if (![entry isKindOfClass:[NSMutableDictionary class]]) {
+        ZLog(@"[PatchManifestNetworkPOC] target bank entry not found");
         return input;
     }
+
+    NSString *oldHash = [entry[@"Hash"] isKindOfClass:NSString.class] ? entry[@"Hash"] : @"";
+    NSNumber *oldSizeNumber = [entry[@"Size"] respondsToSelector:@selector(unsignedLongLongValue)]
+        ? entry[@"Size"] : nil;
+    unsigned long long oldSize = oldSizeNumber.unsignedLongLongValue;
+
+    if ([oldHash caseInsensitiveCompare:kDesiredMD5] == NSOrderedSame &&
+        oldSize == kDesiredSize) {
+        return input;
+    }
+
+    entry[@"Hash"] = kDesiredMD5;
+    entry[@"Size"] = @(kDesiredSize);
 
     NSError *encodeError = nil;
     NSData *output = [NSJSONSerialization dataWithJSONObject:manifest
@@ -115,9 +117,12 @@ static NSData *PMPatchManifestData(NSData *input) {
         return input;
     }
 
-    ZLog(@"[PatchManifestNetworkPOC] zeroed integrity metadata for %lu manifest entries (skipped %lu)",
-         (unsigned long)patchedCount,
-         (unsigned long)skippedCount);
+    ZLog(@"[PatchManifestNetworkPOC] patched %@: Hash %@ -> %@, Size %llu -> %lu",
+          kTargetBank,
+          oldHash,
+          kDesiredMD5,
+          oldSize,
+          (unsigned long)kDesiredSize);
 
     return output;
 }

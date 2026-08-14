@@ -187,7 +187,8 @@
 #import "ZSyslogController.h" // FPS120Controller + every non-UI engine script this file used to own directly - see that file's header
 #import "ZTweakLog.h"
 #import "BankTransplant.h"
-#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h> // UTType-based UIDocumentPickerViewController init, for the Mods section's "Import Bank Mod" button
+#import "BundleTransplant.h"
+#import <UniformTypeIdentifiers/UniformTypeIdentifiers.h> // UTType-based UIDocumentPickerViewController init, for the Mods section's "Import Bank Mod"/"Import Bundle Mod(s)" buttons
 #import "GDEmbeddedFont.h" // kExcelsiorSansTTF / kExcelsiorSansTTFLength - see that file's header
 
 #pragma mark - Window discovery
@@ -2579,6 +2580,20 @@ static const CGFloat kContentFadeHeight = 22;
     [restoreBanksButton addTarget:self action:@selector(restoreOriginalBanksTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.stack addArrangedSubview:modsRow];
 
+    // Bundle Transplant: general-purpose counterpart to the bank row above -
+    // see BundleTransplant.h. Matches on CAB identity rather than filename
+    // (every cached bundle on disk is literally named "__data"), so this
+    // supports picking more than one modded bundle at once, unlike the bank
+    // row's single-file picker.
+    GDRow *bundleModsRow = gd_make_button_pair_row(
+        @"Import Bundle Mod(s)", [UIColor colorWithRed:0.42 green:0.62 blue:1.0 alpha:1.0],
+        @"Restore Bundles", [UIColor colorWithRed:1.0 green:0.42 blue:0.42 alpha:1.0]);
+    UIButton *importBundleButton = objc_getAssociatedObject(bundleModsRow, "gd_button_left");
+    [importBundleButton addTarget:self action:@selector(importBundleModTapped) forControlEvents:UIControlEventTouchUpInside];
+    UIButton *restoreBundlesButton = objc_getAssociatedObject(bundleModsRow, "gd_button_right");
+    [restoreBundlesButton addTarget:self action:@selector(restoreOriginalBundlesTapped) forControlEvents:UIControlEventTouchUpInside];
+    [self.stack addArrangedSubview:bundleModsRow];
+
     // --- Config ---
     // Native Liquid Glass, sized to match every other row/button on the
     // panel (see gd_make_button_row). Deliberately the very last thing
@@ -2686,6 +2701,13 @@ static const CGFloat kContentFadeHeight = 22;
     [haptic impactOccurred];
 }
 
+// Associated-object key on a UIDocumentPickerViewController instance,
+// tagging which import flow presented it ("bank" or "bundle") - both
+// pickers share the one UIDocumentPickerDelegate method below, so this is
+// how that shared callback knows which of BankTransplant/BundleTransplant
+// to route the picked URL(s) to.
+static void * const kGDModsPickerKindKey = (void *)&kGDModsPickerKindKey;
+
 #pragma mark Mods (bank transplant)
 //
 // UI-side glue only - the actual splice/backup/swap logic lives in
@@ -2708,6 +2730,7 @@ static const CGFloat kContentFadeHeight = 22;
     }
     picker.delegate = self;
     picker.allowsMultipleSelection = NO;
+    objc_setAssociatedObject(picker, kGDModsPickerKindKey, @"bank", OBJC_ASSOCIATION_COPY);
 
     UIViewController *presenter = gd_key_window().rootViewController;
     if (!presenter) {
@@ -2715,6 +2738,135 @@ static const CGFloat kContentFadeHeight = 22;
         return;
     }
     [presenter presentViewController:picker animated:YES completion:nil];
+}
+
+#pragma mark Mods (bundle transplant)
+//
+// UI-side glue only, mirroring the bank section above - the actual scan/
+// match/swap logic lives in BundleTransplant.h/.m. The one shape
+// difference from the bank picker: this allows multiple selection, since
+// CAB matching (unlike the bank row's filename lookup) doesn't need the
+// user to import one file at a time.
+
+- (void)importBundleModTapped {
+    UIDocumentPickerViewController *picker;
+    if (@available(iOS 14.0, *)) {
+        picker = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTTypeData, UTTypeItem]];
+    } else {
+        picker = [[UIDocumentPickerViewController alloc] initWithDocumentTypes:@[@"public.data", @"public.item"]
+                                                                          inMode:UIDocumentPickerModeImport];
+    }
+    picker.delegate = self;
+    picker.allowsMultipleSelection = YES;
+    objc_setAssociatedObject(picker, kGDModsPickerKindKey, @"bundle", OBJC_ASSOCIATION_COPY);
+
+    UIViewController *presenter = gd_key_window().rootViewController;
+    if (!presenter) {
+        ZLog(@"[BundleTransplant] no root view controller to present the file picker from");
+        return;
+    }
+    [presenter presentViewController:picker animated:YES completion:nil];
+}
+
+// BundleTransplant's index-build pass reads every cached __data's header
+// (potentially thousands - see that file's header) before it can resolve
+// even one match, so this gets the same background-queue + working-alert
+// treatment as the bank picker's re-encode, for the same reason: this is
+// UIKit main-thread code, and blocking it here would freeze the game with
+// no feedback for however long the scan takes.
+- (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
+    if (urls.count == 0) return;
+
+    NSString *kind = objc_getAssociatedObject(controller, kGDModsPickerKindKey);
+    if ([kind isEqualToString:@"bundle"]) {
+        [self gd_handlePickedBundleModURLs:urls];
+    } else {
+        [self gd_handlePickedBankModURL:urls.firstObject];
+    }
+}
+
+- (void)gd_handlePickedBundleModURLs:(NSArray<NSURL *> *)urls {
+    UIViewController *presenter = gd_key_window().rootViewController;
+    UIAlertController *working = [UIAlertController alertControllerWithTitle:@"Scanning Cache…"
+                                                                       message:@"Indexing cached bundles by CAB and swapping matches. This can take a while with a large cache."
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+    UIActivityIndicatorView *spinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
+    spinner.translatesAutoresizingMaskIntoConstraints = NO;
+    [working.view addSubview:spinner];
+    [spinner startAnimating];
+    [NSLayoutConstraint activateConstraints:@[
+        [spinner.centerXAnchor constraintEqualToAnchor:working.view.centerXAnchor],
+        [spinner.bottomAnchor constraintEqualToAnchor:working.view.bottomAnchor constant:-16],
+    ]];
+    if (presenter) [presenter presentViewController:working animated:YES completion:nil];
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSError *error = nil;
+        NSArray<BundleTransplantResult *> *results = [BundleTransplant transplantAndSwapModdedBundlesAtURLs:urls error:&error];
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            void (^showResult)(void) = ^{
+                UINotificationFeedbackGenerator *haptic = [UINotificationFeedbackGenerator new];
+                if (!results) {
+                    [haptic notificationOccurred:UINotificationFeedbackTypeError];
+                    [self gd_presentModsAlertWithTitle:@"Scan Failed"
+                                                message:error.localizedDescription ?: @"Unknown error."];
+                    return;
+                }
+
+                NSInteger totalSwapped = 0;
+                NSMutableArray<NSString *> *lines = [NSMutableArray array];
+                for (BundleTransplantResult *r in results) {
+                    totalSwapped += r.swappedCount;
+                    if (r.error) {
+                        [lines addObject:[NSString stringWithFormat:@"%@: %@", r.moddedFileName, r.error.localizedDescription]];
+                    } else if (r.swappedCount == 0) {
+                        [lines addObject:[NSString stringWithFormat:@"%@ (%@): no match in cache", r.moddedFileName, r.cab ?: @"?"]];
+                    } else {
+                        [lines addObject:[NSString stringWithFormat:@"%@ (%@): swapped %ld", r.moddedFileName, r.cab, (long)r.swappedCount]];
+                    }
+                }
+
+                [haptic notificationOccurred:(totalSwapped > 0) ? UINotificationFeedbackTypeSuccess : UINotificationFeedbackTypeWarning];
+                NSString *title = totalSwapped > 0 ? @"Bundles Swapped" : @"No Matches";
+                NSString *message = [lines componentsJoinedByString:@"\n"];
+                if (totalSwapped > 0) {
+                    message = [message stringByAppendingString:@"\n\nRestart the game for swapped bundles to take effect."];
+                }
+                [self gd_presentModsAlertWithTitle:title message:message];
+            };
+            if (working.presentingViewController) {
+                [working dismissViewControllerAnimated:YES completion:showResult];
+            } else {
+                showResult();
+            }
+        });
+    });
+}
+
+// Restores every cached __data under Library/UnityCache/Shared that's ever
+// been swapped back to its untouched backup - see
+// +[BundleTransplant restoreAllBackedUpBundlesWithError:]. Same caveat as
+// the bank row's restore: backups are never deleted, safe to tap more than
+// once.
+- (void)restoreOriginalBundlesTapped {
+    NSError *error = nil;
+    NSInteger restored = [BundleTransplant restoreAllBackedUpBundlesWithError:&error];
+
+    UINotificationFeedbackGenerator *haptic = [UINotificationFeedbackGenerator new];
+    if (restored < 0) {
+        [haptic notificationOccurred:UINotificationFeedbackTypeError];
+        [self gd_presentModsAlertWithTitle:@"Restore Failed"
+                                    message:error.localizedDescription ?: @"Unknown error."];
+        return;
+    }
+
+    [haptic notificationOccurred:UINotificationFeedbackTypeSuccess];
+    NSString *message = restored == 0
+        ? @"No backed-up bundles found - nothing to restore."
+        : [NSString stringWithFormat:@"Restored %ld bundle%@ to its cached stock state. Restart the game for it to take effect.",
+              (long)restored, restored == 1 ? @"" : @"s"];
+    [self gd_presentModsAlertWithTitle:@"Restore Bundles" message:message];
 }
 
 // bt_reencode_bank (called inside +transplantAndSwapModdedBankAtURL:error:)
@@ -2726,8 +2878,7 @@ static const CGFloat kContentFadeHeight = 22;
 // Instead: show an indeterminate "working" alert immediately, do the
 // actual work on a background queue, then hop back to main to dismiss it
 // and show the real result.
-- (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
-    NSURL *moddedURL = urls.firstObject;
+- (void)gd_handlePickedBankModURL:(nullable NSURL *)moddedURL {
     if (!moddedURL) return;
 
     UIViewController *presenter = gd_key_window().rootViewController;

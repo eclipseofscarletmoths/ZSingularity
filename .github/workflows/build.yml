@@ -159,6 +159,9 @@ jobs:
             GDScripts.m \
             ZSyslogController.m \
             BankTransplant.m \
+            BundleTransplant.m \
+            UnityBundleCAB.m \
+            LZ4BlockDecoder.m \
             PatchManifestSync.m \
             PatchManifestNetworkPOC.m \
             FADPCMCodec.m \
