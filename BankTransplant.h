@@ -1,35 +1,40 @@
 // BankTransplant.h
 //
-// REPURPOSED from the original wrapper-splice approach (see git history /
-// README for the old version) to an audio re-encode pipeline. The old
-// approach spliced a desktop-coded (Vorbis) modded bank's *entire* FSB5
-// blob - its own sample headers, name table, and data - onto the stock
-// mobile bank's FEV/RIFF wrapper, unchanged. That kept the payload
-// Vorbis-coded, which meant two independent things had to hold for it to
-// work: whatever integrity check gates a swapped bank file had to accept
-// it, AND the mobile FMOD runtime had to have a Vorbis decoder linked in
-// - both unconfirmed, per the project notes.
-//
-// This version drops the header-transplant/splice logic entirely. Instead
-// it decodes the modded bank's Vorbis sample data to PCM, re-encodes that
-// PCM to FADPCM (FADPCMCodec.h/.m), and rebuilds each sample's FSB5
-// header by cloning the STOCK file's own existing FADPCM header for that
-// sample name and patching only what changes with re-encoded content
-// (data offset/size, peak-normalization value) - see FSB5HeaderRebuild.h.
-// The result is structurally an ordinary FADPCM bank in the stock file's
-// own shape, not a splice of someone else's header table, which sidesteps
-// both open questions above: no Vorbis decode is required on-device, and
-// the file is closer to what a real FADPCM build looks like.
-//
-// This does NOT remove every unknown - see FSB5HeaderRebuild.h and
-// FSB5VorbisExtract.h for what's still unverified (the coefficient table
-// mapping and the FSB5 packed-header bit layout) before treating output
-// from this pipeline as trustworthy on-device.
+// REPURPOSED again: the re-encode pipeline (decode modded Vorbis -> PCM ->
+// re-encode to FADPCM -> rebuild a stock-shaped FSB5 header, see git
+// history for that version) is gone. It turns out the Limbus mobile
+// client itself already supports Vorbis-coded FSB5 samples, so there was
+// never a codec mismatch to work around - the mobile FMOD runtime just
+// plays whatever's in the file. That makes the whole
+// decode/re-encode/header-rebuild pipeline (and everything it depended
+// on - FADPCMCodec.h, FSB5VorbisExtract.h, FSB5HeaderRebuild.h,
+// FSB5SampleHeaderIO.h, VorbisSetupTable.h/FSB5VorbisSetupTable.bin, and
+// the libvorbis/AVAudioConverter linkage in the old .m) unnecessary. This
+// version does a direct whole-file swap: the modded bank, byte for byte,
+// in place of the stock one with the same name. No parsing, no
+// transcoding, no header surgery.
 //
 // Every write to the game's own bank file is still preceded by a
-// one-time, never-overwritten backup (<name>.bank.orig-bak) so
-// +restoreAllBackedUpBanksWithError: can always get back to the untouched
-// stock file regardless of how many times a bank has since been re-swapped.
+// one-time, never-overwritten backup so +restoreAllBackedUpBanksWithError:
+// can always get back to the untouched stock file regardless of how many
+// times a bank has since been re-swapped.
+//
+// IMPORTANT (learned the hard way, see BundleTransplant.h for the same
+// lesson on the visual-asset side): that backup must NOT live inside
+// +mobileFMODBuildsDirectory as a same-folder sibling file
+// (<name>.bank.orig-bak right next to <name>.bank). Whatever validates
+// that directory treated an unrecognized extra file as reason to flag
+// the bank and force a redownload - and since the backup is written once
+// and then just sits there, that flag came back on every subsequent
+// launch, not only the one where the swap happened. Backups live under
+// +bankBackupDirectory instead (this tweak's own Library directory), so
+// +mobileFMODBuildsDirectory only ever contains exactly the bank files
+// the game itself expects to find there.
+//
+// Manifest hash/size verification for the swapped file is handled
+// separately and passively by PatchManifestNetwork at the network layer
+// (see that file) - this class does not need to trigger or wait on any
+// resync itself.
 
 #import <Foundation/Foundation.h>
 
@@ -40,17 +45,8 @@ extern NSString * const BankTransplantErrorDomain;
 typedef NS_ENUM(NSInteger, BankTransplantErrorCode) {
     BankTransplantErrorCantReadModded = 1,
     BankTransplantErrorOriginalNotFound,     // no file with the modded bank's name under the Mobile FMOD build directory
-    BankTransplantErrorCantReadOriginal,
-    BankTransplantErrorBadOriginalWrapper,   // stock doesn't parse as a RIFF/FEV bank with an SNDH+SND wrapper
-    BankTransplantErrorBadModdedWrapper,     // modded doesn't parse the same way
-    BankTransplantErrorSampleSetMismatch,    // sample name tables differ between the two FSB5 blobs - refused, not re-encoded
-    BankTransplantErrorModdedNotVorbis,      // modded's FSB5 mode isn't 15 (Vorbis) - nothing to re-encode
-    BankTransplantErrorVorbisNotLinked,      // <vorbis/codec.h> wasn't found at compile time - BT_HAVE_LIBVORBIS never got defined, so this build has no decoder at all regardless of any sample's content
-    BankTransplantErrorVorbisSetupUnknown,   // a sample's crc32 wasn't found in the bundled known-setup-packet table (see FSB5VorbisExtract.h) - can't decode without FMOD's own preset codebook for it
-    BankTransplantErrorVorbisDecodeFailed,   // libvorbis IS linked and ran, but rejected/errored on this specific sample's packet stream - a real decode failure, not a build problem
-    BankTransplantErrorResampleFailed,       // decoded PCM could not be converted to the 24 kHz Mobile target format
     BankTransplantErrorBackupFailed,         // couldn't create the one-time backup of the original before touching it
-    BankTransplantErrorWriteFailed,          // re-encode succeeded but writing/swapping the result on disk failed
+    BankTransplantErrorWriteFailed,          // swapping the modded file in failed
 };
 
 @interface BankTransplant : NSObject
@@ -60,29 +56,28 @@ typedef NS_ENUM(NSInteger, BankTransplantErrorCode) {
 // game's Documents directory - no separate container lookup needed).
 + (NSString *)mobileFMODBuildsDirectory;
 
+// Library/ZSingularityBankBackups inside this app's sandbox - where
+// backups of stock banks live now. Deliberately NOT inside
+// +mobileFMODBuildsDirectory - see the IMPORTANT note above.
++ (NSString *)bankBackupDirectory;
+
 // moddedURL is whatever the user picked via UIDocumentPickerViewController -
 // possibly security-scoped (outside the app sandbox, e.g. from Files/iCloud).
 // This starts/stops that access itself; callers don't need to.
 //
 // Looks up moddedURL.lastPathComponent under +mobileFMODBuildsDirectory,
-// backs that file up on first touch, decodes every Vorbis sample in the
-// modded bank to PCM, re-encodes each to FADPCM, rebuilds sample headers
-// against the stock file's own header table, and atomically replaces the
-// stock bank in place. Returns NO and fills error on any failure (nothing
-// on disk is modified in that case, aside from the backup, which is
-// always safe to have made).
-//
-// This can legitimately be slow (real Vorbis decode + a from-scratch
-// analysis-by-synthesis ADPCM encoder, per-sample, on-device) - callers
-// should not run it on the main thread for anything but tiny test banks.
+// backs that file up on first touch, then atomically replaces the stock
+// bank with the modded file's bytes as-is. Returns NO and fills error on
+// any failure (nothing on disk is modified in that case, aside from the
+// backup, which is always safe to have made).
 + (BOOL)transplantAndSwapModdedBankAtURL:(NSURL *)moddedURL
                                     error:(NSError **)error;
 
 // Restores every <name>.bank under +mobileFMODBuildsDirectory that has a
-// matching <name>.bank.orig-bak from its backup, leaving the backups in
-// place (so this is safe to run more than once / after further swaps).
-// Returns the number of files restored, or -1 with error filled on a
-// filesystem-level failure walking the directory.
+// matching <name>.bank.orig-bak under +bankBackupDirectory, leaving the
+// backups in place (so this is safe to run more than once / after further
+// swaps). Returns the number of files restored, or -1 with error filled
+// on a filesystem-level failure walking the backup directory.
 + (NSInteger)restoreAllBackedUpBanksWithError:(NSError **)error;
 
 @end
