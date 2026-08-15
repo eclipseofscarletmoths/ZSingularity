@@ -29,9 +29,14 @@
 //   uint32 BE                      flags:
 //                                    bits 0-5  compression type
 //                                              (0 none, 1 LZMA, 2 LZ4, 3 LZ4HC, 4 LZHAM)
-//                                    bit 6     blocks-info stored at EOF instead of here
-//                                    bit 7     blocks-info + directory info combined
-//   [4-byte stream alignment, format version >= 7, only when blocks-info is NOT at EOF]
+//                                    bit 6     blocks-info + directory info combined
+//                                              (unrelated to location; set on
+//                                              essentially every modern bundle)
+//                                    bit 7     blocks-info stored at EOF instead of here
+//                                    bit 9     blocks-info needs padding at its start
+//                                              (only meaningful when bit 7 is NOT set -
+//                                              see the alignment step below)
+//   [16-byte stream alignment, gated on flags bit 9, only when blocks-info is NOT at EOF]
 //   <compressed blocks-info bytes, length = compressed size above,
 //    located either right here or at (archiveSize - compressedSize)>
 //

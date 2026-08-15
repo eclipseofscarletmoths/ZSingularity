@@ -118,18 +118,35 @@ static BOOL ubc_parse_header(UBCCursor *c, UBCHeader *out, NSError **error) {
         if (error) *error = [NSError errorWithDomain:UnityBundleCABErrorDomain code:UnityBundleCABErrorTooSmall userInfo:nil];
         return NO;
     }
+    (void)formatVersion; // no longer branched on - see padding fix below
 
-    BOOL blocksInfoAtEnd = (flags & 0x40) != 0;
+    // Bit 6 (0x40) is BlocksAndDirectoryInfoCombined - unrelated to
+    // location, and set on essentially every modern bundle. Bit 7 (0x80)
+    // is the actual "stored at EOF" flag (BlocksInfoAtTheEnd). These were
+    // previously swapped here (and in the header doc above), which meant
+    // this evaluated to YES almost unconditionally - working only by
+    // coincidence on bundles where bit 0x80 also happened to be set, and
+    // silently misreading every bundle where it wasn't (confirmed against
+    // real __data_modded [0xc3, bit 0x80 set] vs __data_unmodded [0x243,
+    // bit 0x80 NOT set] - only the latter was affected).
+    BOOL blocksInfoAtEnd = (flags & 0x80) != 0;
+    BOOL needsPaddingAtStart = (flags & 0x200) != 0;
 
-    // Stream alignment: format version >= 7 pads the header up to a
-    // 4-byte boundary before the blocks-info blob, but ONLY when that
-    // blob immediately follows here - when it's stored at EOF instead,
-    // its location is computed from the archive's total size, not from
-    // this stream position, so there's nothing to align.
-    if (formatVersion >= 7 && !blocksInfoAtEnd) {
-        size_t rem = c->pos % 4;
+    // Stream alignment: gated on flags bit 9 (0x200,
+    // BlockInfoNeedPaddingAtStart), not on format version - and the pad
+    // target is a 16-byte boundary, not 4. Previously gated on
+    // `formatVersion >= 7` with a 4-byte target, which for
+    // __data_unmodded (header ends at byte 44, already 4-aligned) applied
+    // zero padding when 4 bytes were actually required to reach the real
+    // 16-byte-aligned start at byte 48 - corrupting the very first LZ4
+    // token blocksInfo decompression read. Only applies when blocksInfo
+    // is NOT at EOF - when it's stored at EOF instead, its location comes
+    // from the archive's total size, not this stream position, so there
+    // is nothing to align here.
+    if (!blocksInfoAtEnd && needsPaddingAtStart) {
+        size_t rem = c->pos % 16;
         if (rem != 0) {
-            if (!ubc_skip(c, 4 - rem)) {
+            if (!ubc_skip(c, 16 - rem)) {
                 if (error) *error = [NSError errorWithDomain:UnityBundleCABErrorDomain code:UnityBundleCABErrorTooSmall userInfo:nil];
                 return NO;
             }
