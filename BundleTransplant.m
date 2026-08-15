@@ -164,7 +164,13 @@ static BOOL bt2_try_patch_info_size(NSString *infoPath, uint64_t oldSize, uint64
 @implementation BundleTransplant
 
 + (NSString *)unityCacheSharedDirectory {
-    NSArray<NSString *> *paths = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES);
+    // UnityCache sits directly under Library, NOT under Library/Caches -
+    // NSCachesDirectory resolves to the latter, which is a sibling
+    // directory that happens to also exist (Library/Caches is the
+    // fsCachedData location PatchManifestSync/PatchManifestNetworkPOC
+    // deal with) but isn't this one. NSLibraryDirectory is Library
+    // itself, matching the actual on-device path.
+    NSArray<NSString *> *paths = NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES);
     NSString *cachesDir = paths.firstObject;
     if (!cachesDir) return nil;
     return [cachesDir stringByAppendingPathComponent:@"UnityCache/Shared"];

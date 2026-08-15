@@ -64,8 +64,10 @@ typedef NS_ENUM(NSInteger, BundleTransplantErrorCode) {
 @interface BundleTransplant : NSObject
 
 // Library/UnityCache/Shared inside this app's own sandbox (the tweak runs
-// in-process, so NSCachesDirectory here already IS the game's own Caches
-// directory - same reasoning as BankTransplant's Documents note).
+// in-process, so NSLibraryDirectory here already IS the game's own
+// Library directory - same reasoning as BankTransplant's Documents note).
+// UnityCache is a direct child of Library, not of Library/Caches - see
+// the implementation note in the .m for why that distinction matters.
 + (NSString *)unityCacheSharedDirectory;
 
 // moddedURLs are whatever the user multi-picked via
