@@ -2,7 +2,7 @@ name: Build Tweak
 
 on:
   push:
-    branches: [ManifestIntercept]
+    branches: [main]
     paths:
       - "**.m"
       - "**.h"
