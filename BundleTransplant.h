@@ -37,6 +37,19 @@
 // integrity checks that this can't currently satisfy. Treat this the same
 // way BankTransplant.h treats its own open questions: unverified until
 // confirmed on-device.
+//
+// IMPORTANT (learned the hard way, same lesson as BankTransplant.h):
+// backups must NOT live inside +unityCacheSharedDirectory, not even as a
+// same-folder sibling file (__data.orig-bak right next to __data, as this
+// used to do). Whatever validates that cache tree treated an unrecognized
+// extra file in a cache folder as reason to flag the entry and force a
+// redownload - and since a backup is written once and then just sits
+// there, that flag came back on every subsequent launch, not only the one
+// where the swap happened. Backups now live under +bundleBackupDirectory
+// instead, one flat file per backed-up __data, named by percent-encoding
+// that file's path relative to +unityCacheSharedDirectory (every cached
+// bundle is literally named "__data" - see above - so the relative path,
+// not just the leaf name, is what makes each backup unique).
 
 #import <Foundation/Foundation.h>
 
@@ -70,6 +83,11 @@ typedef NS_ENUM(NSInteger, BundleTransplantErrorCode) {
 // the implementation note in the .m for why that distinction matters.
 + (NSString *)unityCacheSharedDirectory;
 
+// Library/ZSingularityBundleBackups inside this app's sandbox - where
+// backups of cached bundles live now. Deliberately NOT inside
+// +unityCacheSharedDirectory - see the IMPORTANT note above.
++ (NSString *)bundleBackupDirectory;
+
 // moddedURLs are whatever the user multi-picked via
 // UIDocumentPickerViewController - possibly security-scoped, same as
 // BankTransplant. This starts/stops that access itself.
@@ -90,9 +108,11 @@ typedef NS_ENUM(NSInteger, BundleTransplantErrorCode) {
                                                                                   error:(NSError **)error;
 
 // Restores every __data under +unityCacheSharedDirectory that has a
-// matching __data.orig-bak from its backup, at whatever depth found -
-// same recursive walk as the swap side. Returns the number of files
-// restored, or -1 with error filled on a filesystem-level failure.
+// matching backup under +bundleBackupDirectory. Returns the number of
+// files restored, or -1 with error filled on a filesystem-level failure
+// listing the backup directory. Returns 0 (not an error) if
+// +bundleBackupDirectory doesn't exist yet - i.e. nothing has ever been
+// swapped.
 + (NSInteger)restoreAllBackedUpBundlesWithError:(NSError **)error;
 
 @end

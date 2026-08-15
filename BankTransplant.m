@@ -672,6 +672,23 @@ static NSString * const kBTVorbisSetupResourceName = @"FSB5VorbisSetupTable.bin"
     return [documentsDir stringByAppendingPathComponent:@"Assets/Sound/FMODBuilds/Mobile"];
 }
 
+// Backups deliberately do NOT live in +mobileFMODBuildsDirectory anymore -
+// same lesson as CABBundleSwapController's swap backups (see that file's
+// notes): whatever validates that directory treated an unexpected
+// <name>.bank.orig-bak sibling sitting there as reason to flag the bank
+// and force a redownload, and since a backup is written once and then
+// just sits there, that flag came back on every subsequent launch, not
+// only the one where the swap happened. Backups now live under this
+// tweak's own Library directory instead - the directory the game/engine
+// actually reads banks from stays exactly {stock or swapped bank}, never
+// anything extra.
++ (NSString *)bankBackupDirectory {
+    NSArray<NSString *> *paths = NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES);
+    NSString *libraryDir = paths.firstObject;
+    if (!libraryDir) return nil;
+    return [libraryDir stringByAppendingPathComponent:@"ZSingularityBankBackups"];
+}
+
 + (BOOL)transplantAndSwapModdedBankAtURL:(NSURL *)moddedURL error:(NSError **)error {
     BOOL accessing = [moddedURL startAccessingSecurityScopedResource];
 
@@ -695,7 +712,22 @@ static NSString * const kBTVorbisSetupResourceName = @"FSB5VorbisSetupTable.bin"
         return NO;
     }
 
-    NSString *backupPath = [originalPath stringByAppendingString:kBTBackupSuffix];
+    NSString *backupDir = [self bankBackupDirectory];
+    if (!backupDir) {
+        if (accessing) [moddedURL stopAccessingSecurityScopedResource];
+        if (error) *error = BTError(BankTransplantErrorBackupFailed, @"Couldn't resolve the backup directory.");
+        return NO;
+    }
+    if (![fm fileExistsAtPath:backupDir]) {
+        NSError *dirErr = nil;
+        if (![fm createDirectoryAtPath:backupDir withIntermediateDirectories:YES attributes:nil error:&dirErr]) {
+            if (accessing) [moddedURL stopAccessingSecurityScopedResource];
+            if (error) *error = BTError(BankTransplantErrorBackupFailed,
+                [NSString stringWithFormat:@"Couldn't create the backup directory: %@", dirErr.localizedDescription]);
+            return NO;
+        }
+    }
+    NSString *backupPath = [backupDir stringByAppendingPathComponent:[fileName stringByAppendingString:kBTBackupSuffix]];
     if (![fm fileExistsAtPath:backupPath]) {
         NSError *copyErr = nil;
         if (![fm copyItemAtPath:originalPath toPath:backupPath error:&copyErr]) {
@@ -704,7 +736,7 @@ static NSString * const kBTVorbisSetupResourceName = @"FSB5VorbisSetupTable.bin"
                 [NSString stringWithFormat:@"Couldn't back up %@ before touching it: %@", fileName, copyErr.localizedDescription]);
             return NO;
         }
-        ZLog(@"[BankTransplant] backed up %@ -> %@", fileName, backupPath.lastPathComponent);
+        ZLog(@"[BankTransplant] backed up %@ -> %@", fileName, backupPath);
     }
 
     NSString *tmpOutPath = [NSTemporaryDirectory() stringByAppendingPathComponent:
@@ -761,19 +793,26 @@ static NSString * const kBTVorbisSetupResourceName = @"FSB5VorbisSetupTable.bin"
 
 + (NSInteger)restoreAllBackedUpBanksWithError:(NSError **)error {
     NSString *mobileDir = [self mobileFMODBuildsDirectory];
+    NSString *backupDir = [self bankBackupDirectory];
     NSFileManager *fm = NSFileManager.defaultManager;
+
+    if (!backupDir || ![fm fileExistsAtPath:backupDir]) {
+        return 0; // nothing has ever been backed up - not an error
+    }
+
     NSError *listErr = nil;
-    NSArray<NSString *> *entries = [fm contentsOfDirectoryAtPath:mobileDir error:&listErr];
+    NSArray<NSString *> *entries = [fm contentsOfDirectoryAtPath:backupDir error:&listErr];
     if (!entries) {
-        if (error) *error = listErr ?: BTError(BankTransplantErrorOriginalNotFound, @"Couldn't list the Mobile FMOD build directory.");
+        if (error) *error = listErr ?: BTError(BankTransplantErrorOriginalNotFound, @"Couldn't list the bank backup directory.");
         return -1;
     }
 
     NSInteger restored = 0;
     for (NSString *entry in entries) {
         if (![entry hasSuffix:kBTBackupSuffix]) continue;
-        NSString *backupPath = [mobileDir stringByAppendingPathComponent:entry];
-        NSString *originalPath = [backupPath substringToIndex:backupPath.length - kBTBackupSuffix.length];
+        NSString *backupPath = [backupDir stringByAppendingPathComponent:entry];
+        NSString *fileName = [entry substringToIndex:entry.length - kBTBackupSuffix.length];
+        NSString *originalPath = [mobileDir stringByAppendingPathComponent:fileName];
 
         NSString *tmpPath = [NSTemporaryDirectory() stringByAppendingPathComponent:[NSUUID UUID].UUIDString];
         NSError *copyErr = nil;

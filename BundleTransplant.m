@@ -23,7 +23,7 @@
 #import <dispatch/dispatch.h>
 
 NSString * const BundleTransplantErrorDomain = @"BundleTransplantErrorDomain";
-static NSString * const kBT2BackupSuffix = @"__data.orig-bak"; // sibling of __data, not a suffix appended to it - see bt2_backup_path
+static NSString * const kBT2BackupSuffix = @".orig-bak";
 
 @implementation BundleTransplantResult
 @end
@@ -34,11 +34,46 @@ static NSError *BT2Error(BundleTransplantErrorCode code, NSString *message) {
                             userInfo:@{NSLocalizedDescriptionKey: message}];
 }
 
-// __data.orig-bak lives next to __data (same directory), not appended
-// onto its name, so it stays a plain filename match for the restore
-// walk below regardless of what __data's own name ever contains.
-static NSString *bt2_backup_path_for_data_path(NSString *dataPath) {
-    return [[dataPath stringByDeletingLastPathComponent] stringByAppendingPathComponent:kBT2BackupSuffix];
+// Backups used to live as "__data.orig-bak" right next to __data in the
+// SAME UnityCache/Shared folder - same mistake made (and already fixed)
+// on the audio side, see BankTransplant.m's bankBackupDirectory note.
+// Whatever validates a cache folder treated that extra sibling file as
+// reason to flag the entry and force a redownload, and since it's written
+// once and just sits there, the flag came back on every subsequent
+// launch, not only the one where the swap happened.
+//
+// Backups now live under +bundleBackupDirectory instead (this tweak's own
+// Library directory, isolated from anything Unity's cache scans), keyed
+// by dataPath's location RELATIVE to +unityCacheSharedDirectory with "/"
+// percent-encoded to "%2F" so the whole nested path collapses to one flat,
+// reversible filename - every cached bundle is literally named "__data"
+// (per BundleTransplant.h), so the leaf name alone can't disambiguate
+// which of potentially thousands of them a given backup belongs to; only
+// the full relative path can. bt2_restore_original_path_for_backup_name
+// below is the inverse of this encoding, used by the restore walk.
+static NSString *bt2_relative_path(NSString *fullPath, NSString *root) {
+    if ([fullPath hasPrefix:root]) {
+        NSString *rel = [fullPath substringFromIndex:root.length];
+        if ([rel hasPrefix:@"/"]) rel = [rel substringFromIndex:1];
+        return rel;
+    }
+    return fullPath.lastPathComponent; // shouldn't happen; harmless fallback
+}
+
+static NSString *bt2_backup_path_for_data_path(NSString *dataPath, NSString *cacheDir, NSString *backupDir) {
+    NSString *rel = bt2_relative_path(dataPath, cacheDir);
+    NSString *flat = [rel stringByReplacingOccurrencesOfString:@"/" withString:@"%2F"];
+    return [backupDir stringByAppendingPathComponent:[flat stringByAppendingString:kBT2BackupSuffix]];
+}
+
+// Inverse of the encoding above: given a backup file's own name (not its
+// full path), returns the original __data path it belongs to under
+// cacheDir. Returns nil if `backupName` doesn't have the expected suffix.
+static NSString *bt2_original_path_for_backup_name(NSString *backupName, NSString *cacheDir) {
+    if (![backupName hasSuffix:kBT2BackupSuffix]) return nil;
+    NSString *flat = [backupName substringToIndex:backupName.length - kBT2BackupSuffix.length];
+    NSString *rel = [flat stringByReplacingOccurrencesOfString:@"%2F" withString:@"/"];
+    return [cacheDir stringByAppendingPathComponent:rel];
 }
 
 #pragma mark - Phase 1: recursive __data discovery
@@ -176,6 +211,17 @@ static BOOL bt2_try_patch_info_size(NSString *infoPath, uint64_t oldSize, uint64
     return [cachesDir stringByAppendingPathComponent:@"UnityCache/Shared"];
 }
 
+// Library/ZSingularityBundleBackups inside this app's sandbox - where
+// backups of cached bundles live now. Deliberately NOT inside
+// +unityCacheSharedDirectory - see the comment above
+// bt2_backup_path_for_data_path in this file for why.
++ (NSString *)bundleBackupDirectory {
+    NSArray<NSString *> *paths = NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES);
+    NSString *libraryDir = paths.firstObject;
+    if (!libraryDir) return nil;
+    return [libraryDir stringByAppendingPathComponent:@"ZSingularityBundleBackups"];
+}
+
 + (nullable NSArray<BundleTransplantResult *> *)transplantAndSwapModdedBundlesAtURLs:(NSArray<NSURL *> *)moddedURLs
                                                                                   error:(NSError **)error {
     NSString *cacheDir = [self unityCacheSharedDirectory];
@@ -192,6 +238,20 @@ static BOOL bt2_try_patch_info_size(NSString *infoPath, uint64_t oldSize, uint64
     ZLog(@"[BundleTransplant] found %lu cached __data file(s), indexing by CAB…", (unsigned long)dataPaths.count);
     NSDictionary<NSString *, NSArray<NSString *> *> *cabIndex = bt2_build_cab_index(dataPaths);
     ZLog(@"[BundleTransplant] indexed %lu distinct CAB(s)", (unsigned long)cabIndex.count);
+
+    NSString *backupDir = [self bundleBackupDirectory];
+    if (!backupDir) {
+        if (error) *error = BT2Error(BundleTransplantErrorBackupFailed, @"Couldn't resolve the backup directory.");
+        return nil;
+    }
+    if (![fm fileExistsAtPath:backupDir]) {
+        NSError *dirErr = nil;
+        if (![fm createDirectoryAtPath:backupDir withIntermediateDirectories:YES attributes:nil error:&dirErr]) {
+            if (error) *error = BT2Error(BundleTransplantErrorBackupFailed,
+                [NSString stringWithFormat:@"Couldn't create the backup directory: %@", dirErr.localizedDescription]);
+            return nil;
+        }
+    }
 
     NSMutableArray<BundleTransplantResult *> *results = [NSMutableArray arrayWithCapacity:moddedURLs.count];
 
@@ -229,7 +289,7 @@ static BOOL bt2_try_patch_info_size(NSString *infoPath, uint64_t oldSize, uint64
 
         NSInteger swapped = 0;
         for (NSString *dataPath in matches) {
-            NSString *backupPath = bt2_backup_path_for_data_path(dataPath);
+            NSString *backupPath = bt2_backup_path_for_data_path(dataPath, cacheDir, backupDir);
             if (![fm fileExistsAtPath:backupPath]) {
                 NSError *copyErr = nil;
                 if (![fm copyItemAtPath:dataPath toPath:backupPath error:&copyErr]) {
@@ -285,25 +345,29 @@ static BOOL bt2_try_patch_info_size(NSString *infoPath, uint64_t oldSize, uint64
 
 + (NSInteger)restoreAllBackedUpBundlesWithError:(NSError **)error {
     NSString *cacheDir = [self unityCacheSharedDirectory];
+    NSString *backupDir = [self bundleBackupDirectory];
     NSFileManager *fm = NSFileManager.defaultManager;
-    BOOL isDir = NO;
-    if (!cacheDir || ![fm fileExistsAtPath:cacheDir isDirectory:&isDir] || !isDir) {
-        if (error) *error = BT2Error(BundleTransplantErrorNoCacheDirectory, @"Library/UnityCache/Shared doesn't exist.");
+
+    if (!cacheDir) {
+        if (error) *error = BT2Error(BundleTransplantErrorNoCacheDirectory, @"Couldn't resolve Library/UnityCache/Shared.");
+        return -1;
+    }
+    if (!backupDir || ![fm fileExistsAtPath:backupDir]) {
+        return 0; // nothing has ever been backed up - not an error
+    }
+
+    NSError *listErr = nil;
+    NSArray<NSString *> *entries = [fm contentsOfDirectoryAtPath:backupDir error:&listErr];
+    if (!entries) {
+        if (error) *error = listErr ?: BT2Error(BundleTransplantErrorBackupFailed, @"Couldn't list the bundle backup directory.");
         return -1;
     }
 
-    NSDirectoryEnumerator<NSString *> *walker = [fm enumeratorAtPath:cacheDir];
-    NSMutableArray<NSString *> *backupPaths = [NSMutableArray array];
-    for (NSString *relPath in walker) {
-        if ([relPath.lastPathComponent isEqualToString:kBT2BackupSuffix]) {
-            [backupPaths addObject:[cacheDir stringByAppendingPathComponent:relPath]];
-        }
-    }
-
     NSInteger restored = 0;
-    for (NSString *backupPath in backupPaths) {
-        NSString *originalPath = [[backupPath stringByDeletingLastPathComponent] stringByAppendingPathComponent:@"__data"];
-
+    for (NSString *entry in entries) {
+        NSString *originalPath = bt2_original_path_for_backup_name(entry, cacheDir);
+        if (!originalPath) continue; // not one of ours (unexpected extension) - skip rather than guess
+        NSString *backupPath = [backupDir stringByAppendingPathComponent:entry];
         NSString *tmpPath = [NSTemporaryDirectory() stringByAppendingPathComponent:[NSUUID UUID].UUIDString];
         NSError *copyErr = nil;
         if (![fm copyItemAtPath:backupPath toPath:tmpPath error:&copyErr]) {

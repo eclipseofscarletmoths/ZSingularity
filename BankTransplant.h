@@ -27,9 +27,21 @@
 // from this pipeline as trustworthy on-device.
 //
 // Every write to the game's own bank file is still preceded by a
-// one-time, never-overwritten backup (<name>.bank.orig-bak) so
-// +restoreAllBackedUpBanksWithError: can always get back to the untouched
-// stock file regardless of how many times a bank has since been re-swapped.
+// one-time, never-overwritten backup so +restoreAllBackedUpBanksWithError:
+// can always get back to the untouched stock file regardless of how many
+// times a bank has since been re-swapped.
+//
+// IMPORTANT (learned the hard way, see CABBundleSwapController.h for the
+// same lesson on the visual-asset side): that backup must NOT live inside
+// +mobileFMODBuildsDirectory as a same-folder sibling file
+// (<name>.bank.orig-bak right next to <name>.bank, as this used to do).
+// Whatever validates that directory treated an unrecognized extra file as
+// reason to flag the bank and force a redownload - and since the backup
+// is written once and then just sits there, that flag came back on every
+// subsequent launch, not only the one where the swap happened. Backups
+// now live under +bankBackupDirectory instead (this tweak's own Library
+// directory), so +mobileFMODBuildsDirectory only ever contains exactly
+// the bank files the game itself expects to find there.
 
 #import <Foundation/Foundation.h>
 
@@ -60,6 +72,11 @@ typedef NS_ENUM(NSInteger, BankTransplantErrorCode) {
 // game's Documents directory - no separate container lookup needed).
 + (NSString *)mobileFMODBuildsDirectory;
 
+// Library/ZSingularityBankBackups inside this app's sandbox - where
+// backups of stock banks live now. Deliberately NOT inside
+// +mobileFMODBuildsDirectory - see the IMPORTANT note above.
++ (NSString *)bankBackupDirectory;
+
 // moddedURL is whatever the user picked via UIDocumentPickerViewController -
 // possibly security-scoped (outside the app sandbox, e.g. from Files/iCloud).
 // This starts/stops that access itself; callers don't need to.
@@ -79,10 +96,10 @@ typedef NS_ENUM(NSInteger, BankTransplantErrorCode) {
                                     error:(NSError **)error;
 
 // Restores every <name>.bank under +mobileFMODBuildsDirectory that has a
-// matching <name>.bank.orig-bak from its backup, leaving the backups in
-// place (so this is safe to run more than once / after further swaps).
-// Returns the number of files restored, or -1 with error filled on a
-// filesystem-level failure walking the directory.
+// matching <name>.bank.orig-bak under +bankBackupDirectory, leaving the
+// backups in place (so this is safe to run more than once / after further
+// swaps). Returns the number of files restored, or -1 with error filled
+// on a filesystem-level failure walking the backup directory.
 + (NSInteger)restoreAllBackedUpBanksWithError:(NSError **)error;
 
 @end
