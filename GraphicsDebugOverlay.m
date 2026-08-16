@@ -1431,6 +1431,99 @@ static const CGFloat kFillAlpha = 1.0;
 @implementation GDRow
 @end
 
+// Auto-scrolling ("marquee") label for text that's wider than its
+// container - used for the Info dropdown's Path/CAB lines, which
+// should stay fully readable rather than middle-truncated (per
+// request). Only animates when the text actually overflows the
+// view's own width; sits perfectly still otherwise, so this is safe
+// to use unconditionally without checking text length up front.
+//
+// Ping-pongs left/right rather than wrapping around - a seamless
+// infinite-scroll wraparound needs two copies of the label side by
+// side and careful modulo math; a reset-to-start jump cut (the easy
+// alternative) reads as a stutter in a small debug-overlay row. A
+// smooth reverse direction avoids both problems for one extra line
+// of state (the `toEnd` bool passed down the recursive step below).
+@interface GDMarqueeLabel : UIView
+@property (nonatomic, copy) NSString *text;
+@property (nonatomic, strong) UIFont *font;
+@property (nonatomic, strong) UIColor *textColor;
+@end
+
+@implementation GDMarqueeLabel {
+    UILabel *_label;
+    NSLayoutConstraint *_labelLeadingConstraint;
+    BOOL _scrolling;
+}
+
+- (instancetype)initWithFrame:(CGRect)frame {
+    if ((self = [super initWithFrame:frame])) {
+        self.clipsToBounds = YES;
+        self.translatesAutoresizingMaskIntoConstraints = NO;
+
+        _label = [[UILabel alloc] init];
+        _label.translatesAutoresizingMaskIntoConstraints = NO;
+        _label.numberOfLines = 1;
+        _label.lineBreakMode = NSLineBreakByClipping; // this view's own scrolling is the "see the rest" mechanism, not ellipsis
+        [self addSubview:_label];
+
+        _labelLeadingConstraint = [_label.leadingAnchor constraintEqualToAnchor:self.leadingAnchor];
+        [NSLayoutConstraint activateConstraints:@[
+            _labelLeadingConstraint,
+            [_label.centerYAnchor constraintEqualToAnchor:self.centerYAnchor],
+        ]];
+    }
+    return self;
+}
+
+- (void)setText:(NSString *)text { _label.text = text; [self setNeedsLayout]; }
+- (NSString *)text { return _label.text; }
+- (void)setFont:(UIFont *)font { _label.font = font; [self setNeedsLayout]; }
+- (UIFont *)font { return _label.font; }
+- (void)setTextColor:(UIColor *)textColor { _label.textColor = textColor; }
+- (UIColor *)textColor { return _label.textColor; }
+
+- (CGSize)intrinsicContentSize {
+    return CGSizeMake(UIViewNoIntrinsicMetric, ceil(_label.font.lineHeight));
+}
+
+- (void)layoutSubviews {
+    [super layoutSubviews];
+    [_label sizeToFit];
+    CGFloat overflow = ceil(CGRectGetWidth(_label.frame)) - CGRectGetWidth(self.bounds);
+    if (overflow > 4 && !_scrolling) {
+        _scrolling = YES;
+        [self gd_scrollStep:YES overflow:overflow duration:MAX(2.5, overflow / 16.0)];
+    } else if (overflow <= 4 && _scrolling) {
+        _scrolling = NO; // shrank back under the container's width (e.g. rotation) - let the in-flight step's own check catch up and stop
+    }
+}
+
+- (void)gd_scrollStep:(BOOL)toEnd overflow:(CGFloat)overflow duration:(NSTimeInterval)duration {
+    if (!_scrolling) {
+        _labelLeadingConstraint.constant = 0;
+        return;
+    }
+    __weak typeof(self) weakSelf = self;
+    [UIView animateWithDuration:duration
+                           delay:0.9
+                         options:UIViewAnimationOptionCurveEaseInOut
+                      animations:^{
+        typeof(self) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        strongSelf->_labelLeadingConstraint.constant = toEnd ? -overflow : 0;
+        [strongSelf layoutIfNeeded];
+    }
+                      completion:^(BOOL finished) {
+        typeof(self) strongSelf = weakSelf;
+        if (finished && strongSelf && strongSelf->_scrolling) {
+            [strongSelf gd_scrollStep:!toEnd overflow:overflow duration:duration];
+        }
+    }];
+}
+
+@end
+
 static const CGFloat kRowHeight = 26;
 static const CGFloat kTitleColumnWidth = 92;
 static const CGFloat kValueColumnWidth = 34;
@@ -1797,48 +1890,6 @@ static UIView *gd_make_blacklist_entry_row(NSString *term, id target, SEL remove
     return row;
 }
 
-// Rewrites an on-disk path under this app's own Library directory
-// (which is everything ModAssetLibrary ever hands back - see
-// +modLibraryRootDirectory) into one starting at "Library/..." instead
-// of the full sandbox path ("/var/mobile/Containers/Data/Application/
-// <UUID>/Library/..."), per request ("starting from NSDirectory, not
-// the entire var/ path"). Falls back to just the leaf filename if
-// `path` doesn't live under the Library directory for some reason.
-static NSString *gd_library_relative_path(NSString *path) {
-    NSArray<NSString *> *paths = NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES);
-    NSString *libraryDir = paths.firstObject;
-    if (libraryDir && [path hasPrefix:libraryDir]) {
-        NSString *relative = [path substringFromIndex:libraryDir.length];
-        if ([relative hasPrefix:@"/"]) relative = [relative substringFromIndex:1];
-        return [@"Library/" stringByAppendingString:relative];
-    }
-    return path.lastPathComponent;
-}
-
-// The path shown in an entry's Info dropdown - deliberately NOT
-// entry.path (that's just where this tweak keeps its own tracked copy,
-// under +[ModAssetLibrary modLibraryRootDirectory]). What's actually
-// useful to see is where the file lives WITHIN THE GAME's own files -
-// i.e. wherever it was (or would be) swapped into. For a bundle that's
-// wherever its CAB currently sits in +[BundleTransplant
-// unityCacheSharedDirectory] (there can be more than one match - see
-// BundleTransplant.h's own MATCHING note - so every match is listed);
-// for a bank it's the one deterministic +[BankTransplant
-// mobileFMODBuildsDirectory]/<fileName>, since a bank's filename IS its
-// identity, no lookup needed.
-static NSString *gd_mods_entry_live_path_description(ModAssetLibraryEntry *entry) {
-    if (entry.cab) {
-        NSArray<NSString *> *matches = [BundleTransplant cachedDataPathsForCAB:entry.cab];
-        if (matches.count == 0) return @"Not currently cached by the game";
-        NSMutableArray<NSString *> *relatives = [NSMutableArray arrayWithCapacity:matches.count];
-        for (NSString *path in matches) [relatives addObject:gd_library_relative_path(path)];
-        return [relatives componentsJoinedByString:@", "];
-    }
-    NSString *bankDir = [BankTransplant mobileFMODBuildsDirectory];
-    NSString *path = bankDir ? [bankDir stringByAppendingPathComponent:entry.fileName] : entry.fileName;
-    return gd_library_relative_path(path);
-}
-
 // Folder header row for the Mods Library accordion: [chevron][folder
 // icon][name] .... [Add pill][pencil][X], left-to-right per request.
 // The whole row (not just the chevron) is tappable for expand/collapse
@@ -1916,7 +1967,7 @@ static UIView *gd_make_mods_folder_row(NSString *folderName, BOOL expanded, id t
     UIButton *addButton = [UIButton buttonWithType:UIButtonTypeSystem];
     addButton.translatesAutoresizingMaskIntoConstraints = NO;
     gd_style_button_as_native_glass(addButton, @"Add", [UIColor colorWithRed:0.42 green:0.62 blue:1.0 alpha:1.0]);
-    addButton.titleLabel.font = [UIFont systemFontOfSize:10 weight:UIFontWeightSemibold];
+    addButton.titleLabel.font = [UIFont systemFontOfSize:8.5 weight:UIFontWeightSemibold];
     [addButton addTarget:target action:addAction forControlEvents:UIControlEventTouchUpInside];
     objc_setAssociatedObject(addButton, "gd_modsFolderName", folderName, OBJC_ASSOCIATION_COPY);
     [row addSubview:addButton];
@@ -1934,7 +1985,7 @@ static UIView *gd_make_mods_folder_row(NSString *folderName, BOOL expanded, id t
         [folderIcon.widthAnchor constraintEqualToConstant:18],
 
         [label.leadingAnchor constraintEqualToAnchor:folderIcon.trailingAnchor constant:6],
-        [label.trailingAnchor constraintLessThanOrEqualToAnchor:addButton.leadingAnchor constant:-8],
+        [label.trailingAnchor constraintLessThanOrEqualToAnchor:addButton.leadingAnchor constant:-6],
         [label.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
 
         [deleteButton.trailingAnchor constraintEqualToAnchor:row.trailingAnchor],
@@ -1942,15 +1993,15 @@ static UIView *gd_make_mods_folder_row(NSString *folderName, BOOL expanded, id t
         [deleteButton.widthAnchor constraintEqualToConstant:18],
         [deleteButton.heightAnchor constraintEqualToConstant:18],
 
-        [renameButton.trailingAnchor constraintEqualToAnchor:deleteButton.leadingAnchor constant:-6],
+        [renameButton.trailingAnchor constraintEqualToAnchor:deleteButton.leadingAnchor constant:-3],
         [renameButton.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
         [renameButton.widthAnchor constraintEqualToConstant:18],
         [renameButton.heightAnchor constraintEqualToConstant:18],
 
-        [addButton.trailingAnchor constraintEqualToAnchor:renameButton.leadingAnchor constant:-6],
+        [addButton.trailingAnchor constraintEqualToAnchor:renameButton.leadingAnchor constant:-3],
         [addButton.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
         [addButton.heightAnchor constraintEqualToConstant:18],
-        [addButton.widthAnchor constraintGreaterThanOrEqualToConstant:38],
+        [addButton.widthAnchor constraintGreaterThanOrEqualToConstant:32],
 
         [row.topAnchor constraintEqualToAnchor:label.topAnchor constant:-5],
         [row.bottomAnchor constraintEqualToAnchor:label.bottomAnchor constant:5],
@@ -1959,18 +2010,18 @@ static UIView *gd_make_mods_folder_row(NSString *folderName, BOOL expanded, id t
 }
 
 // One tracked file's row, indented under its folder: [zip/doc icon]
-// [name] .... [Info pill][X], left-to-right. Every entry gets both
-// buttons now regardless of whether it parsed as a Unity bundle (the
-// old per-CAB-only "Reset" button is gone - see
-// -gd_modsLibraryEntryDeleteConfirmed:, which now falls back to a
-// per-filename bank restore for entries with no CAB). Info toggles an
-// expandable panel the caller (see -gd_rebuildModsLibrary) inserts
-// right after this row when the entry's path is in
-// modsLibraryExpandedInfoEntries; Delete is hold-to-confirm, wired by
-// the caller the same way the folder row's own X is.
-static UIView *gd_make_mods_entry_row(ModAssetLibraryEntry *entry, id target, SEL infoAction) {
+// [name] .... [X]. No separate Info button anymore - tapping anywhere
+// on the row (same whole-row tap-target approach as the folder row
+// above) toggles the filepath/CAB/size dropdown the caller (see
+// -gd_rebuildModsLibrary) inserts right after this row when the
+// entry's path is in modsLibraryExpandedInfoEntries. Delete is
+// hold-to-confirm, wired by the caller the same way the folder row's
+// own X is. The entry is stashed on the ROW (for the tap gesture) as
+// well as on the delete button (for its own handler).
+static UIView *gd_make_mods_entry_row(ModAssetLibraryEntry *entry, id target, SEL tapAction) {
     UIView *row = [[UIView alloc] init];
     row.translatesAutoresizingMaskIntoConstraints = NO;
+    objc_setAssociatedObject(row, "gd_modsEntry", entry, OBJC_ASSOCIATION_RETAIN);
 
     BOOL isBundle = (entry.cab != nil);
     UIImageSymbolConfiguration *iconConfig = [UIImageSymbolConfiguration configurationWithPointSize:12 weight:UIImageSymbolWeightRegular];
@@ -2001,15 +2052,8 @@ static UIView *gd_make_mods_entry_row(ModAssetLibraryEntry *entry, id target, SE
     [row addSubview:deleteButton];
     objc_setAssociatedObject(row, "gd_button_delete", deleteButton, OBJC_ASSOCIATION_RETAIN);
 
-    // "Info" - wide pill, immediately to the left of X - toggles the
-    // filepath/CAB/size dropdown (gd_make_mods_entry_info_panel).
-    UIButton *infoButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    infoButton.translatesAutoresizingMaskIntoConstraints = NO;
-    gd_style_button_as_native_glass(infoButton, @"Info", [UIColor colorWithWhite:1 alpha:0.65]);
-    infoButton.titleLabel.font = [UIFont systemFontOfSize:9 weight:UIFontWeightSemibold];
-    [infoButton addTarget:target action:infoAction forControlEvents:UIControlEventTouchUpInside];
-    objc_setAssociatedObject(infoButton, "gd_modsEntry", entry, OBJC_ASSOCIATION_RETAIN);
-    [row addSubview:infoButton];
+    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:target action:tapAction];
+    [row addGestureRecognizer:tap];
 
     [NSLayoutConstraint activateConstraints:@[
         [icon.leadingAnchor constraintEqualToAnchor:row.leadingAnchor constant:22], // indented under the folder icon above
@@ -2017,18 +2061,13 @@ static UIView *gd_make_mods_entry_row(ModAssetLibraryEntry *entry, id target, SE
         [icon.widthAnchor constraintEqualToConstant:16],
 
         [label.leadingAnchor constraintEqualToAnchor:icon.trailingAnchor constant:5],
-        [label.trailingAnchor constraintLessThanOrEqualToAnchor:infoButton.leadingAnchor constant:-8],
+        [label.trailingAnchor constraintLessThanOrEqualToAnchor:deleteButton.leadingAnchor constant:-8],
         [label.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
 
         [deleteButton.trailingAnchor constraintEqualToAnchor:row.trailingAnchor],
         [deleteButton.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
         [deleteButton.widthAnchor constraintEqualToConstant:18],
         [deleteButton.heightAnchor constraintEqualToConstant:18],
-
-        [infoButton.trailingAnchor constraintEqualToAnchor:deleteButton.leadingAnchor constant:-6],
-        [infoButton.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
-        [infoButton.heightAnchor constraintEqualToConstant:18],
-        [infoButton.widthAnchor constraintGreaterThanOrEqualToConstant:34],
 
         [row.topAnchor constraintEqualToAnchor:label.topAnchor constant:-3],
         [row.bottomAnchor constraintEqualToAnchor:label.bottomAnchor constant:3],
@@ -2038,14 +2077,14 @@ static UIView *gd_make_mods_entry_row(ModAssetLibraryEntry *entry, id target, SE
 
 // Expandable "Info" panel for one entry - filepath (where the file
 // lives WITHIN THE GAME's own files, not this tweak's own tracked-copy
-// storage - see gd_mods_entry_live_path_description), CAB (bundles
-// only), and human-readable size, one muted subtext line each.
-// Inserted directly after the entry's own row in modsLibraryStack when
-// its path is in modsLibraryExpandedInfoEntries - see -gd_rebuildModsLibrary.
+// storage - resolved once at import time, see
+// ModAssetLibraryEntry.livePathDescription), CAB (bundles only), and
+// human-readable size. Path/CAB use GDMarqueeLabel so a long value
+// scrolls into view instead of getting truncated.
 static UIView *gd_make_mods_entry_info_panel(ModAssetLibraryEntry *entry) {
     UIStackView *panel = [[UIStackView alloc] init];
     panel.axis = UILayoutConstraintAxisVertical;
-    panel.spacing = 1;
+    panel.spacing = 2;
     panel.translatesAutoresizingMaskIntoConstraints = NO;
     panel.layoutMarginsRelativeArrangement = YES;
     panel.layoutMargins = UIEdgeInsetsMake(2, 38, 2, 4); // lines up under the entry name, past the folder/doc icon indent
@@ -2053,21 +2092,36 @@ static UIView *gd_make_mods_entry_info_panel(ModAssetLibraryEntry *entry) {
     UIFont *subtextFont = [UIFont systemFontOfSize:9.5 weight:UIFontWeightRegular];
     UIColor *subtextColor = [UIColor colorWithWhite:1 alpha:0.4];
 
-    NSString *pathLine = [NSString stringWithFormat:@"Path: %@", gd_mods_entry_live_path_description(entry)];
-    NSString *sizeLine = [NSString stringWithFormat:@"Size: %@", [NSByteCountFormatter stringFromByteCount:(long long)entry.byteSize countStyle:NSByteCountFormatterCountStyleFile]];
+    // livePathDescription is resolved ONCE, at import time (see
+    // +[ModAssetLibrary importFileURLs:intoFolder:error:]) - not
+    // recomputed here. For a bundle, computing this means reading every
+    // cached __data's CAB header to find this entry's match (see
+    // BundleTransplant.h's own MATCHING note), which is exactly the
+    // full-directory rescan that used to make opening this dropdown
+    // hang: doing that on every tap instead of once at import was the
+    // bug. nil only for entries imported before this field existed.
+    NSString *pathText = entry.livePathDescription ?: @"(unknown - imported before this was tracked)";
 
-    NSMutableArray<NSString *> *lines = [NSMutableArray arrayWithObjects:pathLine, nil];
-    if (entry.cab) [lines addObject:[NSString stringWithFormat:@"CAB: %@", entry.cab]];
-    [lines addObject:sizeLine];
+    GDMarqueeLabel *pathLabel = [[GDMarqueeLabel alloc] init];
+    pathLabel.text = [NSString stringWithFormat:@"Path: %@", pathText];
+    pathLabel.font = subtextFont;
+    pathLabel.textColor = subtextColor;
+    [panel addArrangedSubview:pathLabel];
 
-    for (NSString *line in lines) {
-        UILabel *label = [[UILabel alloc] init];
-        label.text = line;
-        label.font = subtextFont;
-        label.textColor = subtextColor;
-        label.lineBreakMode = NSLineBreakByTruncatingMiddle;
-        [panel addArrangedSubview:label];
+    if (entry.cab) {
+        GDMarqueeLabel *cabLabel = [[GDMarqueeLabel alloc] init];
+        cabLabel.text = [NSString stringWithFormat:@"CAB: %@", entry.cab];
+        cabLabel.font = subtextFont;
+        cabLabel.textColor = subtextColor;
+        [panel addArrangedSubview:cabLabel];
     }
+
+    UILabel *sizeLabel = [[UILabel alloc] init];
+    sizeLabel.text = [NSString stringWithFormat:@"Size: %@", [NSByteCountFormatter stringFromByteCount:(long long)entry.byteSize countStyle:NSByteCountFormatterCountStyleFile]];
+    sizeLabel.font = subtextFont;
+    sizeLabel.textColor = subtextColor;
+    [panel addArrangedSubview:sizeLabel]; // short enough it never needs to scroll - plain UILabel is fine
+
     return panel;
 }
 
@@ -2988,7 +3042,7 @@ static const CGFloat kContentFadeHeight = 22;
     self.modsLibraryExpandedInfoEntries = [NSMutableSet set];
     self.modsLibraryStack = [[UIStackView alloc] init];
     self.modsLibraryStack.axis = UILayoutConstraintAxisVertical;
-    self.modsLibraryStack.spacing = 4;
+    self.modsLibraryStack.spacing = 2;
     self.modsLibraryStack.translatesAutoresizingMaskIntoConstraints = NO;
     [self.stack addArrangedSubview:self.modsLibraryStack];
     [self gd_rebuildModsLibrary];
@@ -3809,8 +3863,8 @@ static void * const kGDModsPickerKindKey = (void *)&kGDModsPickerKindKey;
 // own on-disk path since that's stable across a rebuild the way the
 // entry object itself isn't (a fresh array of entries is read back
 // from the manifest on every -gd_rebuildModsLibrary call).
-- (void)gd_modsLibraryEntryInfoTapped:(UIButton *)sender {
-    ModAssetLibraryEntry *entry = objc_getAssociatedObject(sender, "gd_modsEntry");
+- (void)gd_modsLibraryEntryInfoTapped:(UITapGestureRecognizer *)gesture {
+    ModAssetLibraryEntry *entry = objc_getAssociatedObject(gesture.view, "gd_modsEntry");
     if (!entry) return;
     if ([self.modsLibraryExpandedInfoEntries containsObject:entry.path]) {
         [self.modsLibraryExpandedInfoEntries removeObject:entry.path];

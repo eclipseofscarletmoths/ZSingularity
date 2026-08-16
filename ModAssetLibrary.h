@@ -47,6 +47,27 @@ typedef NS_ENUM(NSInteger, ModAssetLibraryErrorCode) {
 @property (nonatomic, copy) NSString *path;               // full on-disk path, under the owning folder
 @property (nonatomic, assign) unsigned long long byteSize;
 @property (nonatomic, copy) NSString *dateAdded;           // ISO 8601, UTC
+
+// Human-readable description of where this file lives (or would live)
+// WITHIN THE GAME's own files - i.e. wherever it was/would be swapped
+// into. For a bundle this means resolving every cached __data whose own
+// CAB matches this entry's (there can be more than one - see
+// BundleTransplant.h's own MATCHING note); for a bank it's the one
+// deterministic +[BankTransplant mobileFMODBuildsDirectory]/<fileName>.
+//
+// Resolved exactly ONCE, at import time
+// (+importFileURLs:intoFolder:error:), and never recomputed after -
+// resolving a bundle's match means reading every cached __data's CAB
+// header (see UnityBundleCAB.h), which does not scale to "once per UI
+// render": recomputing it every time an entry's Info dropdown opened
+// used to mean rescanning the entire Unity bundle cache on every tap,
+// which is exactly the hang this field exists to avoid. The tradeoff is
+// staleness - if the game's cache changes shape after import (a fresh
+// login re-caches something under a new hash, say), this won't reflect
+// that until the entry is re-imported. Given what this field is FOR
+// (a human glancing at "where did this go"), that's the right side of
+// the tradeoff to be on.
+@property (nonatomic, copy, nullable) NSString *livePathDescription;
 @end
 
 @interface ModAssetLibrary : NSObject

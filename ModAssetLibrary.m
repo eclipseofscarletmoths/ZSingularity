@@ -2,6 +2,8 @@
 
 #import "ModAssetLibrary.h"
 #import "UnityBundleCAB.h"
+#import "BundleTransplant.h"
+#import "BankTransplant.h"
 #import "ZTweakLog.h"
 
 NSString * const ModAssetLibraryErrorDomain = @"ModAssetLibraryErrorDomain";
@@ -22,6 +24,7 @@ static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
     d[@"path"] = self.path;
     d[@"byteSize"] = @(self.byteSize);
     d[@"dateAdded"] = self.dateAdded;
+    if (self.livePathDescription) d[@"livePathDescription"] = self.livePathDescription;
     return d;
 }
 
@@ -33,6 +36,7 @@ static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
     e.path = d[@"path"];
     e.byteSize = [d[@"byteSize"] unsignedLongLongValue];
     e.dateAdded = [d[@"dateAdded"] isKindOfClass:NSString.class] ? d[@"dateAdded"] : @"";
+    e.livePathDescription = [d[@"livePathDescription"] isKindOfClass:NSString.class] ? d[@"livePathDescription"] : nil;
     return e;
 }
 
@@ -42,6 +46,7 @@ static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
 + (NSString *)mal_manifestPathForFolder:(NSString *)folderName;
 + (BOOL)mal_writeEntries:(NSArray<ModAssetLibraryEntry *> *)entries toFolder:(NSString *)folderName error:(NSError **)error;
 + (NSString *)mal_uniqueFileNameFor:(NSString *)desired inFolder:(NSString *)folderPath;
++ (NSString *)mal_livePathDescriptionForCAB:(nullable NSString *)cab fileName:(NSString *)fileName;
 @end
 
 @implementation ModAssetLibrary
@@ -181,6 +186,41 @@ static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
     return candidate;
 }
 
+// Rewrites an on-disk path under this app's own Library directory into
+// one starting at "Library/..." instead of the full sandbox path
+// ("/var/mobile/Containers/Data/Application/<UUID>/Library/...").
+// Returns `path` UNCHANGED if it doesn't live under the Library
+// directory - most bank paths don't (they live under the game's own
+// bundle/Documents tree via +[BankTransplant mobileFMODBuildsDirectory],
+// not this tweak's Library folder) and the full path is exactly what's
+// useful to see there. (Previously this fell back to just
+// path.lastPathComponent in that case, which is why a bank's Info
+// dropdown used to show only its filename with no path at all - that
+// was the bug, not a deliberate simplification.)
++ (NSString *)mal_libraryRelativePath:(NSString *)path {
+    NSArray<NSString *> *paths = NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES);
+    NSString *libraryDir = paths.firstObject;
+    if (libraryDir && [path hasPrefix:libraryDir]) {
+        NSString *relative = [path substringFromIndex:libraryDir.length];
+        if ([relative hasPrefix:@"/"]) relative = [relative substringFromIndex:1];
+        return [@"Library/" stringByAppendingString:relative];
+    }
+    return path;
+}
+
++ (NSString *)mal_livePathDescriptionForCAB:(nullable NSString *)cab fileName:(NSString *)fileName {
+    if (cab) {
+        NSArray<NSString *> *matches = [BundleTransplant cachedDataPathsForCAB:cab];
+        if (matches.count == 0) return @"Not currently cached by the game";
+        NSMutableArray<NSString *> *relatives = [NSMutableArray arrayWithCapacity:matches.count];
+        for (NSString *path in matches) [relatives addObject:[self mal_libraryRelativePath:path]];
+        return [relatives componentsJoinedByString:@", "];
+    }
+    NSString *bankDir = [BankTransplant mobileFMODBuildsDirectory];
+    NSString *path = bankDir ? [bankDir stringByAppendingPathComponent:fileName] : fileName;
+    return [self mal_libraryRelativePath:path];
+}
+
 + (BOOL)importFileURLs:(NSArray<NSURL *> *)moddedURLs intoFolder:(NSString *)folderName error:(NSError **)error {
     NSString *root = [self modLibraryRootDirectory];
     NSString *folderPath = [root stringByAppendingPathComponent:folderName];
@@ -226,6 +266,10 @@ static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
         entry.path = destPath;
         entry.byteSize = attrs.fileSize;
         entry.dateAdded = now;
+        // Resolved here, once, and never again - see ModAssetLibrary.h's
+        // own comment on livePathDescription for why recomputing this on
+        // every UI render (as the Info dropdown used to) doesn't scale.
+        entry.livePathDescription = [self mal_livePathDescriptionForCAB:cab fileName:destName];
         [entries addObject:entry];
         importedCount++;
     }
