@@ -142,6 +142,17 @@ typedef NS_ENUM(NSInteger, BundleTransplantErrorCode) {
 // backup for this CAB at all.
 + (NSInteger)restoreBackedUpBundlesForCAB:(NSString *)cab force:(BOOL)force error:(NSError **)error;
 
+// Scans +unityCacheSharedDirectory RIGHT NOW - not +bundleBackupDirectory -
+// for every __data whose own CAB equals `cab`. This is the file's
+// CURRENT location in the game's own cache (wherever it'll actually be
+// loaded from), not where a backup of it happens to be stored. A CAB
+// can legitimately match more than one cached __data - see MATCHING
+// above - so this can return more than one path. Always returns an
+// array (never nil); empty if the cache directory doesn't exist yet or
+// nothing currently matches `cab` (e.g. it hasn't been swapped in, or
+// the game hasn't cached that asset this session).
++ (NSArray<NSString *> *)cachedDataPathsForCAB:(NSString *)cab;
+
 @end
 
 NS_ASSUME_NONNULL_END

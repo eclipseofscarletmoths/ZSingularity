@@ -491,51 +491,62 @@ static void gd_style_icon_button_as_native_glass(UIButton *button, UIImage *imag
     button.contentHorizontalAlignment = UIControlContentHorizontalAlignmentCenter;
 }
 
-// Associated-object keys backing the generic hold-to-confirm gesture
+// Associated-object key backing the generic hold-to-confirm gesture
 // (see gd_attach_hold_to_confirm and -gd_handleHoldToConfirmGesture:
 // below) - stashed per-button so the shared CADisplayLink-driven tick
-// handler can restyle/reset whichever button is currently mid-hold
-// without every call site having to pass all of this through manually.
-static void * const kGDHoldConfirmBlockKey = (void *)&kGDHoldConfirmBlockKey;       // copied void(^)(void), run once the hold completes
-static void * const kGDHoldConfirmIconKey = (void *)&kGDHoldConfirmIconKey;         // UIImage, re-applied every tick alongside the interpolated tint
-static void * const kGDHoldConfirmBaseTintKey = (void *)&kGDHoldConfirmBaseTintKey; // UIColor the button starts (and ends) at
+// handler can run whichever button's own completion block once its
+// hold completes, without every call site having to pass it through
+// manually.
+static void * const kGDHoldConfirmBlockKey = (void *)&kGDHoldConfirmBlockKey; // copied void(^)(void), run once the hold completes
 
-// Linear per-channel interpolation between two UIColors - used to fade
-// a hold-to-confirm icon from its resting tint to red as the hold
-// progresses. Both colors are expected to already be in (or convert
-// cleanly to) the RGB colorspace, true for every UIColor this file
-// constructs with colorWithRed:green:blue:alpha: or colorWithWhite:alpha:.
-static UIColor *gd_color_lerp(UIColor *from, UIColor *to, CGFloat t) {
-    CGFloat fr, fg, fb, fa, tr, tg, tb, ta;
-    [from getRed:&fr green:&fg blue:&fb alpha:&fa];
-    [to getRed:&tr green:&tg blue:&tb alpha:&ta];
-    return [UIColor colorWithRed:fr + (tr - fr) * t
-                            green:fg + (tg - fg) * t
-                             blue:fb + (tb - fb) * t
-                            alpha:fa + (ta - fa) * t];
-}
-
-// Wires up `button` (expected to already be styled via
-// gd_style_icon_button_as_native_glass with `icon`/`baseTint`) so that
-// holding it for kGDHoldConfirmDuration seconds - not just tapping it -
+// Wires up `button` so that holding it for 1.5s - not just tapping it -
 // runs `onConfirm`. This is the safety net requested for every
 // destructive X icon in the Mods Library accordion (folder delete,
-// entry delete): a single tap does nothing but register the touch-down;
-// -gd_handleHoldToConfirmGesture:/-gd_holdConfirmTick: below own the
-// actual timing and the expand-then-redden animation, mirroring the
-// Syslog button's own hold-to-confirm pattern (see
-// -handleSyslogButtonLongPress:) but generalized to any icon button and
-// with a caller-supplied completion block instead of one hardcoded
-// action.
-static void gd_attach_hold_to_confirm(UIButton *button, UIImage *icon, UIColor *baseTint, id target, void (^onConfirm)(void)) {
+// entry delete): -gd_handleHoldToConfirmGesture:/-gd_holdConfirmTick:
+// below own the actual timing and the icon's expand-while-held
+// animation, mirroring the Syslog button's own hold-to-confirm timing
+// mechanism (see -handleSyslogButtonLongPress:) - CADisplayLink-driven
+// via a minimumPressDuration:0 long-press so this owns per-frame
+// progress rather than only learning the hold completed - but without
+// that button's red progress-fill: a plain quick tap/release here
+// instead plays an error haptic (see -gd_handleHoldToConfirmGesture:),
+// which does the same "you need to hold this" job. `onConfirm` is a
+// caller-supplied completion block instead of one hardcoded action.
+static void gd_attach_hold_to_confirm(UIButton *button, id target, void (^onConfirm)(void)) {
     UILongPressGestureRecognizer *press =
         [[UILongPressGestureRecognizer alloc] initWithTarget:target action:@selector(gd_handleHoldToConfirmGesture:)];
     press.minimumPressDuration = 0; // -gd_holdConfirmTick: owns the real timing, same reasoning as the Syslog button's hold
     press.cancelsTouchesInView = NO;
     [button addGestureRecognizer:press];
-    objc_setAssociatedObject(button, kGDHoldConfirmIconKey, icon, OBJC_ASSOCIATION_RETAIN);
-    objc_setAssociatedObject(button, kGDHoldConfirmBaseTintKey, baseTint, OBJC_ASSOCIATION_RETAIN);
     objc_setAssociatedObject(button, kGDHoldConfirmBlockKey, [onConfirm copy], OBJC_ASSOCIATION_COPY);
+}
+
+// Associated-object keys for gd_attach_pill_hold_to_confirm below -
+// same idea as kGDHoldConfirmBlockKey above, plus one for the fill
+// layer itself so it's created once per button and reused (mirrors
+// syslogButtonFillLayer's own "created lazily on first Began, persists
+// after that" comment).
+static void * const kGDPillHoldConfirmBlockKey = (void *)&kGDPillHoldConfirmBlockKey;
+static void * const kGDPillHoldConfirmFillLayerKey = (void *)&kGDPillHoldConfirmFillLayerKey;
+
+// Wide-button counterpart to gd_attach_hold_to_confirm above - wires up
+// `button` so that holding it for 1.5s runs `onConfirm`, with a red
+// fill sweeping left-to-right across the whole button as visual
+// progress. This is literally the Syslog button's own hold-to-confirm
+// mechanism (see -handleSyslogButtonLongPress:/-gd_syslogHoldTick:),
+// factored out so any other wide button - currently just "Restore
+// Bundles & Banks" - can reuse the same behavior instead of firing on
+// a plain tap. Same minimumPressDuration:0 + CADisplayLink shape as
+// gd_attach_hold_to_confirm, and the same "quick tap/early release
+// plays an error haptic" contract - see
+// -gd_handlePillHoldToConfirmGesture:.
+static void gd_attach_pill_hold_to_confirm(UIButton *button, id target, void (^onConfirm)(void)) {
+    UILongPressGestureRecognizer *press =
+        [[UILongPressGestureRecognizer alloc] initWithTarget:target action:@selector(gd_handlePillHoldToConfirmGesture:)];
+    press.minimumPressDuration = 0;
+    press.cancelsTouchesInView = NO;
+    [button addGestureRecognizer:press];
+    objc_setAssociatedObject(button, kGDPillHoldConfirmBlockKey, [onConfirm copy], OBJC_ASSOCIATION_COPY);
 }
 
 #pragma mark - Engine scripts
@@ -1804,6 +1815,30 @@ static NSString *gd_library_relative_path(NSString *path) {
     return path.lastPathComponent;
 }
 
+// The path shown in an entry's Info dropdown - deliberately NOT
+// entry.path (that's just where this tweak keeps its own tracked copy,
+// under +[ModAssetLibrary modLibraryRootDirectory]). What's actually
+// useful to see is where the file lives WITHIN THE GAME's own files -
+// i.e. wherever it was (or would be) swapped into. For a bundle that's
+// wherever its CAB currently sits in +[BundleTransplant
+// unityCacheSharedDirectory] (there can be more than one match - see
+// BundleTransplant.h's own MATCHING note - so every match is listed);
+// for a bank it's the one deterministic +[BankTransplant
+// mobileFMODBuildsDirectory]/<fileName>, since a bank's filename IS its
+// identity, no lookup needed.
+static NSString *gd_mods_entry_live_path_description(ModAssetLibraryEntry *entry) {
+    if (entry.cab) {
+        NSArray<NSString *> *matches = [BundleTransplant cachedDataPathsForCAB:entry.cab];
+        if (matches.count == 0) return @"Not currently cached by the game";
+        NSMutableArray<NSString *> *relatives = [NSMutableArray arrayWithCapacity:matches.count];
+        for (NSString *path in matches) [relatives addObject:gd_library_relative_path(path)];
+        return [relatives componentsJoinedByString:@", "];
+    }
+    NSString *bankDir = [BankTransplant mobileFMODBuildsDirectory];
+    NSString *path = bankDir ? [bankDir stringByAppendingPathComponent:entry.fileName] : entry.fileName;
+    return gd_library_relative_path(path);
+}
+
 // Folder header row for the Mods Library accordion: [chevron][folder
 // icon][name] .... [Add pill][pencil][X], left-to-right per request.
 // The whole row (not just the chevron) is tappable for expand/collapse
@@ -1904,17 +1939,17 @@ static UIView *gd_make_mods_folder_row(NSString *folderName, BOOL expanded, id t
 
         [deleteButton.trailingAnchor constraintEqualToAnchor:row.trailingAnchor],
         [deleteButton.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
-        [deleteButton.widthAnchor constraintEqualToConstant:16],
-        [deleteButton.heightAnchor constraintEqualToConstant:16],
+        [deleteButton.widthAnchor constraintEqualToConstant:18],
+        [deleteButton.heightAnchor constraintEqualToConstant:18],
 
-        [renameButton.trailingAnchor constraintEqualToAnchor:deleteButton.leadingAnchor constant:-10],
+        [renameButton.trailingAnchor constraintEqualToAnchor:deleteButton.leadingAnchor constant:-6],
         [renameButton.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
-        [renameButton.widthAnchor constraintEqualToConstant:16],
-        [renameButton.heightAnchor constraintEqualToConstant:16],
+        [renameButton.widthAnchor constraintEqualToConstant:18],
+        [renameButton.heightAnchor constraintEqualToConstant:18],
 
-        [addButton.trailingAnchor constraintEqualToAnchor:renameButton.leadingAnchor constant:-8],
+        [addButton.trailingAnchor constraintEqualToAnchor:renameButton.leadingAnchor constant:-6],
         [addButton.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
-        [addButton.heightAnchor constraintEqualToConstant:20],
+        [addButton.heightAnchor constraintEqualToConstant:18],
         [addButton.widthAnchor constraintGreaterThanOrEqualToConstant:38],
 
         [row.topAnchor constraintEqualToAnchor:label.topAnchor constant:-5],
@@ -1987,10 +2022,10 @@ static UIView *gd_make_mods_entry_row(ModAssetLibraryEntry *entry, id target, SE
 
         [deleteButton.trailingAnchor constraintEqualToAnchor:row.trailingAnchor],
         [deleteButton.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
-        [deleteButton.widthAnchor constraintEqualToConstant:16],
-        [deleteButton.heightAnchor constraintEqualToConstant:16],
+        [deleteButton.widthAnchor constraintEqualToConstant:18],
+        [deleteButton.heightAnchor constraintEqualToConstant:18],
 
-        [infoButton.trailingAnchor constraintEqualToAnchor:deleteButton.leadingAnchor constant:-8],
+        [infoButton.trailingAnchor constraintEqualToAnchor:deleteButton.leadingAnchor constant:-6],
         [infoButton.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
         [infoButton.heightAnchor constraintEqualToConstant:18],
         [infoButton.widthAnchor constraintGreaterThanOrEqualToConstant:34],
@@ -2001,12 +2036,12 @@ static UIView *gd_make_mods_entry_row(ModAssetLibraryEntry *entry, id target, SE
     return row;
 }
 
-// Expandable "Info" panel for one entry - filepath (relative to
-// NSLibraryDirectory, not the full sandbox /var/... path -
-// gd_library_relative_path), CAB (bundles only), and human-readable
-// size, one muted subtext line each. Inserted directly after the
-// entry's own row in modsLibraryStack when its path is in
-// modsLibraryExpandedInfoEntries - see -gd_rebuildModsLibrary.
+// Expandable "Info" panel for one entry - filepath (where the file
+// lives WITHIN THE GAME's own files, not this tweak's own tracked-copy
+// storage - see gd_mods_entry_live_path_description), CAB (bundles
+// only), and human-readable size, one muted subtext line each.
+// Inserted directly after the entry's own row in modsLibraryStack when
+// its path is in modsLibraryExpandedInfoEntries - see -gd_rebuildModsLibrary.
 static UIView *gd_make_mods_entry_info_panel(ModAssetLibraryEntry *entry) {
     UIStackView *panel = [[UIStackView alloc] init];
     panel.axis = UILayoutConstraintAxisVertical;
@@ -2018,7 +2053,7 @@ static UIView *gd_make_mods_entry_info_panel(ModAssetLibraryEntry *entry) {
     UIFont *subtextFont = [UIFont systemFontOfSize:9.5 weight:UIFontWeightRegular];
     UIColor *subtextColor = [UIColor colorWithWhite:1 alpha:0.4];
 
-    NSString *pathLine = [NSString stringWithFormat:@"Path: %@", gd_library_relative_path(entry.path)];
+    NSString *pathLine = [NSString stringWithFormat:@"Path: %@", gd_mods_entry_live_path_description(entry)];
     NSString *sizeLine = [NSString stringWithFormat:@"Size: %@", [NSByteCountFormatter stringFromByteCount:(long long)entry.byteSize countStyle:NSByteCountFormatterCountStyleFile]];
 
     NSMutableArray<NSString *> *lines = [NSMutableArray arrayWithObjects:pathLine, nil];
@@ -2230,6 +2265,22 @@ static UIView *gd_make_title_block(void) {
 @property (nonatomic, assign) NSTimeInterval holdConfirmStartTime;
 @property (nonatomic, assign) BOOL holdConfirmTriggered;
 @property (nonatomic, strong) CADisplayLink *holdConfirmDisplayLink;
+
+// Same idea as the block above, but for wide pill/text buttons that
+// confirm a hold with a left-to-right fill sweeping across the whole
+// button - i.e. literally the Syslog button's own hold mechanism (see
+// -handleSyslogButtonLongPress:/-gd_syslogHoldTick:), generalized the
+// same way the icon version above generalizes it for small X icons.
+// Currently just the "Restore Bundles & Banks" button, but written to
+// take any button + a completion block. Kept as its own separate set
+// of state (rather than reusing holdConfirm* above) since the two
+// button styles animate completely differently (a growing icon vs. a
+// growing fill layer) and could, in principle, both be mid-hold at
+// once (different sections of the panel).
+@property (nonatomic, weak) UIButton *pillHoldConfirmActiveButton;
+@property (nonatomic, assign) NSTimeInterval pillHoldConfirmStartTime;
+@property (nonatomic, assign) BOOL pillHoldConfirmTriggered;
+@property (nonatomic, strong) CADisplayLink *pillHoldConfirmDisplayLink;
 
 // Verbose (tweak-only log) mode: engaged by holding the Debug section's
 // "Syslog" button for kSyslogHoldDuration seconds - see
@@ -2920,7 +2971,17 @@ static const CGFloat kContentFadeHeight = 22;
     UIButton *importModButton = objc_getAssociatedObject(modsRow, "gd_button_left");
     [importModButton addTarget:self action:@selector(importModTapped) forControlEvents:UIControlEventTouchUpInside];
     UIButton *restoreOriginalsButton = objc_getAssociatedObject(modsRow, "gd_button_right");
-    [restoreOriginalsButton addTarget:self action:@selector(restoreOriginalsTapped) forControlEvents:UIControlEventTouchUpInside];
+    // Hold-to-confirm (1.5s, same red-fill mechanism as the Syslog
+    // button's own hold - see gd_attach_pill_hold_to_confirm) rather than
+    // a plain tap, same reasoning as every X icon in the accordion below:
+    // this is a destructive-ish bulk action, a stray tap shouldn't run
+    // it. A quick tap now just plays an error haptic instead of doing
+    // anything - see -gd_handlePillHoldToConfirmGesture:. Reuses the
+    // `weakSelf` already declared above for the Syslog line handler -
+    // still in scope here, same method body.
+    gd_attach_pill_hold_to_confirm(restoreOriginalsButton, self, ^{
+        [weakSelf restoreOriginalsTapped];
+    });
     [self.stack addArrangedSubview:modsRow];
 
     self.modsLibraryExpandedFolders = [NSMutableSet set];
@@ -3397,9 +3458,14 @@ static void * const kGDModsPickerKindKey = (void *)&kGDModsPickerKindKey;
             self.holdConfirmDisplayLink = nil;
             if (!self.holdConfirmTriggered) {
                 // Released before the 1.5s mark - snap the icon back to
-                // its resting size/color instead of leaving it stranded
-                // mid-animation.
+                // its resting size instead of leaving it stranded
+                // mid-animation, and play an error haptic: this covers a
+                // plain quick tap too (Began immediately followed by
+                // Ended), which is exactly the "clicked but didn't hold"
+                // case that should tell the person to hold instead.
                 [self gd_resetHoldConfirmButton:button animated:YES];
+                UINotificationFeedbackGenerator *haptic = [UINotificationFeedbackGenerator new];
+                [haptic notificationOccurred:UINotificationFeedbackTypeError];
             }
             self.holdConfirmActiveButton = nil;
             break;
@@ -3409,13 +3475,14 @@ static void * const kGDModsPickerKindKey = (void *)&kGDModsPickerKindKey;
     }
 }
 
-// Drives the per-frame "expand then slowly redden" animation and fires
-// the button's completion block once the hold reaches
-// kGDHoldConfirmDuration. Scale ramps up over the hold's first 40% (a
-// quick, obvious "this is registering" pop) and then holds there while
-// color alone keeps interpolating toward red across the FULL duration,
-// per request ("expanding in size, then slowly turning red until the
-// time is up").
+// Drives the per-frame "expand while held" animation and fires the
+// button's completion block once the hold reaches
+// kGDHoldConfirmDuration. No color change - that turned out not to
+// render correctly (the fill never became visible against the icon's
+// own glass background) and was dropped rather than fixed; the scale
+// alone, plus the error haptic on an early release in
+// -gd_handleHoldToConfirmGesture:, is enough to communicate "hold,
+// don't tap."
 - (void)gd_holdConfirmTick:(CADisplayLink *)link {
     static const NSTimeInterval kGDHoldConfirmDuration = 1.5;
     UIButton *button = self.holdConfirmActiveButton;
@@ -3425,7 +3492,6 @@ static void * const kGDModsPickerKindKey = (void *)&kGDModsPickerKindKey;
     }
 
     NSTimeInterval elapsed = CACurrentMediaTime() - self.holdConfirmStartTime;
-    CGFloat pct = (CGFloat)MIN(1.0, elapsed / kGDHoldConfirmDuration);
     CGFloat scalePct = (CGFloat)MIN(1.0, elapsed / (kGDHoldConfirmDuration * 0.4));
 
     [CATransaction begin];
@@ -3433,12 +3499,7 @@ static void * const kGDModsPickerKindKey = (void *)&kGDModsPickerKindKey;
     button.transform = CGAffineTransformMakeScale(1.0 + 0.4 * scalePct, 1.0 + 0.4 * scalePct);
     [CATransaction commit];
 
-    UIColor *baseTint = objc_getAssociatedObject(button, kGDHoldConfirmBaseTintKey);
-    UIImage *icon = objc_getAssociatedObject(button, kGDHoldConfirmIconKey);
-    UIColor *red = [UIColor colorWithRed:1.0 green:0.15 blue:0.15 alpha:1.0];
-    gd_style_icon_button_as_native_glass(button, icon, gd_color_lerp(baseTint ?: red, red, pct));
-
-    if (pct >= 1.0 && !self.holdConfirmTriggered) {
+    if (elapsed >= kGDHoldConfirmDuration && !self.holdConfirmTriggered) {
         self.holdConfirmTriggered = YES;
         [link invalidate];
         self.holdConfirmDisplayLink = nil;
@@ -3455,16 +3516,119 @@ static void * const kGDModsPickerKindKey = (void *)&kGDModsPickerKindKey;
 }
 
 - (void)gd_resetHoldConfirmButton:(UIButton *)button animated:(BOOL)animated {
-    UIColor *baseTint = objc_getAssociatedObject(button, kGDHoldConfirmBaseTintKey);
-    UIImage *icon = objc_getAssociatedObject(button, kGDHoldConfirmIconKey);
     void (^apply)(void) = ^{
         button.transform = CGAffineTransformIdentity;
-        gd_style_icon_button_as_native_glass(button, icon, baseTint);
     };
     if (animated) {
         [UIView animateWithDuration:0.18 animations:apply];
     } else {
         apply();
+    }
+}
+
+// Handler for gd_attach_pill_hold_to_confirm's gesture - same shape as
+// -handleSyslogButtonLongPress: (this basically IS that method,
+// generalized to any button + completion block instead of hardcoding
+// the Syslog button and -gd_enterSyslogVerboseMode). minimumPressDuration:0
+// so -Began fires on touch-down and -gd_pillHoldConfirmTick: owns the
+// real 1.5s timing per-frame, the same reasoning as the icon version's
+// own header comment.
+- (void)gd_handlePillHoldToConfirmGesture:(UILongPressGestureRecognizer *)gesture {
+    UIButton *button = (UIButton *)gesture.view;
+    switch (gesture.state) {
+        case UIGestureRecognizerStateBegan: {
+            if (self.pillHoldConfirmActiveButton && self.pillHoldConfirmActiveButton != button) break;
+
+            self.pillHoldConfirmActiveButton = button;
+            self.pillHoldConfirmStartTime = CACurrentMediaTime();
+            self.pillHoldConfirmTriggered = NO;
+
+            CALayer *fill = objc_getAssociatedObject(button, kGDPillHoldConfirmFillLayerKey);
+            if (!fill) {
+                fill = [CALayer layer];
+                fill.backgroundColor = [UIColor colorWithRed:1.0 green:0.08 blue:0.08 alpha:0.85].CGColor;
+                fill.anchorPoint = CGPointMake(0, 0);
+                fill.cornerRadius = button.bounds.size.height / 2.0;
+                fill.cornerCurve = kCACornerCurveContinuous;
+                // Inserted directly as a sublayer, same reasoning as
+                // syslogButtonFillLayer's own comment - sits behind
+                // whatever UIButtonConfiguration's native glass style is
+                // managing as the button's real subviews, and survives
+                // gd_style_button_as_native_glass never touching
+                // button.layer's sublayers directly.
+                [button.layer insertSublayer:fill atIndex:0];
+                objc_setAssociatedObject(button, kGDPillHoldConfirmFillLayerKey, fill, OBJC_ASSOCIATION_RETAIN);
+            }
+
+            [self.pillHoldConfirmDisplayLink invalidate];
+            self.pillHoldConfirmDisplayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(gd_pillHoldConfirmTick:)];
+            [self.pillHoldConfirmDisplayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+            break;
+        }
+        case UIGestureRecognizerStateEnded:
+        case UIGestureRecognizerStateCancelled:
+        case UIGestureRecognizerStateFailed: {
+            if (self.pillHoldConfirmActiveButton != button) break;
+            [self.pillHoldConfirmDisplayLink invalidate];
+            self.pillHoldConfirmDisplayLink = nil;
+
+            if (!self.pillHoldConfirmTriggered) {
+                // Released before the 1.5s mark (a plain tap included) -
+                // snap the fill back down and play an error haptic, same
+                // contract as the icon X buttons' own early-release path.
+                CALayer *fill = objc_getAssociatedObject(button, kGDPillHoldConfirmFillLayerKey);
+                [CATransaction begin];
+                [CATransaction setAnimationDuration:0.18];
+                fill.frame = CGRectMake(0, 0, 0, button.bounds.size.height);
+                fill.cornerRadius = button.bounds.size.height / 2.0;
+                [CATransaction commit];
+
+                UINotificationFeedbackGenerator *haptic = [UINotificationFeedbackGenerator new];
+                [haptic notificationOccurred:UINotificationFeedbackTypeError];
+            }
+            self.pillHoldConfirmActiveButton = nil;
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+- (void)gd_pillHoldConfirmTick:(CADisplayLink *)link {
+    static const NSTimeInterval kGDPillHoldConfirmDuration = 1.5;
+    UIButton *button = self.pillHoldConfirmActiveButton;
+    if (!button) {
+        [link invalidate];
+        return;
+    }
+
+    NSTimeInterval elapsed = CACurrentMediaTime() - self.pillHoldConfirmStartTime;
+    CGFloat pct = (CGFloat)MIN(1.0, elapsed / kGDPillHoldConfirmDuration);
+
+    CALayer *fill = objc_getAssociatedObject(button, kGDPillHoldConfirmFillLayerKey);
+    CGRect bounds = button.bounds;
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES]; // no implicit animation - the per-tick updates ARE the animation
+    fill.frame = CGRectMake(0, 0, bounds.size.width * pct, bounds.size.height);
+    fill.cornerRadius = bounds.size.height / 2.0;
+    [CATransaction commit];
+
+    if (pct >= 1.0 && !self.pillHoldConfirmTriggered) {
+        self.pillHoldConfirmTriggered = YES;
+        [link invalidate];
+        self.pillHoldConfirmDisplayLink = nil;
+
+        void (^completion)(void) = objc_getAssociatedObject(button, kGDPillHoldConfirmBlockKey);
+
+        // Snap the fill back down now that the hold has done its job -
+        // otherwise it'd sit fully red until some unrelated redraw.
+        [CATransaction begin];
+        [CATransaction setAnimationDuration:0.18];
+        fill.frame = CGRectMake(0, 0, 0, bounds.size.height);
+        [CATransaction commit];
+
+        self.pillHoldConfirmActiveButton = nil;
+        if (completion) completion();
     }
 }
 
@@ -3529,9 +3693,6 @@ static void * const kGDModsPickerKindKey = (void *)&kGDModsPickerKindKey;
         return;
     }
 
-    UIImageSymbolConfiguration *xSymbolConfig = [UIImageSymbolConfiguration configurationWithPointSize:6 weight:UIImageSymbolWeightSemibold];
-    UIImage *xImage = [UIImage systemImageNamed:@"xmark" withConfiguration:xSymbolConfig];
-    UIColor *xTint = [UIColor colorWithWhite:1 alpha:0.55];
     __weak typeof(self) weakSelf = self;
 
     for (NSString *folderName in folders) {
@@ -3543,7 +3704,7 @@ static void * const kGDModsPickerKindKey = (void *)&kGDModsPickerKindKey;
 
         UIButton *folderDeleteButton = objc_getAssociatedObject(folderRow, "gd_button_delete");
         NSString *folderNameForDelete = [folderName copy]; // own copy for the block below, independent of the loop variable
-        gd_attach_hold_to_confirm(folderDeleteButton, xImage, xTint, self, ^{
+        gd_attach_hold_to_confirm(folderDeleteButton, self, ^{
             [weakSelf gd_deleteModFolderConfirmed:folderNameForDelete];
         });
         [self.modsLibraryStack addArrangedSubview:folderRow];
@@ -3577,7 +3738,7 @@ static void * const kGDModsPickerKindKey = (void *)&kGDModsPickerKindKey;
             UIButton *entryDeleteButton = objc_getAssociatedObject(entryRow, "gd_button_delete");
             ModAssetLibraryEntry *entryForDelete = entry;
             NSString *folderNameForEntry = [folderName copy];
-            gd_attach_hold_to_confirm(entryDeleteButton, xImage, xTint, self, ^{
+            gd_attach_hold_to_confirm(entryDeleteButton, self, ^{
                 [weakSelf gd_deleteModEntryConfirmed:entryForDelete inFolder:folderNameForEntry];
             });
             [self.modsLibraryStack addArrangedSubview:entryRow];

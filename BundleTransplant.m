@@ -477,4 +477,18 @@ static BOOL bt2_same_size_as_backup(NSString *backupPath, NSString *originalPath
     return restored;
 }
 
++ (NSArray<NSString *> *)cachedDataPathsForCAB:(NSString *)cab {
+    NSString *root = [self unityCacheSharedDirectory];
+    if (!root || ![NSFileManager.defaultManager fileExistsAtPath:root]) return @[];
+
+    NSArray<NSString *> *dataPaths = bt2_find_all_data_files(root);
+    NSMutableArray<NSString *> *matches = [NSMutableArray array];
+    for (NSString *path in dataPaths) {
+        NSError *cabErr = nil;
+        NSString *pathCAB = [UnityBundleCAB primaryCABForBundleAtPath:path error:&cabErr];
+        if (pathCAB && [pathCAB isEqualToString:cab]) [matches addObject:path];
+    }
+    return matches;
+}
+
 @end
