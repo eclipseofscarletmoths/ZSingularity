@@ -189,14 +189,18 @@ static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
 // Rewrites an on-disk path under this app's own Library directory into
 // one starting at "Library/..." instead of the full sandbox path
 // ("/var/mobile/Containers/Data/Application/<UUID>/Library/...").
-// Returns `path` UNCHANGED if it doesn't live under the Library
-// directory - most bank paths don't (they live under the game's own
-// bundle/Documents tree via +[BankTransplant mobileFMODBuildsDirectory],
-// not this tweak's Library folder) and the full path is exactly what's
-// useful to see there. (Previously this fell back to just
-// path.lastPathComponent in that case, which is why a bank's Info
-// dropdown used to show only its filename with no path at all - that
-// was the bug, not a deliberate simplification.)
+// Falls through to +mal_sandboxRelativePath: for everything else (most
+// bank paths - they live under the game's own bundle/Documents tree via
+// +[BankTransplant mobileFMODBuildsDirectory], not this tweak's Library
+// folder), which does the same rewrite rooted at the app's own
+// NSHomeDirectory() instead, so those come back as e.g.
+// "Documents/Assets/Sound/FMODBuilds/Mobile/music.bank" rather than the
+// full "/var/mobile/Containers/Data/Application/<UUID>/..." path.
+// (Previously this fell back to just path.lastPathComponent in that
+// case, which is why a bank's Info dropdown used to show only its
+// filename with no path at all - that was the bug, not a deliberate
+// simplification. Then it fell back to the untouched absolute path,
+// which is the /var/mobile/... the person is now asking to drop too.)
 + (NSString *)mal_libraryRelativePath:(NSString *)path {
     NSArray<NSString *> *paths = NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES);
     NSString *libraryDir = paths.firstObject;
@@ -204,6 +208,26 @@ static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
         NSString *relative = [path substringFromIndex:libraryDir.length];
         if ([relative hasPrefix:@"/"]) relative = [relative substringFromIndex:1];
         return [@"Library/" stringByAppendingString:relative];
+    }
+    return [self mal_sandboxRelativePath:path];
+}
+
+// Same idea as +mal_libraryRelativePath: above, but rooted at the app's
+// sandbox home (NSHomeDirectory()) rather than just its Library
+// subdirectory - this is what turns a bank's full
+// "/var/mobile/Containers/Data/Application/<UUID>/Documents/Assets/..."
+// path into "Documents/Assets/..." (the game's own NSDirectory tree),
+// since the tweak runs in-process and NSHomeDirectory() here already IS
+// the game's own sandbox home - no separate container lookup needed.
+// Returns `path` unchanged if it doesn't live under the sandbox home at
+// all (shouldn't normally happen for anything this tweak tracks, but
+// better than silently returning an empty string).
++ (NSString *)mal_sandboxRelativePath:(NSString *)path {
+    NSString *home = NSHomeDirectory();
+    if (home && [path hasPrefix:home]) {
+        NSString *relative = [path substringFromIndex:home.length];
+        if ([relative hasPrefix:@"/"]) relative = [relative substringFromIndex:1];
+        return relative;
     }
     return path;
 }

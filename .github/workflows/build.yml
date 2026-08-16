@@ -44,6 +44,14 @@ jobs:
       #
       # Adjust -miphoneos-version-min if your deployment target
       # differs - 15.0 covers all ProMotion (120Hz-capable) devices.
+      #
+      # -DZS_BUILD_NUMBER=<run number> stamps the same counter the
+      # "Publish release" step below already tags each build with
+      # (build-${{ github.run_number }}) into the binary itself, so the
+      # panel's header version tag (see gd_version_string in
+      # GraphicsDebugOverlay.m) updates on its own with every push -
+      # no version bump needed here beyond the "v0.0.1" prefix baked
+      # into that function.
       - name: Compile tweak dylib
         run: |
           clang \
@@ -54,6 +62,7 @@ jobs:
             -isysroot "${{ steps.sdk.outputs.path }}" \
             -arch arm64 \
             -miphoneos-version-min=15.0 \
+            -DZS_BUILD_NUMBER=${{ github.run_number }} \
             -framework Foundation \
             -framework UIKit \
             -framework QuartzCore \

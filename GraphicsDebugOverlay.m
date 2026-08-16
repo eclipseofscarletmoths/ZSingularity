@@ -499,19 +499,113 @@ static void gd_style_icon_button_as_native_glass(UIButton *button, UIImage *imag
 // manually.
 static void * const kGDHoldConfirmBlockKey = (void *)&kGDHoldConfirmBlockKey; // copied void(^)(void), run once the hold completes
 
+// Associated-object keys backing the capsule-expansion pieces built by
+// gd_attach_delete_capsule below - the sibling view appended after the
+// X button's trailing edge, the layout constraint driving its width,
+// the "Delete" label revealed inside it, and the two red progress-fill
+// layers (one in the expansion view, one in the X button itself) that
+// together sweep across the WHOLE capsule once expanded. Stashed per
+// button (same pattern as kGDHoldConfirmBlockKey) so
+// -gd_handleHoldToConfirmGesture:/-gd_holdConfirmTick: can drive them
+// without every call site threading them through manually.
+static void * const kGDHoldConfirmExpansionViewKey = (void *)&kGDHoldConfirmExpansionViewKey;
+static void * const kGDHoldConfirmExpansionWidthKey = (void *)&kGDHoldConfirmExpansionWidthKey;
+static void * const kGDHoldConfirmDeleteLabelKey = (void *)&kGDHoldConfirmDeleteLabelKey;
+static void * const kGDHoldConfirmExpansionFillKey = (void *)&kGDHoldConfirmExpansionFillKey;
+static void * const kGDHoldConfirmButtonFillKey = (void *)&kGDHoldConfirmButtonFillKey;
+
+// Target width (points) of the revealed "Delete" capsule segment, and
+// how long the quick open/close snap takes - independent of
+// kGDHoldConfirmDuration below, which times the red fill instead.
+static const CGFloat kGDDeleteCapsuleExpandedWidth = 60;
+static const NSTimeInterval kGDDeleteCapsuleSnapDuration = 0.16;
+
+// Builds the capsule "expansion" companion view for `button` and
+// inserts it into `parent` (button's own superview), immediately after
+// button's trailing edge. This - not the button itself - is what grows
+// when the hold begins: the X button never resizes or repositions, so
+// its glyph is pixel-for-pixel stationary throughout, while this view
+// (plus the matching fill layer dropped into the button itself, see
+// below) is "the glass" that visibly expands to form one continuous
+// capsule shape. The button's own native-glass chrome already supplies
+// a rounded silhouette at rest, so this view only needs a rounded
+// TRAILING cap (kCALayerMaxXMinYCorner/kCALayerMaxXMaxYCorner) - its
+// leading edge butts flush against the button with no rounding, so the
+// two read as one pill once expanded, rather than two visibly separate
+// shapes.
+//
+// Starts at zero width, so at rest it's fully invisible and reserves no
+// visible space - -gd_handleHoldToConfirmGesture:/-gd_holdConfirmTick:
+// own growing it back down again on release.
+static void gd_attach_delete_capsule(UIButton *button, UIView *parent) {
+    if (!parent) return; // defensive - button should already be in its row by the time this runs
+
+    UIView *expansion = [[UIView alloc] init];
+    expansion.translatesAutoresizingMaskIntoConstraints = NO;
+    expansion.clipsToBounds = YES;
+    expansion.userInteractionEnabled = NO; // purely decorative - the long-press stays owned by `button`
+    expansion.layer.cornerCurve = kCACornerCurveContinuous;
+    [parent addSubview:expansion];
+    [parent sendSubviewToBack:expansion]; // sits visually behind the button's own trailing edge so there's no seam
+    parent.clipsToBounds = NO; // let the capsule overhang the row's resting bounds while expanded - see the header comment above
+
+    UILabel *deleteLabel = [[UILabel alloc] init];
+    deleteLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    deleteLabel.text = @"Delete";
+    deleteLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightSemibold];
+    deleteLabel.textColor = [UIColor colorWithRed:1 green:0.3 blue:0.3 alpha:1];
+    deleteLabel.alpha = 0; // faded in once the capsule has room for it - see -gd_handleHoldToConfirmGesture:
+    [expansion addSubview:deleteLabel];
+
+    CALayer *expansionFill = [CALayer layer];
+    expansionFill.backgroundColor = [UIColor colorWithRed:1.0 green:0.08 blue:0.08 alpha:0.85].CGColor; // same red/alpha as the Syslog button's own fill
+    expansionFill.anchorPoint = CGPointMake(0, 0);
+    expansionFill.maskedCorners = kCALayerMaxXMinYCorner | kCALayerMaxXMaxYCorner; // rounds only the capsule's outer/trailing cap
+    expansionFill.cornerCurve = kCACornerCurveContinuous;
+    [expansion.layer insertSublayer:expansionFill atIndex:0];
+
+    CALayer *buttonFill = [CALayer layer];
+    buttonFill.backgroundColor = expansionFill.backgroundColor;
+    buttonFill.anchorPoint = CGPointMake(0, 0);
+    buttonFill.maskedCorners = kCALayerMinXMinYCorner | kCALayerMinXMaxYCorner; // rounds only the capsule's leading cap
+    buttonFill.cornerCurve = kCACornerCurveContinuous;
+    // Same trick as kGDPillHoldConfirmFillLayerKey/syslogButtonFillLayer -
+    // inserted directly as a sublayer so it survives
+    // gd_style_icon_button_as_native_glass rebuilding the button's own
+    // UIButtonConfiguration-owned subviews.
+    [button.layer insertSublayer:buttonFill atIndex:0];
+
+    NSLayoutConstraint *widthConstraint = [expansion.widthAnchor constraintEqualToConstant:0];
+    [NSLayoutConstraint activateConstraints:@[
+        [expansion.leadingAnchor constraintEqualToAnchor:button.trailingAnchor],
+        [expansion.centerYAnchor constraintEqualToAnchor:button.centerYAnchor],
+        [expansion.heightAnchor constraintEqualToAnchor:button.heightAnchor],
+        widthConstraint,
+
+        [deleteLabel.centerYAnchor constraintEqualToAnchor:expansion.centerYAnchor],
+        [deleteLabel.trailingAnchor constraintLessThanOrEqualToAnchor:expansion.trailingAnchor constant:-8],
+        [deleteLabel.leadingAnchor constraintGreaterThanOrEqualToAnchor:expansion.leadingAnchor constant:4],
+    ]];
+
+    objc_setAssociatedObject(button, kGDHoldConfirmExpansionViewKey, expansion, OBJC_ASSOCIATION_RETAIN);
+    objc_setAssociatedObject(button, kGDHoldConfirmExpansionWidthKey, widthConstraint, OBJC_ASSOCIATION_RETAIN);
+    objc_setAssociatedObject(button, kGDHoldConfirmDeleteLabelKey, deleteLabel, OBJC_ASSOCIATION_RETAIN);
+    objc_setAssociatedObject(button, kGDHoldConfirmExpansionFillKey, expansionFill, OBJC_ASSOCIATION_RETAIN);
+    objc_setAssociatedObject(button, kGDHoldConfirmButtonFillKey, buttonFill, OBJC_ASSOCIATION_RETAIN);
+}
+
 // Wires up `button` so that holding it for 1.5s - not just tapping it -
 // runs `onConfirm`. This is the safety net requested for every
 // destructive X icon in the Mods Library accordion (folder delete,
 // entry delete): -gd_handleHoldToConfirmGesture:/-gd_holdConfirmTick:
-// below own the actual timing and the icon's expand-while-held
-// animation, mirroring the Syslog button's own hold-to-confirm timing
-// mechanism (see -handleSyslogButtonLongPress:) - CADisplayLink-driven
-// via a minimumPressDuration:0 long-press so this owns per-frame
-// progress rather than only learning the hold completed - but without
-// that button's red progress-fill: a plain quick tap/release here
-// instead plays an error haptic (see -gd_handleHoldToConfirmGesture:),
-// which does the same "you need to hold this" job. `onConfirm` is a
-// caller-supplied completion block instead of one hardcoded action.
+// below own the actual timing, the capsule-expand reveal, and the red
+// progress-fill (see gd_attach_delete_capsule above) - CADisplayLink-
+// driven via a minimumPressDuration:0 long-press so this owns per-frame
+// progress rather than only learning the hold completed. A plain quick
+// tap/release instead collapses the capsule back down and plays an
+// error haptic (see -gd_handleHoldToConfirmGesture:), which does the
+// "you need to hold this" job. `onConfirm` is a caller-supplied
+// completion block instead of one hardcoded action.
 static void gd_attach_hold_to_confirm(UIButton *button, id target, void (^onConfirm)(void)) {
     UILongPressGestureRecognizer *press =
         [[UILongPressGestureRecognizer alloc] initWithTarget:target action:@selector(gd_handleHoldToConfirmGesture:)];
@@ -519,6 +613,7 @@ static void gd_attach_hold_to_confirm(UIButton *button, id target, void (^onConf
     press.cancelsTouchesInView = NO;
     [button addGestureRecognizer:press];
     objc_setAssociatedObject(button, kGDHoldConfirmBlockKey, [onConfirm copy], OBJC_ASSOCIATION_COPY);
+    gd_attach_delete_capsule(button, button.superview);
 }
 
 // Associated-object keys for gd_attach_pill_hold_to_confirm below -
@@ -1448,12 +1543,47 @@ static const CGFloat kFillAlpha = 1.0;
 @property (nonatomic, copy) NSString *text;
 @property (nonatomic, strong) UIFont *font;
 @property (nonatomic, strong) UIColor *textColor;
+// Stable identity for this marquee's content (e.g. an entry's path plus
+// which line it is - "<path>|path" / "<path>|cab"), used to persist
+// scroll phase across a -gd_rebuildModsLibrary rebuild. Without this,
+// EVERY rebuild - triggered by toggling ANY dropdown, not just this
+// one's own - tore down and recreated every GDMarqueeLabel instance,
+// each restarting at frame 0. That's what read as "the marquee resets
+// when other dropdowns are triggered": it wasn't this label's own
+// dropdown being touched, it was any sibling row's rebuild recreating
+// it from scratch. Leave nil for a label that doesn't need to survive
+// rebuilds (it'll just always start at frame 0, same as before).
+@property (nonatomic, copy) NSString *marqueeKey;
 @end
 
 @implementation GDMarqueeLabel {
     UILabel *_label;
     NSLayoutConstraint *_labelLeadingConstraint;
     BOOL _scrolling;
+}
+
+// Persists, keyed by -marqueeKey, the CACurrentMediaTime() each
+// marquee's ping-pong cycle notionally began. Process-lifetime and
+// class-level - deliberately NOT tied to any one GDMarqueeLabel
+// instance's lifetime - so a label rebuilt with the same key (e.g.
+// every row in the mods list, every time -gd_rebuildModsLibrary runs)
+// resumes exactly where its cycle should be instead of restarting.
+// CAAnimation's beginTime is honored even when it's in the past at the
+// moment the animation is added - the layer just renders as if the
+// animation had been running continuously since then - which is
+// exactly the "don't reset" behavior wanted here.
+static NSMutableDictionary<NSString *, NSNumber *> *gGDMarqueeCycleStartTimes;
+static dispatch_once_t gGDMarqueeRegistryToken;
+static CFTimeInterval gd_marquee_cycle_start(NSString *key) {
+    dispatch_once(&gGDMarqueeRegistryToken, ^{
+        gGDMarqueeCycleStartTimes = [NSMutableDictionary dictionary];
+    });
+    if (!key) return CACurrentMediaTime();
+    NSNumber *existing = gGDMarqueeCycleStartTimes[key];
+    if (existing) return existing.doubleValue;
+    CFTimeInterval now = CACurrentMediaTime();
+    gGDMarqueeCycleStartTimes[key] = @(now);
+    return now;
 }
 
 - (instancetype)initWithFrame:(CGRect)frame {
@@ -1467,6 +1597,10 @@ static const CGFloat kFillAlpha = 1.0;
         _label.lineBreakMode = NSLineBreakByClipping; // this view's own scrolling is the "see the rest" mechanism, not ellipsis
         [self addSubview:_label];
 
+        // Stays at constant 0 always now - see -gd_startScrollingWithOverflow:,
+        // which animates the label's LAYER (transform) rather than this
+        // Auto Layout constraint, so a stray layout pass elsewhere in the
+        // panel can never stomp mid-scroll position back to 0.
         _labelLeadingConstraint = [_label.leadingAnchor constraintEqualToAnchor:self.leadingAnchor];
         [NSLayoutConstraint activateConstraints:@[
             _labelLeadingConstraint,
@@ -1476,7 +1610,13 @@ static const CGFloat kFillAlpha = 1.0;
     return self;
 }
 
-- (void)setText:(NSString *)text { _label.text = text; [self setNeedsLayout]; }
+- (void)setText:(NSString *)text {
+    _label.text = text;
+    [_label.layer removeAnimationForKey:@"gdMarqueeScroll"];
+    _label.layer.transform = CATransform3DIdentity;
+    _scrolling = NO;
+    [self setNeedsLayout];
+}
 - (NSString *)text { return _label.text; }
 - (void)setFont:(UIFont *)font { _label.font = font; [self setNeedsLayout]; }
 - (UIFont *)font { return _label.font; }
@@ -1493,33 +1633,41 @@ static const CGFloat kFillAlpha = 1.0;
     CGFloat overflow = ceil(CGRectGetWidth(_label.frame)) - CGRectGetWidth(self.bounds);
     if (overflow > 4 && !_scrolling) {
         _scrolling = YES;
-        [self gd_scrollStep:YES overflow:overflow duration:MAX(2.5, overflow / 16.0)];
+        [self gd_startScrollingWithOverflow:overflow];
     } else if (overflow <= 4 && _scrolling) {
-        _scrolling = NO; // shrank back under the container's width (e.g. rotation) - let the in-flight step's own check catch up and stop
+        // shrank back under the container's width (e.g. rotation)
+        _scrolling = NO;
+        [_label.layer removeAnimationForKey:@"gdMarqueeScroll"];
+        _label.layer.transform = CATransform3DIdentity;
     }
 }
 
-- (void)gd_scrollStep:(BOOL)toEnd overflow:(CGFloat)overflow duration:(NSTimeInterval)duration {
-    if (!_scrolling) {
-        _labelLeadingConstraint.constant = 0;
-        return;
-    }
-    __weak typeof(self) weakSelf = self;
-    [UIView animateWithDuration:duration
-                           delay:0.9
-                         options:UIViewAnimationOptionCurveEaseInOut
-                      animations:^{
-        typeof(self) strongSelf = weakSelf;
-        if (!strongSelf) return;
-        strongSelf->_labelLeadingConstraint.constant = toEnd ? -overflow : 0;
-        [strongSelf layoutIfNeeded];
-    }
-                      completion:^(BOOL finished) {
-        typeof(self) strongSelf = weakSelf;
-        if (finished && strongSelf && strongSelf->_scrolling) {
-            [strongSelf gd_scrollStep:!toEnd overflow:overflow duration:duration];
-        }
-    }];
+// Builds the full hold/move/hold/move ping-pong as one repeating
+// keyframe animation on the label's transform (not its Auto-Layout-
+// governed position - see the constraint comment above), timed to have
+// begun at -marqueeKey's persisted start time rather than "now". That's
+// what lets a freshly (re)created label pick its cycle back up in
+// mid-scroll instead of jumping to frame 0.
+- (void)gd_startScrollingWithOverflow:(CGFloat)overflow {
+    NSTimeInterval moveDuration = MAX(2.5, overflow / 16.0);
+    NSTimeInterval holdDuration = 0.9;
+    NSTimeInterval cycle = 2 * (moveDuration + holdDuration);
+
+    NSTimeInterval t1 = holdDuration / cycle;                     // arrived back at start, about to move out
+    NSTimeInterval t2 = (holdDuration + moveDuration) / cycle;    // arrived at the far end
+    NSTimeInterval t3 = (2 * holdDuration + moveDuration) / cycle; // about to move back
+
+    CAKeyframeAnimation *anim = [CAKeyframeAnimation animationWithKeyPath:@"transform.translation.x"];
+    anim.keyTimes = @[@0, @(t1), @(t2), @(t3), @1];
+    anim.values = @[@0, @0, @(-overflow), @(-overflow), @0];
+    CAMediaTimingFunction *linear = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionLinear];
+    CAMediaTimingFunction *easeInOut = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
+    anim.timingFunctions = @[linear, easeInOut, linear, easeInOut];
+    anim.duration = cycle;
+    anim.repeatCount = HUGE_VALF;
+    anim.beginTime = gd_marquee_cycle_start(self.marqueeKey);
+    anim.removedOnCompletion = NO;
+    [_label.layer addAnimation:anim forKey:@"gdMarqueeScroll"];
 }
 
 @end
@@ -1903,11 +2051,10 @@ static UIView *gd_make_blacklist_entry_row(NSString *term, id target, SEL remove
 // each is wired up independently by the caller (see -gd_rebuildModsLibrary).
 //
 // Add/Rename are plain buttons the caller wires with target/action.
-// Delete is NOT wired here - gd_attach_hold_to_confirm needs a
-// completion block that closes over `folderName`, which only the
-// calling Objective-C method can build cleanly - so this just returns
-// the styled, associated-object-tagged button via "gd_button_delete"
-// for the caller to attach the hold gesture to.
+// Delete is no longer built here at all - it now lives inside this
+// folder's own dropdown (its expanded child list) instead of on this
+// always-visible row, see gd_make_mods_folder_delete_row - so there's
+// no "gd_button_delete" associated object on this row anymore.
 static UIView *gd_make_mods_folder_row(NSString *folderName, BOOL expanded, id target, SEL tapAction, SEL addAction, SEL renameAction) {
     UIView *row = [[UIView alloc] init];
     row.translatesAutoresizingMaskIntoConstraints = NO;
@@ -1937,20 +2084,8 @@ static UIView *gd_make_mods_folder_row(NSString *folderName, BOOL expanded, id t
     label.lineBreakMode = NSLineBreakByTruncatingMiddle;
     [row addSubview:label];
 
-    // X - delete, at the row's far right extreme, same glyph/style as
-    // the blacklist entry rows' own remove button. Hold-to-confirm is
-    // attached by the caller (see gd_attach_hold_to_confirm).
-    UIButton *deleteButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    deleteButton.translatesAutoresizingMaskIntoConstraints = NO;
-    UIImageSymbolConfiguration *xSymbolConfig = [UIImageSymbolConfiguration configurationWithPointSize:6 weight:UIImageSymbolWeightSemibold];
-    UIImage *xImage = [UIImage systemImageNamed:@"xmark" withConfiguration:xSymbolConfig];
-    UIColor *xTint = [UIColor colorWithWhite:1 alpha:0.55];
-    gd_style_icon_button_as_native_glass(deleteButton, xImage, xTint);
-    objc_setAssociatedObject(deleteButton, "gd_modsFolderName", folderName, OBJC_ASSOCIATION_COPY);
-    [row addSubview:deleteButton];
-    objc_setAssociatedObject(row, "gd_button_delete", deleteButton, OBJC_ASSOCIATION_RETAIN);
-
-    // Pencil - rename, immediately to the left of X.
+    // Pencil - rename, now at the row's far right extreme (X used to be
+    // here; it's moved into the dropdown, see above).
     UIButton *renameButton = [UIButton buttonWithType:UIButtonTypeSystem];
     renameButton.translatesAutoresizingMaskIntoConstraints = NO;
     UIImageSymbolConfiguration *pencilConfig = [UIImageSymbolConfiguration configurationWithPointSize:9 weight:UIImageSymbolWeightSemibold];
@@ -1960,14 +2095,16 @@ static UIView *gd_make_mods_folder_row(NSString *folderName, BOOL expanded, id t
     objc_setAssociatedObject(renameButton, "gd_modsFolderName", folderName, OBJC_ASSOCIATION_COPY);
     [row addSubview:renameButton];
 
-    // "Add" - wider, pill-shaped (native glass button, same style as
-    // every titled pill elsewhere in this panel), to the left of the
-    // pencil - adds more files into this already-existing folder
-    // without going through the New Mod Folder prompt again.
+    // Add - icon-only plus glyph now (was a wider "Add" text pill),
+    // sized the same as the other icon buttons on this row (pencil/X
+    // elsewhere), immediately to the left of the pencil - adds more
+    // files into this already-existing folder without going through
+    // the New Mod Folder prompt again.
     UIButton *addButton = [UIButton buttonWithType:UIButtonTypeSystem];
     addButton.translatesAutoresizingMaskIntoConstraints = NO;
-    gd_style_button_as_native_glass(addButton, @"Add", [UIColor colorWithRed:0.42 green:0.62 blue:1.0 alpha:1.0]);
-    addButton.titleLabel.font = [UIFont systemFontOfSize:8.5 weight:UIFontWeightSemibold];
+    UIImageSymbolConfiguration *plusConfig = [UIImageSymbolConfiguration configurationWithPointSize:9 weight:UIImageSymbolWeightSemibold];
+    UIImage *plusImage = [UIImage systemImageNamed:@"plus" withConfiguration:plusConfig];
+    gd_style_icon_button_as_native_glass(addButton, plusImage, [UIColor colorWithRed:0.42 green:0.62 blue:1.0 alpha:1.0]);
     [addButton addTarget:target action:addAction forControlEvents:UIControlEventTouchUpInside];
     objc_setAssociatedObject(addButton, "gd_modsFolderName", folderName, OBJC_ASSOCIATION_COPY);
     [row addSubview:addButton];
@@ -1988,20 +2125,63 @@ static UIView *gd_make_mods_folder_row(NSString *folderName, BOOL expanded, id t
         [label.trailingAnchor constraintLessThanOrEqualToAnchor:addButton.leadingAnchor constant:-6],
         [label.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
 
-        [deleteButton.trailingAnchor constraintEqualToAnchor:row.trailingAnchor],
-        [deleteButton.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
-        [deleteButton.widthAnchor constraintEqualToConstant:18],
-        [deleteButton.heightAnchor constraintEqualToConstant:18],
-
-        [renameButton.trailingAnchor constraintEqualToAnchor:deleteButton.leadingAnchor constant:-3],
+        [renameButton.trailingAnchor constraintEqualToAnchor:row.trailingAnchor],
         [renameButton.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
         [renameButton.widthAnchor constraintEqualToConstant:18],
         [renameButton.heightAnchor constraintEqualToConstant:18],
 
         [addButton.trailingAnchor constraintEqualToAnchor:renameButton.leadingAnchor constant:-3],
         [addButton.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
+        [addButton.widthAnchor constraintEqualToConstant:18],
         [addButton.heightAnchor constraintEqualToConstant:18],
-        [addButton.widthAnchor constraintGreaterThanOrEqualToConstant:32],
+
+        [row.topAnchor constraintEqualToAnchor:label.topAnchor constant:-5],
+        [row.bottomAnchor constraintEqualToAnchor:label.bottomAnchor constant:5],
+    ]];
+    return row;
+}
+
+// Small standalone row holding just the folder's delete (X) control -
+// lives inside the folder's own dropdown (its expanded child list) now,
+// instead of out on the always-visible header row above (per request).
+// First thing shown once a folder is expanded. Kept at the same 18x18
+// size/glyph the X always had, and centered on this row using the exact
+// same -5/+5 top/bottom margin convention gd_make_mods_folder_row uses,
+// so it sits at the same Y position within its row that it always did -
+// just in a row of its own now, inside the dropdown, rather than
+// sharing the folder header row. Delete is NOT wired here - the caller
+// attaches the hold-to-confirm gesture via "gd_button_delete", same
+// pattern as before.
+static UIView *gd_make_mods_folder_delete_row(NSString *folderName) {
+    UIView *row = [[UIView alloc] init];
+    row.translatesAutoresizingMaskIntoConstraints = NO;
+    objc_setAssociatedObject(row, "gd_modsFolderName", folderName, OBJC_ASSOCIATION_COPY);
+
+    UILabel *label = [[UILabel alloc] init];
+    label.translatesAutoresizingMaskIntoConstraints = NO;
+    label.text = @"Delete Folder";
+    label.font = [UIFont systemFontOfSize:10.5 weight:UIFontWeightMedium];
+    label.textColor = [UIColor colorWithWhite:1 alpha:0.4];
+    [row addSubview:label];
+
+    UIButton *deleteButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    deleteButton.translatesAutoresizingMaskIntoConstraints = NO;
+    UIImageSymbolConfiguration *xSymbolConfig = [UIImageSymbolConfiguration configurationWithPointSize:6 weight:UIImageSymbolWeightSemibold];
+    UIImage *xImage = [UIImage systemImageNamed:@"xmark" withConfiguration:xSymbolConfig];
+    UIColor *xTint = [UIColor colorWithWhite:1 alpha:0.55];
+    gd_style_icon_button_as_native_glass(deleteButton, xImage, xTint);
+    objc_setAssociatedObject(deleteButton, "gd_modsFolderName", folderName, OBJC_ASSOCIATION_COPY);
+    [row addSubview:deleteButton];
+    objc_setAssociatedObject(row, "gd_button_delete", deleteButton, OBJC_ASSOCIATION_RETAIN);
+
+    [NSLayoutConstraint activateConstraints:@[
+        [label.leadingAnchor constraintEqualToAnchor:row.leadingAnchor constant:38], // same indent as the entry rows below it
+        [label.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
+
+        [deleteButton.trailingAnchor constraintEqualToAnchor:row.trailingAnchor],
+        [deleteButton.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
+        [deleteButton.widthAnchor constraintEqualToConstant:18],
+        [deleteButton.heightAnchor constraintEqualToConstant:18],
 
         [row.topAnchor constraintEqualToAnchor:label.topAnchor constant:-5],
         [row.bottomAnchor constraintEqualToAnchor:label.bottomAnchor constant:5],
@@ -2010,14 +2190,14 @@ static UIView *gd_make_mods_folder_row(NSString *folderName, BOOL expanded, id t
 }
 
 // One tracked file's row, indented under its folder: [zip/doc icon]
-// [name] .... [X]. No separate Info button anymore - tapping anywhere
-// on the row (same whole-row tap-target approach as the folder row
-// above) toggles the filepath/CAB/size dropdown the caller (see
-// -gd_rebuildModsLibrary) inserts right after this row when the
-// entry's path is in modsLibraryExpandedInfoEntries. Delete is
-// hold-to-confirm, wired by the caller the same way the folder row's
-// own X is. The entry is stashed on the ROW (for the tap gesture) as
-// well as on the delete button (for its own handler).
+// [name]. No separate Info button - tapping anywhere on the row (same
+// whole-row tap-target approach as the folder row above) toggles the
+// filepath/CAB/size dropdown the caller (see -gd_rebuildModsLibrary)
+// inserts right after this row when the entry's path is in
+// modsLibraryExpandedInfoEntries. Delete now lives INSIDE that dropdown
+// (see gd_make_mods_entry_info_panel) rather than out on this
+// always-visible row - per request, so the row itself no longer owns a
+// delete button. The entry is stashed on the row for the tap gesture.
 static UIView *gd_make_mods_entry_row(ModAssetLibraryEntry *entry, id target, SEL tapAction) {
     UIView *row = [[UIView alloc] init];
     row.translatesAutoresizingMaskIntoConstraints = NO;
@@ -2040,18 +2220,6 @@ static UIView *gd_make_mods_entry_row(ModAssetLibraryEntry *entry, id target, SE
     label.lineBreakMode = NSLineBreakByTruncatingMiddle;
     [row addSubview:label];
 
-    // X - delete + restore. Same hold-to-confirm treatment as the
-    // folder row's own X; the caller attaches the actual gesture.
-    UIButton *deleteButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    deleteButton.translatesAutoresizingMaskIntoConstraints = NO;
-    UIImageSymbolConfiguration *xSymbolConfig = [UIImageSymbolConfiguration configurationWithPointSize:6 weight:UIImageSymbolWeightSemibold];
-    UIImage *xImage = [UIImage systemImageNamed:@"xmark" withConfiguration:xSymbolConfig];
-    UIColor *xTint = [UIColor colorWithWhite:1 alpha:0.55];
-    gd_style_icon_button_as_native_glass(deleteButton, xImage, xTint);
-    objc_setAssociatedObject(deleteButton, "gd_modsEntry", entry, OBJC_ASSOCIATION_RETAIN);
-    [row addSubview:deleteButton];
-    objc_setAssociatedObject(row, "gd_button_delete", deleteButton, OBJC_ASSOCIATION_RETAIN);
-
     UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:target action:tapAction];
     [row addGestureRecognizer:tap];
 
@@ -2061,13 +2229,8 @@ static UIView *gd_make_mods_entry_row(ModAssetLibraryEntry *entry, id target, SE
         [icon.widthAnchor constraintEqualToConstant:16],
 
         [label.leadingAnchor constraintEqualToAnchor:icon.trailingAnchor constant:5],
-        [label.trailingAnchor constraintLessThanOrEqualToAnchor:deleteButton.leadingAnchor constant:-8],
+        [label.trailingAnchor constraintLessThanOrEqualToAnchor:row.trailingAnchor constant:-8],
         [label.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
-
-        [deleteButton.trailingAnchor constraintEqualToAnchor:row.trailingAnchor],
-        [deleteButton.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
-        [deleteButton.widthAnchor constraintEqualToConstant:18],
-        [deleteButton.heightAnchor constraintEqualToConstant:18],
 
         [row.topAnchor constraintEqualToAnchor:label.topAnchor constant:-3],
         [row.bottomAnchor constraintEqualToAnchor:label.bottomAnchor constant:3],
@@ -2081,13 +2244,28 @@ static UIView *gd_make_mods_entry_row(ModAssetLibraryEntry *entry, id target, SE
 // ModAssetLibraryEntry.livePathDescription), CAB (bundles only), and
 // human-readable size. Path/CAB use GDMarqueeLabel so a long value
 // scrolls into view instead of getting truncated.
+// Returns a container whose "gd_button_delete" associated object is the
+// entry's X (delete) button - the caller (-gd_rebuildModsLibrary) reads
+// that the same way it always has, to attach hold-to-confirm. The X
+// itself now lives inside this dropdown instead of on the always-visible
+// entry row above it (per request) - same 18x18 size/glyph it always
+// had, and centered on the Path line so it sits at the same Y position
+// it used to occupy on the row (the row's one line of text, now this
+// dropdown's first line).
 static UIView *gd_make_mods_entry_info_panel(ModAssetLibraryEntry *entry) {
+    UIView *container = [[UIView alloc] init];
+    container.translatesAutoresizingMaskIntoConstraints = NO;
+    objc_setAssociatedObject(container, "gd_modsEntry", entry, OBJC_ASSOCIATION_RETAIN);
+
     UIStackView *panel = [[UIStackView alloc] init];
     panel.axis = UILayoutConstraintAxisVertical;
     panel.spacing = 2;
     panel.translatesAutoresizingMaskIntoConstraints = NO;
     panel.layoutMarginsRelativeArrangement = YES;
-    panel.layoutMargins = UIEdgeInsetsMake(2, 38, 2, 4); // lines up under the entry name, past the folder/doc icon indent
+    // Right margin widened (4 -> 26) to reserve room for the delete
+    // button that now lives in this corner instead of out on the row.
+    panel.layoutMargins = UIEdgeInsetsMake(2, 38, 2, 26); // lines up under the entry name, past the folder/doc icon indent
+    [container addSubview:panel];
 
     UIFont *subtextFont = [UIFont systemFontOfSize:9.5 weight:UIFontWeightRegular];
     UIColor *subtextColor = [UIColor colorWithWhite:1 alpha:0.4];
@@ -2106,6 +2284,10 @@ static UIView *gd_make_mods_entry_info_panel(ModAssetLibraryEntry *entry) {
     pathLabel.text = [NSString stringWithFormat:@"Path: %@", pathText];
     pathLabel.font = subtextFont;
     pathLabel.textColor = subtextColor;
+    // Keyed by entry path so this marquee's scroll phase survives a
+    // -gd_rebuildModsLibrary triggered by some OTHER row's dropdown -
+    // see GDMarqueeLabel.marqueeKey.
+    pathLabel.marqueeKey = [entry.path stringByAppendingString:@"|path"];
     [panel addArrangedSubview:pathLabel];
 
     if (entry.cab) {
@@ -2113,6 +2295,7 @@ static UIView *gd_make_mods_entry_info_panel(ModAssetLibraryEntry *entry) {
         cabLabel.text = [NSString stringWithFormat:@"CAB: %@", entry.cab];
         cabLabel.font = subtextFont;
         cabLabel.textColor = subtextColor;
+        cabLabel.marqueeKey = [entry.path stringByAppendingString:@"|cab"];
         [panel addArrangedSubview:cabLabel];
     }
 
@@ -2122,7 +2305,31 @@ static UIView *gd_make_mods_entry_info_panel(ModAssetLibraryEntry *entry) {
     sizeLabel.textColor = subtextColor;
     [panel addArrangedSubview:sizeLabel]; // short enough it never needs to scroll - plain UILabel is fine
 
-    return panel;
+    // X - delete + restore. Same glyph/style/size it had on the entry
+    // row; hold-to-confirm is attached by the caller, same as before.
+    UIButton *deleteButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    deleteButton.translatesAutoresizingMaskIntoConstraints = NO;
+    UIImageSymbolConfiguration *xSymbolConfig = [UIImageSymbolConfiguration configurationWithPointSize:6 weight:UIImageSymbolWeightSemibold];
+    UIImage *xImage = [UIImage systemImageNamed:@"xmark" withConfiguration:xSymbolConfig];
+    UIColor *xTint = [UIColor colorWithWhite:1 alpha:0.55];
+    gd_style_icon_button_as_native_glass(deleteButton, xImage, xTint);
+    objc_setAssociatedObject(deleteButton, "gd_modsEntry", entry, OBJC_ASSOCIATION_RETAIN);
+    [container addSubview:deleteButton];
+    objc_setAssociatedObject(container, "gd_button_delete", deleteButton, OBJC_ASSOCIATION_RETAIN);
+
+    [NSLayoutConstraint activateConstraints:@[
+        [panel.topAnchor constraintEqualToAnchor:container.topAnchor],
+        [panel.leadingAnchor constraintEqualToAnchor:container.leadingAnchor],
+        [panel.trailingAnchor constraintEqualToAnchor:container.trailingAnchor],
+        [panel.bottomAnchor constraintEqualToAnchor:container.bottomAnchor],
+
+        [deleteButton.trailingAnchor constraintEqualToAnchor:container.trailingAnchor constant:-4],
+        [deleteButton.centerYAnchor constraintEqualToAnchor:pathLabel.centerYAnchor], // same Y the row's own X used to sit at
+        [deleteButton.widthAnchor constraintEqualToConstant:18],
+        [deleteButton.heightAnchor constraintEqualToConstant:18],
+    ]];
+
+    return container;
 }
 
 static UILabel *gd_make_section_header(NSString *text) {
@@ -2212,6 +2419,24 @@ static UIFont *gd_excelsior_sans_font(CGFloat size, UIFontWeight weight) {
     return boldDescriptor ? [UIFont fontWithDescriptor:boldDescriptor size:size] : regular;
 }
 
+// Build number auto-injected by CI via -DZS_BUILD_NUMBER=<run number> on
+// the "Compile tweak dylib" step in .github/workflows/build.yml (which
+// already tags each release build-<run number>, so this reuses that same
+// counter rather than introducing a second one). Falls back to 0 for a
+// plain local `clang` invocation with no -D passed, so the panel still
+// builds/runs outside CI - just labeled as a local build instead of a
+// numbered one.
+#ifndef ZS_BUILD_NUMBER
+#define ZS_BUILD_NUMBER 0
+#endif
+
+static NSString *gd_version_string(void) {
+    if (ZS_BUILD_NUMBER == 0) {
+        return @"v0.0.1 (local build)";
+    }
+    return [NSString stringWithFormat:@"v0.0.1 build %d", ZS_BUILD_NUMBER];
+}
+
 static UIView *gd_make_title_block(void) {
     UIView *container = [[UIView alloc] init];
     container.translatesAutoresizingMaskIntoConstraints = NO;
@@ -2222,8 +2447,9 @@ static UIView *gd_make_title_block(void) {
 
     NSString *fullTitle = @"ZSingularity";
     NSString *emphasized = @"ZS"; // larger prefix within the same word
-    UIFont *bigFont = gd_excelsior_sans_font(40, UIFontWeightBold);
-    UIFont *restFont = gd_excelsior_sans_font(30, UIFontWeightBold);
+    // 50% bigger across the board per request (was 40/30).
+    UIFont *bigFont = gd_excelsior_sans_font(60, UIFontWeightBold);
+    UIFont *restFont = gd_excelsior_sans_font(45, UIFontWeightBold);
     UIColor *titleColor = gd_accent_green_color();
 
     NSMutableAttributedString *titleString =
@@ -2235,12 +2461,33 @@ static UIView *gd_make_title_block(void) {
     [titleString addAttribute:NSFontAttributeName
                          value:bigFont
                          range:NSMakeRange(0, emphasized.length)];
+
+    // Version tag, moved here from the subtitle line (per request) and
+    // sized 150% smaller than the wordmark it now sits beside - i.e.
+    // restFont's point size divided by 1.5 - so it reads as a small
+    // badge riding the wordmark's own baseline rather than a second
+    // line of text. Muted/white like the old subtitle rather than the
+    // wordmark's green, so it stays legible as secondary detail.
+    // gd_version_string() below pulls the build number CI stamps in at
+    // compile time, so this updates on its own with every new build -
+    // no manual edit needed here.
+    NSString *versionTag = [@" " stringByAppendingString:gd_version_string()];
+    UIFont *versionFont = gd_excelsior_sans_font(restFont.pointSize / 1.5, UIFontWeightMedium);
+    NSAttributedString *versionString =
+        [[NSAttributedString alloc] initWithString:versionTag
+                                         attributes:@{
+            NSFontAttributeName: versionFont,
+            NSForegroundColorAttributeName: [UIColor colorWithWhite:1 alpha:0.45],
+            NSBaselineOffsetAttributeName: @(restFont.descender - versionFont.descender), // keeps the smaller text sitting on the wordmark's own baseline instead of the shared line's midpoint
+        }];
+    [titleString appendAttributedString:versionString];
+
     headerLabel.attributedText = titleString;
     [container addSubview:headerLabel];
 
     UILabel *subtitleLabel = [[UILabel alloc] init];
     subtitleLabel.translatesAutoresizingMaskIntoConstraints = NO;
-    subtitleLabel.text = @"Developed by trilliance  — v0.0.1-PRERELEASE";
+    subtitleLabel.text = @"Developed by trilliance";
     subtitleLabel.textAlignment = NSTextAlignmentNatural; 
     subtitleLabel.textColor = [UIColor colorWithWhite:1 alpha:0.45];
     subtitleLabel.font = [UIFont systemFontOfSize:10 weight:UIFontWeightMedium];
@@ -3499,6 +3746,23 @@ static void * const kGDModsPickerKindKey = (void *)&kGDModsPickerKindKey;
             self.holdConfirmStartTime = CACurrentMediaTime();
             self.holdConfirmTriggered = NO;
 
+            // Snap the capsule open right away - the fill (driven by
+            // -gd_holdConfirmTick: below) is what actually times out the
+            // 1.5s hold, so the reveal itself just needs to feel quick,
+            // not track the hold duration.
+            NSLayoutConstraint *widthConstraint = objc_getAssociatedObject(button, kGDHoldConfirmExpansionWidthKey);
+            UILabel *deleteLabel = objc_getAssociatedObject(button, kGDHoldConfirmDeleteLabelKey);
+            widthConstraint.constant = kGDDeleteCapsuleExpandedWidth;
+            [UIView animateWithDuration:kGDDeleteCapsuleSnapDuration
+                                   delay:0
+                  usingSpringWithDamping:0.8
+                   initialSpringVelocity:0.4
+                                 options:UIViewAnimationOptionCurveEaseOut
+                              animations:^{
+                [button.superview layoutIfNeeded];
+                deleteLabel.alpha = 1;
+            } completion:nil];
+
             [self.holdConfirmDisplayLink invalidate];
             self.holdConfirmDisplayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(gd_holdConfirmTick:)];
             [self.holdConfirmDisplayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
@@ -3511,12 +3775,12 @@ static void * const kGDModsPickerKindKey = (void *)&kGDModsPickerKindKey;
             [self.holdConfirmDisplayLink invalidate];
             self.holdConfirmDisplayLink = nil;
             if (!self.holdConfirmTriggered) {
-                // Released before the 1.5s mark - snap the icon back to
-                // its resting size instead of leaving it stranded
-                // mid-animation, and play an error haptic: this covers a
-                // plain quick tap too (Began immediately followed by
-                // Ended), which is exactly the "clicked but didn't hold"
-                // case that should tell the person to hold instead.
+                // Released before the 1.5s mark - collapse the capsule
+                // back down instead of leaving it stranded mid-animation,
+                // and play an error haptic: this covers a plain quick tap
+                // too (Began immediately followed by Ended), which is
+                // exactly the "clicked but didn't hold" case that should
+                // tell the person to hold instead.
                 [self gd_resetHoldConfirmButton:button animated:YES];
                 UINotificationFeedbackGenerator *haptic = [UINotificationFeedbackGenerator new];
                 [haptic notificationOccurred:UINotificationFeedbackTypeError];
@@ -3529,14 +3793,13 @@ static void * const kGDModsPickerKindKey = (void *)&kGDModsPickerKindKey;
     }
 }
 
-// Drives the per-frame "expand while held" animation and fires the
-// button's completion block once the hold reaches
-// kGDHoldConfirmDuration. No color change - that turned out not to
-// render correctly (the fill never became visible against the icon's
-// own glass background) and was dropped rather than fixed; the scale
-// alone, plus the error haptic on an early release in
-// -gd_handleHoldToConfirmGesture:, is enough to communicate "hold,
-// don't tap."
+// Drives the per-frame red progress-fill across the now-expanded
+// capsule - same system as the Syslog button's own hold-to-confirm fill
+// (see -gd_syslogHoldTick:) and the pill hold-confirm variant (see
+// -gd_pillHoldConfirmTick:), just split across two adjacent layers
+// (buttonFill + expansionFill) so it sweeps continuously across the
+// whole capsule rather than just one piece of it. Fires the button's
+// completion block once the hold reaches kGDHoldConfirmDuration.
 - (void)gd_holdConfirmTick:(CADisplayLink *)link {
     static const NSTimeInterval kGDHoldConfirmDuration = 1.5;
     UIButton *button = self.holdConfirmActiveButton;
@@ -3546,11 +3809,25 @@ static void * const kGDModsPickerKindKey = (void *)&kGDModsPickerKindKey;
     }
 
     NSTimeInterval elapsed = CACurrentMediaTime() - self.holdConfirmStartTime;
-    CGFloat scalePct = (CGFloat)MIN(1.0, elapsed / (kGDHoldConfirmDuration * 0.4));
+    CGFloat pct = (CGFloat)MIN(1.0, elapsed / kGDHoldConfirmDuration);
+
+    UIView *expansion = objc_getAssociatedObject(button, kGDHoldConfirmExpansionViewKey);
+    CALayer *buttonFill = objc_getAssociatedObject(button, kGDHoldConfirmButtonFillKey);
+    CALayer *expansionFill = objc_getAssociatedObject(button, kGDHoldConfirmExpansionFillKey);
+
+    CGFloat buttonWidth = button.bounds.size.width;
+    CGFloat expansionWidth = expansion.bounds.size.width;
+    CGFloat totalWidth = buttonWidth + expansionWidth;
+    CGFloat filledWidth = totalWidth * pct;
+    CGFloat buttonFillWidth = (CGFloat)MIN(filledWidth, buttonWidth);
+    CGFloat expansionFillWidth = (CGFloat)MAX(0, filledWidth - buttonWidth);
 
     [CATransaction begin];
     [CATransaction setDisableActions:YES]; // per-tick updates ARE the animation, same as the Syslog fill's own tick
-    button.transform = CGAffineTransformMakeScale(1.0 + 0.4 * scalePct, 1.0 + 0.4 * scalePct);
+    buttonFill.frame = CGRectMake(0, 0, buttonFillWidth, button.bounds.size.height);
+    buttonFill.cornerRadius = button.bounds.size.height / 2.0;
+    expansionFill.frame = CGRectMake(0, 0, expansionFillWidth, expansion.bounds.size.height);
+    expansionFill.cornerRadius = expansion.bounds.size.height / 2.0;
     [CATransaction commit];
 
     if (elapsed >= kGDHoldConfirmDuration && !self.holdConfirmTriggered) {
@@ -3569,15 +3846,36 @@ static void * const kGDModsPickerKindKey = (void *)&kGDModsPickerKindKey;
     }
 }
 
+// Collapses the capsule back down to its resting (zero-width) state -
+// used both on an early release (animated, so it visibly retracts) and
+// right before the completion block runs on a full hold (unanimated,
+// since the row is about to be torn down by the resulting rebuild
+// anyway - matches the old scale-reset's own NO/YES split).
 - (void)gd_resetHoldConfirmButton:(UIButton *)button animated:(BOOL)animated {
+    NSLayoutConstraint *widthConstraint = objc_getAssociatedObject(button, kGDHoldConfirmExpansionWidthKey);
+    UILabel *deleteLabel = objc_getAssociatedObject(button, kGDHoldConfirmDeleteLabelKey);
+    CALayer *buttonFill = objc_getAssociatedObject(button, kGDHoldConfirmButtonFillKey);
+    CALayer *expansionFill = objc_getAssociatedObject(button, kGDHoldConfirmExpansionFillKey);
+    UIView *expansion = objc_getAssociatedObject(button, kGDHoldConfirmExpansionViewKey);
+
     void (^apply)(void) = ^{
-        button.transform = CGAffineTransformIdentity;
+        widthConstraint.constant = 0;
+        deleteLabel.alpha = 0;
+        [button.superview layoutIfNeeded];
+    };
+    void (^resetFills)(void) = ^{
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        buttonFill.frame = CGRectMake(0, 0, 0, button.bounds.size.height);
+        expansionFill.frame = CGRectMake(0, 0, 0, expansion.bounds.size.height);
+        [CATransaction commit];
     };
     if (animated) {
         [UIView animateWithDuration:0.18 animations:apply];
     } else {
         apply();
     }
+    resetFills();
 }
 
 // Handler for gd_attach_pill_hold_to_confirm's gesture - same shape as
@@ -3755,15 +4053,20 @@ static void * const kGDModsPickerKindKey = (void *)&kGDModsPickerKindKey;
             @selector(gd_modsLibraryFolderRowTapped:),
             @selector(gd_modsLibraryFolderAddTapped:),
             @selector(gd_modsLibraryFolderRenameTapped:));
+        [self.modsLibraryStack addArrangedSubview:folderRow];
 
-        UIButton *folderDeleteButton = objc_getAssociatedObject(folderRow, "gd_button_delete");
+        if (!expanded) continue;
+
+        // Delete now lives inside the dropdown (per request) - first
+        // thing shown once the folder is expanded, rather than on the
+        // always-visible header row above.
+        UIView *folderDeleteRow = gd_make_mods_folder_delete_row(folderName);
+        UIButton *folderDeleteButton = objc_getAssociatedObject(folderDeleteRow, "gd_button_delete");
         NSString *folderNameForDelete = [folderName copy]; // own copy for the block below, independent of the loop variable
         gd_attach_hold_to_confirm(folderDeleteButton, self, ^{
             [weakSelf gd_deleteModFolderConfirmed:folderNameForDelete];
         });
-        [self.modsLibraryStack addArrangedSubview:folderRow];
-
-        if (!expanded) continue;
+        [self.modsLibraryStack addArrangedSubview:folderDeleteRow];
 
         NSError *error = nil;
         NSArray<ModAssetLibraryEntry *> *entries = [ModAssetLibrary entriesInFolder:folderName error:&error];
@@ -3788,17 +4091,20 @@ static void * const kGDModsPickerKindKey = (void *)&kGDModsPickerKindKey;
 
         for (ModAssetLibraryEntry *entry in sortedEntries) {
             UIView *entryRow = gd_make_mods_entry_row(entry, self, @selector(gd_modsLibraryEntryInfoTapped:));
-
-            UIButton *entryDeleteButton = objc_getAssociatedObject(entryRow, "gd_button_delete");
-            ModAssetLibraryEntry *entryForDelete = entry;
-            NSString *folderNameForEntry = [folderName copy];
-            gd_attach_hold_to_confirm(entryDeleteButton, self, ^{
-                [weakSelf gd_deleteModEntryConfirmed:entryForDelete inFolder:folderNameForEntry];
-            });
             [self.modsLibraryStack addArrangedSubview:entryRow];
 
             if ([self.modsLibraryExpandedInfoEntries containsObject:entry.path]) {
-                [self.modsLibraryStack addArrangedSubview:gd_make_mods_entry_info_panel(entry)];
+                // Delete now lives inside this info dropdown (per
+                // request) instead of on the always-visible entry row
+                // above - see gd_make_mods_entry_info_panel.
+                UIView *infoPanel = gd_make_mods_entry_info_panel(entry);
+                UIButton *entryDeleteButton = objc_getAssociatedObject(infoPanel, "gd_button_delete");
+                ModAssetLibraryEntry *entryForDelete = entry;
+                NSString *folderNameForEntry = [folderName copy];
+                gd_attach_hold_to_confirm(entryDeleteButton, self, ^{
+                    [weakSelf gd_deleteModEntryConfirmed:entryForDelete inFolder:folderNameForEntry];
+                });
+                [self.modsLibraryStack addArrangedSubview:infoPanel];
             }
         }
     }
