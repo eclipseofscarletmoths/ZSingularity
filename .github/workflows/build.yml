@@ -71,6 +71,7 @@ jobs:
             UnityBundleCAB.m \
             LZ4BlockDecoder.m \
             PatchManifestNetwork.m \
+            ModAssetLibrary.m \
             -o ZSingularity.dylib
 
       # Ad-hoc sign so the dylib is well-formed on its own; patch-ipa.yml

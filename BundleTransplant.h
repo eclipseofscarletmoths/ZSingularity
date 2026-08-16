@@ -113,7 +113,34 @@ typedef NS_ENUM(NSInteger, BundleTransplantErrorCode) {
 // listing the backup directory. Returns 0 (not an error) if
 // +bundleBackupDirectory doesn't exist yet - i.e. nothing has ever been
 // swapped.
+//
+// force:NO (the normal path) skips any entry whose live __data is
+// already the same byte size as its own backup - i.e. nothing to
+// actually undo, most commonly a bundle that got backed up (see
+// BankTransplant.h's own note on backup timing - the same shape of
+// "backup happens before the swap is known to succeed" applies here)
+// but never actually swapped. Those don't count toward the returned
+// total. force:YES restores every backup unconditionally, same as
+// this method's behavior before the check existed - the escape hatch
+// for anyone who suspects a real change slipped past a same-size
+// coincidence.
++ (NSInteger)restoreAllBackedUpBundlesWithForce:(BOOL)force error:(NSError **)error;
+
+// Convenience wrapper - equivalent to
+// +restoreAllBackedUpBundlesWithForce:NO error:error.
 + (NSInteger)restoreAllBackedUpBundlesWithError:(NSError **)error;
+
+// Scoped counterpart to the two methods above: restores only backup
+// entries whose OWN CAB (read directly off the backup file, which is
+// untouched stock bytes - see UnityBundleCAB.h) equals `cab`. A single
+// CAB can back more than one cached __data (the same asset cached under
+// more than one session/build hash - see MATCHING above), so this can
+// still restore more than one file for one CAB. force: behaves exactly
+// as it does on the unscoped method above, scoped to just this CAB's
+// entries. Returns the number restored, or -1 with error filled on a
+// filesystem-level failure; returns 0 (not an error) if there's no
+// backup for this CAB at all.
++ (NSInteger)restoreBackedUpBundlesForCAB:(NSString *)cab force:(BOOL)force error:(NSError **)error;
 
 @end
 

@@ -202,8 +202,8 @@ static BOOL bt2_try_patch_info_size(NSString *infoPath, uint64_t oldSize, uint64
     // UnityCache sits directly under Library, NOT under Library/Caches -
     // NSCachesDirectory resolves to the latter, which is a sibling
     // directory that happens to also exist (Library/Caches is the
-    // fsCachedData location PatchManifestNetwork deals with) but isn't
-    // this one. NSLibraryDirectory is Library
+    // fsCachedData location PatchManifestSync/PatchManifestNetworkPOC
+    // deal with) but isn't this one. NSLibraryDirectory is Library
     // itself, matching the actual on-device path.
     NSArray<NSString *> *paths = NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES);
     NSString *cachesDir = paths.firstObject;
@@ -343,7 +343,53 @@ static BOOL bt2_try_patch_info_size(NSString *infoPath, uint64_t oldSize, uint64
     return results;
 }
 
-+ (NSInteger)restoreAllBackedUpBundlesWithError:(NSError **)error {
+// Shared by all three restore entry points below - the actual copy-back
+// for one backup entry. `originalPath` is where it gets written;
+// `backupPath` is the untouched stock source. Returns YES/NO, logs its
+// own failure (same as the pre-existing inline version of this).
+static BOOL bt2_restore_one(NSString *backupPath, NSString *originalPath) {
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSString *tmpPath = [NSTemporaryDirectory() stringByAppendingPathComponent:[NSUUID UUID].UUIDString];
+    NSError *copyErr = nil;
+    if (![fm copyItemAtPath:backupPath toPath:tmpPath error:&copyErr]) {
+        ZLog(@"[BundleTransplant] restore: couldn't stage %@: %@", backupPath, copyErr.localizedDescription);
+        return NO;
+    }
+    NSError *replaceErr = nil;
+    BOOL ok = [fm replaceItemAtURL:[NSURL fileURLWithPath:originalPath]
+                      withItemAtURL:[NSURL fileURLWithPath:tmpPath]
+                     backupItemName:nil
+                            options:0
+                   resultingItemURL:nil
+                              error:&replaceErr];
+    [fm removeItemAtPath:tmpPath error:nil];
+    if (!ok) {
+        ZLog(@"[BundleTransplant] restore: couldn't swap %@ back in: %@", originalPath, replaceErr.localizedDescription);
+    }
+    return ok;
+    // __info is intentionally left as whatever bt2_try_patch_info_size
+    // last wrote - there's no tracked "original __info bytes" backup
+    // (only __data gets one), so a restored __data may still be
+    // sitting next to a __info that was patched for the modded
+    // size. If __info patching turns out to matter for load-time
+    // validation, this is the gap to close next: back up __info
+    // alongside __data before the first patch, same as __data does.
+}
+
+// True if backupPath and originalPath are the same byte size - the
+// force:NO skip condition every restore entry point below shares.
+// Missing/unreadable originalPath counts as "different" (so it still
+// gets restored rather than silently skipped - a live file that can't
+// even be stat'd is not "already matching its backup").
+static BOOL bt2_same_size_as_backup(NSString *backupPath, NSString *originalPath) {
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSDictionary<NSFileAttributeKey, id> *backupAttrs = [fm attributesOfItemAtPath:backupPath error:nil];
+    NSDictionary<NSFileAttributeKey, id> *originalAttrs = [fm attributesOfItemAtPath:originalPath error:nil];
+    if (!backupAttrs || !originalAttrs) return NO;
+    return backupAttrs.fileSize == originalAttrs.fileSize;
+}
+
++ (NSInteger)restoreAllBackedUpBundlesWithForce:(BOOL)force error:(NSError **)error {
     NSString *cacheDir = [self unityCacheSharedDirectory];
     NSString *backupDir = [self bundleBackupDirectory];
     NSFileManager *fm = NSFileManager.defaultManager;
@@ -364,36 +410,68 @@ static BOOL bt2_try_patch_info_size(NSString *infoPath, uint64_t oldSize, uint64
     }
 
     NSInteger restored = 0;
+    NSInteger skipped = 0;
     for (NSString *entry in entries) {
         NSString *originalPath = bt2_original_path_for_backup_name(entry, cacheDir);
         if (!originalPath) continue; // not one of ours (unexpected extension) - skip rather than guess
         NSString *backupPath = [backupDir stringByAppendingPathComponent:entry];
-        NSString *tmpPath = [NSTemporaryDirectory() stringByAppendingPathComponent:[NSUUID UUID].UUIDString];
-        NSError *copyErr = nil;
-        if (![fm copyItemAtPath:backupPath toPath:tmpPath error:&copyErr]) {
-            ZLog(@"[BundleTransplant] restore: couldn't stage %@: %@", backupPath, copyErr.localizedDescription);
-            continue;
+
+        if (!force && bt2_same_size_as_backup(backupPath, originalPath)) {
+            skipped++;
+            continue; // live file's already the same size as the backup - nothing to actually undo
         }
-        NSError *replaceErr = nil;
-        BOOL ok = [fm replaceItemAtURL:[NSURL fileURLWithPath:originalPath]
-                          withItemAtURL:[NSURL fileURLWithPath:tmpPath]
-                         backupItemName:nil
-                                options:0
-                       resultingItemURL:nil
-                                  error:&replaceErr];
-        [fm removeItemAtPath:tmpPath error:nil];
-        if (ok) {
-            restored++;
-        } else {
-            ZLog(@"[BundleTransplant] restore: couldn't swap %@ back in: %@", originalPath, replaceErr.localizedDescription);
-        }
-        // __info is intentionally left as whatever bt2_try_patch_info_size
-        // last wrote - there's no tracked "original __info bytes" backup
-        // (only __data gets one), so a restored __data may still be
-        // sitting next to a __info that was patched for the modded
-        // size. If __info patching turns out to matter for load-time
-        // validation, this is the gap to close next: back up __info
-        // alongside __data before the first patch, same as __data does.
+
+        if (bt2_restore_one(backupPath, originalPath)) restored++;
+    }
+
+    if (skipped > 0) {
+        ZLog(@"[BundleTransplant] restore: skipped %ld byte-identical entr%@ (Force Restore to override)",
+              (long)skipped, skipped == 1 ? @"y" : @"ies");
+    }
+    return restored;
+}
+
++ (NSInteger)restoreAllBackedUpBundlesWithError:(NSError **)error {
+    return [self restoreAllBackedUpBundlesWithForce:NO error:error];
+}
+
++ (NSInteger)restoreBackedUpBundlesForCAB:(NSString *)cab force:(BOOL)force error:(NSError **)error {
+    NSString *cacheDir = [self unityCacheSharedDirectory];
+    NSString *backupDir = [self bundleBackupDirectory];
+    NSFileManager *fm = NSFileManager.defaultManager;
+
+    if (!cacheDir) {
+        if (error) *error = BT2Error(BundleTransplantErrorNoCacheDirectory, @"Couldn't resolve Library/UnityCache/Shared.");
+        return -1;
+    }
+    if (!backupDir || ![fm fileExistsAtPath:backupDir]) {
+        return 0;
+    }
+
+    NSError *listErr = nil;
+    NSArray<NSString *> *entries = [fm contentsOfDirectoryAtPath:backupDir error:&listErr];
+    if (!entries) {
+        if (error) *error = listErr ?: BT2Error(BundleTransplantErrorBackupFailed, @"Couldn't list the bundle backup directory.");
+        return -1;
+    }
+
+    NSInteger restored = 0;
+    for (NSString *entry in entries) {
+        NSString *originalPath = bt2_original_path_for_backup_name(entry, cacheDir);
+        if (!originalPath) continue;
+        NSString *backupPath = [backupDir stringByAppendingPathComponent:entry];
+
+        // The backup is untouched stock bytes, so reading its CAB gives
+        // the same identity the modded file was matched against at swap
+        // time - no need to touch the live (possibly-already-modded)
+        // __data to find out which entries belong to this CAB.
+        NSError *cabErr = nil;
+        NSString *entryCAB = [UnityBundleCAB primaryCABForBundleAtPath:backupPath error:&cabErr];
+        if (!entryCAB || ![entryCAB isEqualToString:cab]) continue;
+
+        if (!force && bt2_same_size_as_backup(backupPath, originalPath)) continue;
+
+        if (bt2_restore_one(backupPath, originalPath)) restored++;
     }
 
     return restored;
