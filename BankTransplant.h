@@ -80,6 +80,14 @@ typedef NS_ENUM(NSInteger, BankTransplantErrorCode) {
 // on a filesystem-level failure walking the backup directory.
 + (NSInteger)restoreAllBackedUpBanksWithError:(NSError **)error;
 
+// Scoped counterpart to the method above: restores only the single
+// <name>.bank (name should include the extension, e.g. "music.bank")
+// that has a matching backup under +bankBackupDirectory, leaving the
+// backup in place. Returns 1 if it was restored, 0 (not an error) if
+// there's no backup for this name at all, or -1 with error filled on a
+// filesystem-level failure.
++ (NSInteger)restoreBackedUpBankNamed:(NSString *)name error:(NSError **)error;
+
 @end
 
 NS_ASSUME_NONNULL_END

@@ -36,6 +36,7 @@ typedef NS_ENUM(NSInteger, ModAssetLibraryErrorCode) {
     ModAssetLibraryErrorCopyFailed,
     ModAssetLibraryErrorManifestReadFailed,
     ModAssetLibraryErrorManifestWriteFailed,
+    ModAssetLibraryErrorDeleteFailed,
 };
 
 // One tracked file inside one folder. See this header's own top comment
@@ -92,6 +93,23 @@ typedef NS_ENUM(NSInteger, ModAssetLibraryErrorCode) {
 // +mobileFMODBuildsDirectory or either backup directory - this only
 // forgets the library's own tracked copy.
 + (BOOL)removeEntry:(ModAssetLibraryEntry *)entry fromFolder:(NSString *)folderName error:(NSError **)error;
+
+// Deletes folderName entirely - its manifest.json, every tracked file
+// under it, and the folder itself. Same "library bookkeeping only"
+// scope as +removeEntry:fromFolder:error: - does NOT touch anything
+// under +unityCacheSharedDirectory/+mobileFMODBuildsDirectory or
+// either backup directory; callers that want the actual swapped-in
+// files restored first should walk +entriesInFolder:error: and drive
+// BundleTransplant/BankTransplant themselves before calling this.
++ (BOOL)deleteFolderNamed:(NSString *)folderName error:(NSError **)error;
+
+// Renames folderName's directory in place (its manifest.json and every
+// tracked file move with it - a plain directory move, not a per-file
+// copy) to newName. newName is validated the same way
+// +createFolderNamed:error: validates its own name argument. Fails with
+// ModAssetLibraryErrorFolderAlreadyExists if newName already names a
+// different existing folder.
++ (BOOL)renameFolderNamed:(NSString *)folderName to:(NSString *)newName error:(NSError **)error;
 
 @end
 

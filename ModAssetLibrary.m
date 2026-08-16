@@ -255,4 +255,60 @@ static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
     return [self mal_writeEntries:remaining toFolder:folderName error:error];
 }
 
++ (BOOL)deleteFolderNamed:(NSString *)folderName error:(NSError **)error {
+    NSString *root = [self modLibraryRootDirectory];
+    NSString *folderPath = root ? [root stringByAppendingPathComponent:folderName] : nil;
+    NSFileManager *fm = NSFileManager.defaultManager;
+    BOOL isDir = NO;
+    if (!folderPath || ![fm fileExistsAtPath:folderPath isDirectory:&isDir] || !isDir) {
+        if (error) *error = MALError(ModAssetLibraryErrorFolderNotFound,
+            [NSString stringWithFormat:@"No folder named \"%@\".", folderName]);
+        return NO;
+    }
+
+    NSError *removeErr = nil;
+    if (![fm removeItemAtPath:folderPath error:&removeErr]) {
+        if (error) *error = removeErr ?: MALError(ModAssetLibraryErrorDeleteFailed,
+            [NSString stringWithFormat:@"Couldn't delete \"%@\".", folderName]);
+        return NO;
+    }
+    return YES;
+}
+
++ (BOOL)renameFolderNamed:(NSString *)folderName to:(NSString *)newName error:(NSError **)error {
+    NSString *trimmed = [newName stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (trimmed.length == 0 || [trimmed containsString:@"/"]) {
+        if (error) *error = MALError(ModAssetLibraryErrorInvalidFolderName,
+            @"Folder name can't be empty or contain \"/\".");
+        return NO;
+    }
+
+    NSString *root = [self modLibraryRootDirectory];
+    NSString *oldPath = root ? [root stringByAppendingPathComponent:folderName] : nil;
+    NSFileManager *fm = NSFileManager.defaultManager;
+    BOOL isDir = NO;
+    if (!oldPath || ![fm fileExistsAtPath:oldPath isDirectory:&isDir] || !isDir) {
+        if (error) *error = MALError(ModAssetLibraryErrorFolderNotFound,
+            [NSString stringWithFormat:@"No folder named \"%@\".", folderName]);
+        return NO;
+    }
+
+    if ([trimmed isEqualToString:folderName]) return YES; // no-op rename
+
+    NSString *newPath = [root stringByAppendingPathComponent:trimmed];
+    if ([fm fileExistsAtPath:newPath]) {
+        if (error) *error = MALError(ModAssetLibraryErrorFolderAlreadyExists,
+            [NSString stringWithFormat:@"A folder named \"%@\" already exists.", trimmed]);
+        return NO;
+    }
+
+    NSError *moveErr = nil;
+    if (![fm moveItemAtPath:oldPath toPath:newPath error:&moveErr]) {
+        if (error) *error = moveErr ?: MALError(ModAssetLibraryErrorDeleteFailed,
+            [NSString stringWithFormat:@"Couldn't rename \"%@\".", folderName]);
+        return NO;
+    }
+    return YES;
+}
+
 @end

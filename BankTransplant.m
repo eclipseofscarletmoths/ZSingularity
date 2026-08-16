@@ -17,6 +17,10 @@ static NSError *BTError(BankTransplantErrorCode code, NSString *message) {
 
 static NSString * const kBTBackupSuffix = @".orig-bak";
 
+@interface BankTransplant ()
++ (BOOL)bt_restoreOneBackupEntry:(NSString *)backupEntryName inBackupDir:(NSString *)backupDir mobileDir:(NSString *)mobileDir;
+@end
+
 @implementation BankTransplant
 
 + (NSString *)mobileFMODBuildsDirectory {
@@ -129,6 +133,39 @@ static NSString * const kBTBackupSuffix = @".orig-bak";
     return YES;
 }
 
+// Shared by +restoreAllBackedUpBanksWithError: and
+// +restoreBackedUpBankNamed:error: below - restores one <name>.bank
+// from its <name>.bank.orig-bak backup, leaving the backup in place.
+// Returns YES/NO for that one file; doesn't fill `error` on a simple
+// "couldn't stage/swap this one" failure (logged via ZLog instead,
+// same as the old inline loop body did), since the all-banks caller
+// wants to keep going past a single bad entry rather than abort.
++ (BOOL)bt_restoreOneBackupEntry:(NSString *)backupEntryName inBackupDir:(NSString *)backupDir mobileDir:(NSString *)mobileDir {
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSString *backupPath = [backupDir stringByAppendingPathComponent:backupEntryName];
+    NSString *fileName = [backupEntryName substringToIndex:backupEntryName.length - kBTBackupSuffix.length];
+    NSString *originalPath = [mobileDir stringByAppendingPathComponent:fileName];
+
+    NSString *tmpPath = [NSTemporaryDirectory() stringByAppendingPathComponent:[NSUUID UUID].UUIDString];
+    NSError *copyErr = nil;
+    if (![fm copyItemAtPath:backupPath toPath:tmpPath error:&copyErr]) {
+        ZLog(@"[BankTransplant] restore: couldn't stage %@: %@", backupEntryName, copyErr.localizedDescription);
+        return NO;
+    }
+    NSError *replaceErr = nil;
+    BOOL ok = [fm replaceItemAtURL:[NSURL fileURLWithPath:originalPath]
+                      withItemAtURL:[NSURL fileURLWithPath:tmpPath]
+                     backupItemName:nil
+                            options:0
+                   resultingItemURL:nil
+                              error:&replaceErr];
+    [fm removeItemAtPath:tmpPath error:nil];
+    if (!ok) {
+        ZLog(@"[BankTransplant] restore: couldn't swap %@ back in: %@", originalPath.lastPathComponent, replaceErr.localizedDescription);
+    }
+    return ok;
+}
+
 + (NSInteger)restoreAllBackedUpBanksWithError:(NSError **)error {
     NSString *mobileDir = [self mobileFMODBuildsDirectory];
     NSString *backupDir = [self bankBackupDirectory];
@@ -148,32 +185,28 @@ static NSString * const kBTBackupSuffix = @".orig-bak";
     NSInteger restored = 0;
     for (NSString *entry in entries) {
         if (![entry hasSuffix:kBTBackupSuffix]) continue;
-        NSString *backupPath = [backupDir stringByAppendingPathComponent:entry];
-        NSString *fileName = [entry substringToIndex:entry.length - kBTBackupSuffix.length];
-        NSString *originalPath = [mobileDir stringByAppendingPathComponent:fileName];
-
-        NSString *tmpPath = [NSTemporaryDirectory() stringByAppendingPathComponent:[NSUUID UUID].UUIDString];
-        NSError *copyErr = nil;
-        if (![fm copyItemAtPath:backupPath toPath:tmpPath error:&copyErr]) {
-            ZLog(@"[BankTransplant] restore: couldn't stage %@: %@", entry, copyErr.localizedDescription);
-            continue;
-        }
-        NSError *replaceErr = nil;
-        BOOL ok = [fm replaceItemAtURL:[NSURL fileURLWithPath:originalPath]
-                          withItemAtURL:[NSURL fileURLWithPath:tmpPath]
-                         backupItemName:nil
-                                options:0
-                       resultingItemURL:nil
-                                  error:&replaceErr];
-        [fm removeItemAtPath:tmpPath error:nil];
-        if (ok) {
-            restored++;
-        } else {
-            ZLog(@"[BankTransplant] restore: couldn't swap %@ back in: %@", originalPath.lastPathComponent, replaceErr.localizedDescription);
-        }
+        if ([self bt_restoreOneBackupEntry:entry inBackupDir:backupDir mobileDir:mobileDir]) restored++;
     }
 
     return restored;
+}
+
++ (NSInteger)restoreBackedUpBankNamed:(NSString *)name error:(NSError **)error {
+    NSString *mobileDir = [self mobileFMODBuildsDirectory];
+    NSString *backupDir = [self bankBackupDirectory];
+    NSFileManager *fm = NSFileManager.defaultManager;
+
+    if (!backupDir || ![fm fileExistsAtPath:backupDir]) {
+        return 0; // nothing has ever been backed up - not an error
+    }
+
+    NSString *backupEntryName = [name stringByAppendingString:kBTBackupSuffix];
+    NSString *backupPath = [backupDir stringByAppendingPathComponent:backupEntryName];
+    if (![fm fileExistsAtPath:backupPath]) {
+        return 0; // no backup for this bank specifically - not an error
+    }
+
+    return [self bt_restoreOneBackupEntry:backupEntryName inBackupDir:backupDir mobileDir:mobileDir] ? 1 : 0;
 }
 
 @end

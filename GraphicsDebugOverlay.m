@@ -491,6 +491,53 @@ static void gd_style_icon_button_as_native_glass(UIButton *button, UIImage *imag
     button.contentHorizontalAlignment = UIControlContentHorizontalAlignmentCenter;
 }
 
+// Associated-object keys backing the generic hold-to-confirm gesture
+// (see gd_attach_hold_to_confirm and -gd_handleHoldToConfirmGesture:
+// below) - stashed per-button so the shared CADisplayLink-driven tick
+// handler can restyle/reset whichever button is currently mid-hold
+// without every call site having to pass all of this through manually.
+static void * const kGDHoldConfirmBlockKey = (void *)&kGDHoldConfirmBlockKey;       // copied void(^)(void), run once the hold completes
+static void * const kGDHoldConfirmIconKey = (void *)&kGDHoldConfirmIconKey;         // UIImage, re-applied every tick alongside the interpolated tint
+static void * const kGDHoldConfirmBaseTintKey = (void *)&kGDHoldConfirmBaseTintKey; // UIColor the button starts (and ends) at
+
+// Linear per-channel interpolation between two UIColors - used to fade
+// a hold-to-confirm icon from its resting tint to red as the hold
+// progresses. Both colors are expected to already be in (or convert
+// cleanly to) the RGB colorspace, true for every UIColor this file
+// constructs with colorWithRed:green:blue:alpha: or colorWithWhite:alpha:.
+static UIColor *gd_color_lerp(UIColor *from, UIColor *to, CGFloat t) {
+    CGFloat fr, fg, fb, fa, tr, tg, tb, ta;
+    [from getRed:&fr green:&fg blue:&fb alpha:&fa];
+    [to getRed:&tr green:&tg blue:&tb alpha:&ta];
+    return [UIColor colorWithRed:fr + (tr - fr) * t
+                            green:fg + (tg - fg) * t
+                             blue:fb + (tb - fb) * t
+                            alpha:fa + (ta - fa) * t];
+}
+
+// Wires up `button` (expected to already be styled via
+// gd_style_icon_button_as_native_glass with `icon`/`baseTint`) so that
+// holding it for kGDHoldConfirmDuration seconds - not just tapping it -
+// runs `onConfirm`. This is the safety net requested for every
+// destructive X icon in the Mods Library accordion (folder delete,
+// entry delete): a single tap does nothing but register the touch-down;
+// -gd_handleHoldToConfirmGesture:/-gd_holdConfirmTick: below own the
+// actual timing and the expand-then-redden animation, mirroring the
+// Syslog button's own hold-to-confirm pattern (see
+// -handleSyslogButtonLongPress:) but generalized to any icon button and
+// with a caller-supplied completion block instead of one hardcoded
+// action.
+static void gd_attach_hold_to_confirm(UIButton *button, UIImage *icon, UIColor *baseTint, id target, void (^onConfirm)(void)) {
+    UILongPressGestureRecognizer *press =
+        [[UILongPressGestureRecognizer alloc] initWithTarget:target action:@selector(gd_handleHoldToConfirmGesture:)];
+    press.minimumPressDuration = 0; // -gd_holdConfirmTick: owns the real timing, same reasoning as the Syslog button's hold
+    press.cancelsTouchesInView = NO;
+    [button addGestureRecognizer:press];
+    objc_setAssociatedObject(button, kGDHoldConfirmIconKey, icon, OBJC_ASSOCIATION_RETAIN);
+    objc_setAssociatedObject(button, kGDHoldConfirmBaseTintKey, baseTint, OBJC_ASSOCIATION_RETAIN);
+    objc_setAssociatedObject(button, kGDHoldConfirmBlockKey, [onConfirm copy], OBJC_ASSOCIATION_COPY);
+}
+
 #pragma mark - Engine scripts
 //
 // Every IL2CPP-mediated engine call this panel makes - urpAsset/
@@ -1739,13 +1786,43 @@ static UIView *gd_make_blacklist_entry_row(NSString *term, id target, SEL remove
     return row;
 }
 
+// Rewrites an on-disk path under this app's own Library directory
+// (which is everything ModAssetLibrary ever hands back - see
+// +modLibraryRootDirectory) into one starting at "Library/..." instead
+// of the full sandbox path ("/var/mobile/Containers/Data/Application/
+// <UUID>/Library/..."), per request ("starting from NSDirectory, not
+// the entire var/ path"). Falls back to just the leaf filename if
+// `path` doesn't live under the Library directory for some reason.
+static NSString *gd_library_relative_path(NSString *path) {
+    NSArray<NSString *> *paths = NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES);
+    NSString *libraryDir = paths.firstObject;
+    if (libraryDir && [path hasPrefix:libraryDir]) {
+        NSString *relative = [path substringFromIndex:libraryDir.length];
+        if ([relative hasPrefix:@"/"]) relative = [relative substringFromIndex:1];
+        return [@"Library/" stringByAppendingString:relative];
+    }
+    return path.lastPathComponent;
+}
+
 // Folder header row for the Mods Library accordion: [chevron][folder
-// icon][name], the whole row tappable (not just the chevron - a bigger
-// hit target beats a precise one for a disclosure control) via a tap
-// gesture wired to `target`/`action`. The folder name is stashed as an
-// associated object on the ROW ITSELF (not the chevron) since the tap
-// gesture's .view is the row.
-static UIView *gd_make_mods_folder_row(NSString *folderName, BOOL expanded, id target, SEL tapAction) {
+// icon][name] .... [Add pill][pencil][X], left-to-right per request.
+// The whole row (not just the chevron) is tappable for expand/collapse
+// via a tap gesture wired to `target`/`action` - a bigger hit target
+// beats a precise one for a disclosure control - but that gesture only
+// covers the row's own background; the three trailing controls are
+// real buttons the tap gesture doesn't intercept (UIKit routes a touch
+// to the deepest hit-testing view first). The folder name is stashed
+// as an associated object on the row itself (for the tap gesture) AND
+// on each of the three trailing buttons (for their own handlers) since
+// each is wired up independently by the caller (see -gd_rebuildModsLibrary).
+//
+// Add/Rename are plain buttons the caller wires with target/action.
+// Delete is NOT wired here - gd_attach_hold_to_confirm needs a
+// completion block that closes over `folderName`, which only the
+// calling Objective-C method can build cleanly - so this just returns
+// the styled, associated-object-tagged button via "gd_button_delete"
+// for the caller to attach the hold gesture to.
+static UIView *gd_make_mods_folder_row(NSString *folderName, BOOL expanded, id target, SEL tapAction, SEL addAction, SEL renameAction) {
     UIView *row = [[UIView alloc] init];
     row.translatesAutoresizingMaskIntoConstraints = NO;
     objc_setAssociatedObject(row, "gd_modsFolderName", folderName, OBJC_ASSOCIATION_COPY);
@@ -1774,6 +1851,41 @@ static UIView *gd_make_mods_folder_row(NSString *folderName, BOOL expanded, id t
     label.lineBreakMode = NSLineBreakByTruncatingMiddle;
     [row addSubview:label];
 
+    // X - delete, at the row's far right extreme, same glyph/style as
+    // the blacklist entry rows' own remove button. Hold-to-confirm is
+    // attached by the caller (see gd_attach_hold_to_confirm).
+    UIButton *deleteButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    deleteButton.translatesAutoresizingMaskIntoConstraints = NO;
+    UIImageSymbolConfiguration *xSymbolConfig = [UIImageSymbolConfiguration configurationWithPointSize:6 weight:UIImageSymbolWeightSemibold];
+    UIImage *xImage = [UIImage systemImageNamed:@"xmark" withConfiguration:xSymbolConfig];
+    UIColor *xTint = [UIColor colorWithWhite:1 alpha:0.55];
+    gd_style_icon_button_as_native_glass(deleteButton, xImage, xTint);
+    objc_setAssociatedObject(deleteButton, "gd_modsFolderName", folderName, OBJC_ASSOCIATION_COPY);
+    [row addSubview:deleteButton];
+    objc_setAssociatedObject(row, "gd_button_delete", deleteButton, OBJC_ASSOCIATION_RETAIN);
+
+    // Pencil - rename, immediately to the left of X.
+    UIButton *renameButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    renameButton.translatesAutoresizingMaskIntoConstraints = NO;
+    UIImageSymbolConfiguration *pencilConfig = [UIImageSymbolConfiguration configurationWithPointSize:9 weight:UIImageSymbolWeightSemibold];
+    UIImage *pencilImage = [UIImage systemImageNamed:@"pencil" withConfiguration:pencilConfig];
+    gd_style_icon_button_as_native_glass(renameButton, pencilImage, [UIColor colorWithWhite:1 alpha:0.6]);
+    [renameButton addTarget:target action:renameAction forControlEvents:UIControlEventTouchUpInside];
+    objc_setAssociatedObject(renameButton, "gd_modsFolderName", folderName, OBJC_ASSOCIATION_COPY);
+    [row addSubview:renameButton];
+
+    // "Add" - wider, pill-shaped (native glass button, same style as
+    // every titled pill elsewhere in this panel), to the left of the
+    // pencil - adds more files into this already-existing folder
+    // without going through the New Mod Folder prompt again.
+    UIButton *addButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    addButton.translatesAutoresizingMaskIntoConstraints = NO;
+    gd_style_button_as_native_glass(addButton, @"Add", [UIColor colorWithRed:0.42 green:0.62 blue:1.0 alpha:1.0]);
+    addButton.titleLabel.font = [UIFont systemFontOfSize:10 weight:UIFontWeightSemibold];
+    [addButton addTarget:target action:addAction forControlEvents:UIControlEventTouchUpInside];
+    objc_setAssociatedObject(addButton, "gd_modsFolderName", folderName, OBJC_ASSOCIATION_COPY);
+    [row addSubview:addButton];
+
     UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:target action:tapAction];
     [row addGestureRecognizer:tap];
 
@@ -1787,8 +1899,23 @@ static UIView *gd_make_mods_folder_row(NSString *folderName, BOOL expanded, id t
         [folderIcon.widthAnchor constraintEqualToConstant:18],
 
         [label.leadingAnchor constraintEqualToAnchor:folderIcon.trailingAnchor constant:6],
-        [label.trailingAnchor constraintLessThanOrEqualToAnchor:row.trailingAnchor constant:-4],
+        [label.trailingAnchor constraintLessThanOrEqualToAnchor:addButton.leadingAnchor constant:-8],
         [label.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
+
+        [deleteButton.trailingAnchor constraintEqualToAnchor:row.trailingAnchor],
+        [deleteButton.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
+        [deleteButton.widthAnchor constraintEqualToConstant:16],
+        [deleteButton.heightAnchor constraintEqualToConstant:16],
+
+        [renameButton.trailingAnchor constraintEqualToAnchor:deleteButton.leadingAnchor constant:-10],
+        [renameButton.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
+        [renameButton.widthAnchor constraintEqualToConstant:16],
+        [renameButton.heightAnchor constraintEqualToConstant:16],
+
+        [addButton.trailingAnchor constraintEqualToAnchor:renameButton.leadingAnchor constant:-8],
+        [addButton.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
+        [addButton.heightAnchor constraintEqualToConstant:20],
+        [addButton.widthAnchor constraintGreaterThanOrEqualToConstant:38],
 
         [row.topAnchor constraintEqualToAnchor:label.topAnchor constant:-5],
         [row.bottomAnchor constraintEqualToAnchor:label.bottomAnchor constant:5],
@@ -1797,12 +1924,16 @@ static UIView *gd_make_mods_folder_row(NSString *folderName, BOOL expanded, id t
 }
 
 // One tracked file's row, indented under its folder: [zip/doc icon]
-// [name][Reset], the Reset button only present when entry.cab is
-// non-nil (see gd_modsLibraryEntryResetTapped:'s header comment on
-// why non-bundle entries don't get one). The entry itself (not just
-// its CAB) is stashed on the button so the tap handler has the whole
-// thing to work with, including for its no-CAB early-out message.
-static UIView *gd_make_mods_entry_row(ModAssetLibraryEntry *entry, id target, SEL resetAction) {
+// [name] .... [Info pill][X], left-to-right. Every entry gets both
+// buttons now regardless of whether it parsed as a Unity bundle (the
+// old per-CAB-only "Reset" button is gone - see
+// -gd_modsLibraryEntryDeleteConfirmed:, which now falls back to a
+// per-filename bank restore for entries with no CAB). Info toggles an
+// expandable panel the caller (see -gd_rebuildModsLibrary) inserts
+// right after this row when the entry's path is in
+// modsLibraryExpandedInfoEntries; Delete is hold-to-confirm, wired by
+// the caller the same way the folder row's own X is.
+static UIView *gd_make_mods_entry_row(ModAssetLibraryEntry *entry, id target, SEL infoAction) {
     UIView *row = [[UIView alloc] init];
     row.translatesAutoresizingMaskIntoConstraints = NO;
 
@@ -1823,42 +1954,86 @@ static UIView *gd_make_mods_entry_row(ModAssetLibraryEntry *entry, id target, SE
     label.lineBreakMode = NSLineBreakByTruncatingMiddle;
     [row addSubview:label];
 
-    UIButton *resetButton = nil;
-    if (isBundle) {
-        resetButton = [UIButton buttonWithType:UIButtonTypeSystem];
-        resetButton.translatesAutoresizingMaskIntoConstraints = NO;
-        UIImageSymbolConfiguration *resetConfig = [UIImageSymbolConfiguration configurationWithPointSize:6 weight:UIImageSymbolWeightSemibold];
-        UIImage *resetImage = [UIImage systemImageNamed:@"arrow.counterclockwise" withConfiguration:resetConfig];
-        gd_style_icon_button_as_native_glass(resetButton, resetImage, [UIColor colorWithRed:1.0 green:0.62 blue:0.32 alpha:1.0]);
-        [resetButton addTarget:target action:resetAction forControlEvents:UIControlEventTouchUpInside];
-        objc_setAssociatedObject(resetButton, "gd_modsEntry", entry, OBJC_ASSOCIATION_RETAIN);
-        [row addSubview:resetButton];
-    }
+    // X - delete + restore. Same hold-to-confirm treatment as the
+    // folder row's own X; the caller attaches the actual gesture.
+    UIButton *deleteButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    deleteButton.translatesAutoresizingMaskIntoConstraints = NO;
+    UIImageSymbolConfiguration *xSymbolConfig = [UIImageSymbolConfiguration configurationWithPointSize:6 weight:UIImageSymbolWeightSemibold];
+    UIImage *xImage = [UIImage systemImageNamed:@"xmark" withConfiguration:xSymbolConfig];
+    UIColor *xTint = [UIColor colorWithWhite:1 alpha:0.55];
+    gd_style_icon_button_as_native_glass(deleteButton, xImage, xTint);
+    objc_setAssociatedObject(deleteButton, "gd_modsEntry", entry, OBJC_ASSOCIATION_RETAIN);
+    [row addSubview:deleteButton];
+    objc_setAssociatedObject(row, "gd_button_delete", deleteButton, OBJC_ASSOCIATION_RETAIN);
 
-    NSMutableArray<NSLayoutConstraint *> *constraints = [NSMutableArray arrayWithArray:@[
+    // "Info" - wide pill, immediately to the left of X - toggles the
+    // filepath/CAB/size dropdown (gd_make_mods_entry_info_panel).
+    UIButton *infoButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    infoButton.translatesAutoresizingMaskIntoConstraints = NO;
+    gd_style_button_as_native_glass(infoButton, @"Info", [UIColor colorWithWhite:1 alpha:0.65]);
+    infoButton.titleLabel.font = [UIFont systemFontOfSize:9 weight:UIFontWeightSemibold];
+    [infoButton addTarget:target action:infoAction forControlEvents:UIControlEventTouchUpInside];
+    objc_setAssociatedObject(infoButton, "gd_modsEntry", entry, OBJC_ASSOCIATION_RETAIN);
+    [row addSubview:infoButton];
+
+    [NSLayoutConstraint activateConstraints:@[
         [icon.leadingAnchor constraintEqualToAnchor:row.leadingAnchor constant:22], // indented under the folder icon above
         [icon.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
         [icon.widthAnchor constraintEqualToConstant:16],
 
         [label.leadingAnchor constraintEqualToAnchor:icon.trailingAnchor constant:5],
+        [label.trailingAnchor constraintLessThanOrEqualToAnchor:infoButton.leadingAnchor constant:-8],
         [label.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
+
+        [deleteButton.trailingAnchor constraintEqualToAnchor:row.trailingAnchor],
+        [deleteButton.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
+        [deleteButton.widthAnchor constraintEqualToConstant:16],
+        [deleteButton.heightAnchor constraintEqualToConstant:16],
+
+        [infoButton.trailingAnchor constraintEqualToAnchor:deleteButton.leadingAnchor constant:-8],
+        [infoButton.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
+        [infoButton.heightAnchor constraintEqualToConstant:18],
+        [infoButton.widthAnchor constraintGreaterThanOrEqualToConstant:34],
 
         [row.topAnchor constraintEqualToAnchor:label.topAnchor constant:-3],
         [row.bottomAnchor constraintEqualToAnchor:label.bottomAnchor constant:3],
     ]];
-    if (resetButton) {
-        [constraints addObjectsFromArray:@[
-            [label.trailingAnchor constraintLessThanOrEqualToAnchor:resetButton.leadingAnchor constant:-6],
-            [resetButton.trailingAnchor constraintEqualToAnchor:row.trailingAnchor],
-            [resetButton.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
-            [resetButton.widthAnchor constraintEqualToConstant:16],
-            [resetButton.heightAnchor constraintEqualToConstant:16],
-        ]];
-    } else {
-        [constraints addObject:[label.trailingAnchor constraintLessThanOrEqualToAnchor:row.trailingAnchor constant:-4]];
-    }
-    [NSLayoutConstraint activateConstraints:constraints];
     return row;
+}
+
+// Expandable "Info" panel for one entry - filepath (relative to
+// NSLibraryDirectory, not the full sandbox /var/... path -
+// gd_library_relative_path), CAB (bundles only), and human-readable
+// size, one muted subtext line each. Inserted directly after the
+// entry's own row in modsLibraryStack when its path is in
+// modsLibraryExpandedInfoEntries - see -gd_rebuildModsLibrary.
+static UIView *gd_make_mods_entry_info_panel(ModAssetLibraryEntry *entry) {
+    UIStackView *panel = [[UIStackView alloc] init];
+    panel.axis = UILayoutConstraintAxisVertical;
+    panel.spacing = 1;
+    panel.translatesAutoresizingMaskIntoConstraints = NO;
+    panel.layoutMarginsRelativeArrangement = YES;
+    panel.layoutMargins = UIEdgeInsetsMake(2, 38, 2, 4); // lines up under the entry name, past the folder/doc icon indent
+
+    UIFont *subtextFont = [UIFont systemFontOfSize:9.5 weight:UIFontWeightRegular];
+    UIColor *subtextColor = [UIColor colorWithWhite:1 alpha:0.4];
+
+    NSString *pathLine = [NSString stringWithFormat:@"Path: %@", gd_library_relative_path(entry.path)];
+    NSString *sizeLine = [NSString stringWithFormat:@"Size: %@", [NSByteCountFormatter stringFromByteCount:(long long)entry.byteSize countStyle:NSByteCountFormatterCountStyleFile]];
+
+    NSMutableArray<NSString *> *lines = [NSMutableArray arrayWithObjects:pathLine, nil];
+    if (entry.cab) [lines addObject:[NSString stringWithFormat:@"CAB: %@", entry.cab]];
+    [lines addObject:sizeLine];
+
+    for (NSString *line in lines) {
+        UILabel *label = [[UILabel alloc] init];
+        label.text = line;
+        label.font = subtextFont;
+        label.textColor = subtextColor;
+        label.lineBreakMode = NSLineBreakByTruncatingMiddle;
+        [panel addArrangedSubview:label];
+    }
+    return panel;
 }
 
 static UILabel *gd_make_section_header(NSString *text) {
@@ -2039,6 +2214,22 @@ static UIView *gd_make_title_block(void) {
 // keeps that from collapsing every row back closed on every rebuild).
 @property (nonatomic, strong) UIStackView *modsLibraryStack;
 @property (nonatomic, strong) NSMutableSet<NSString *> *modsLibraryExpandedFolders;
+// Which entries (keyed by ModAssetLibraryEntry.path) currently have
+// their "Info" dropdown open - see gd_make_mods_entry_row/
+// -gd_modsLibraryEntryInfoTapped: and gd_make_mods_entry_info_panel.
+// Same survives-a-rebuild pattern as modsLibraryExpandedFolders above.
+@property (nonatomic, strong) NSMutableSet<NSString *> *modsLibraryExpandedInfoEntries;
+
+// Generic press-and-hold-to-confirm state, shared by every X (delete)
+// icon in the Mods Library accordion (folder rows and entry rows
+// alike) - see gd_attach_hold_to_confirm/-gd_handleHoldToConfirmGesture:.
+// Only one hold can be in progress at a time, which is all a touch
+// screen can physically drive anyway, so this is a handful of scalar
+// properties rather than a per-button table.
+@property (nonatomic, weak) UIButton *holdConfirmActiveButton;
+@property (nonatomic, assign) NSTimeInterval holdConfirmStartTime;
+@property (nonatomic, assign) BOOL holdConfirmTriggered;
+@property (nonatomic, strong) CADisplayLink *holdConfirmDisplayLink;
 
 // Verbose (tweak-only log) mode: engaged by holding the Debug section's
 // "Syslog" button for kSyslogHoldDuration seconds - see
@@ -2700,54 +2891,40 @@ static const CGFloat kContentFadeHeight = 22;
     // those files' headers. Import Mod(s) sniffs each picked file (RIFF/
     // FEV magic -> bank, UnityFS magic -> bundle - see
     // -gd_kindForFileAtURL:) and routes it to whichever transplant class
-    // actually handles that file type, so this is one button instead of
-    // the old bank-only/bundle-only pair. Restore Originals/Restore
-    // Bundles stay separate since they're not file-picker-driven and
-    // target genuinely different directories.
+    // actually handles that file type, and immediately prompts for a
+    // folder name so every import also lands in the Mods Library
+    // accordion below (see -gd_beginModImportIntoFolder:) - Import Mod(s)
+    // both swaps files in AND tracks them, in one action.
+    //
+    // Restore Bundles/Restore Originals used to be two separate buttons
+    // (different directories, see BankTransplant.h/BundleTransplant.h);
+    // now one "Restore Bundles & Banks" button drives both restores
+    // together, since from the person's side there was never a reason
+    // to run one without the other. Force Restore (the escape hatch for
+    // a same-size coincidence masking a real bundle change - see
+    // +[BundleTransplant restoreAllBackedUpBundlesWithForce:error:])
+    // moved into the "No Assets to Restore" alert this button shows
+    // when there's nothing the soft restore could do - see
+    // -restoreOriginalsTapped/-gd_presentNoAssetsToRestoreAlert.
+    //
+    // The Mods Library accordion (ModAssetLibrary.h) - named folders of
+    // tracked mod files, on top of (not instead of) the swap-in-place
+    // flow above - no longer gets its own section header or a separate
+    // "Add Asset" entry point; it just lives directly under this
+    // section's two buttons, since Import Mod(s) is now the only way
+    // into it.
     gd_add_section_header(self.stack, @"Mods");
     GDRow *modsRow = gd_make_button_pair_row(
         @"Import Mod(s)", [UIColor colorWithRed:0.42 green:0.62 blue:1.0 alpha:1.0],
-        @"Restore Originals", [UIColor colorWithRed:1.0 green:0.42 blue:0.42 alpha:1.0]);
+        @"Restore Bundles & Banks", [UIColor colorWithRed:1.0 green:0.42 blue:0.42 alpha:1.0]);
     UIButton *importModButton = objc_getAssociatedObject(modsRow, "gd_button_left");
     [importModButton addTarget:self action:@selector(importModTapped) forControlEvents:UIControlEventTouchUpInside];
-    UIButton *restoreBanksButton = objc_getAssociatedObject(modsRow, "gd_button_right");
-    [restoreBanksButton addTarget:self action:@selector(restoreOriginalBanksTapped) forControlEvents:UIControlEventTouchUpInside];
+    UIButton *restoreOriginalsButton = objc_getAssociatedObject(modsRow, "gd_button_right");
+    [restoreOriginalsButton addTarget:self action:@selector(restoreOriginalsTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.stack addArrangedSubview:modsRow];
 
-    // Restore Bundles now skips any entry whose live __data is already
-    // the same byte size as its backup (see
-    // +[BundleTransplant restoreAllBackedUpBundlesWithForce:error:]) -
-    // Force Restore is the explicit escape hatch back to the old
-    // unconditional behavior, for anyone who suspects a same-size
-    // coincidence is masking a real change.
-    GDRow *bundleModsRow = gd_make_button_pair_row(
-        @"Restore Bundles", [UIColor colorWithRed:1.0 green:0.42 blue:0.42 alpha:1.0],
-        @"Force Restore Bundles", [UIColor colorWithRed:1.0 green:0.62 blue:0.32 alpha:1.0]);
-    UIButton *restoreBundlesButton = objc_getAssociatedObject(bundleModsRow, "gd_button_left");
-    [restoreBundlesButton addTarget:self action:@selector(restoreOriginalBundlesTapped) forControlEvents:UIControlEventTouchUpInside];
-    UIButton *forceRestoreBundlesButton = objc_getAssociatedObject(bundleModsRow, "gd_button_right");
-    [forceRestoreBundlesButton addTarget:self action:@selector(forceRestoreOriginalBundlesTapped) forControlEvents:UIControlEventTouchUpInside];
-    [self.stack addArrangedSubview:bundleModsRow];
-
-    // --- Mods Library ---
-    // Pure bookkeeping (ModAssetLibrary.h) - organizes picked mod files
-    // into named folders for easier management across multiple mods, on
-    // top of (not instead of) the swap-in-place flow above. Add Asset
-    // creates/targets a folder and copies files into it; the accordion
-    // below lists every folder and, expanded, its tracked entries with a
-    // per-entry Reset where that entry's own CAB makes one possible.
-    gd_add_section_header(self.stack, @"Mods Library");
-    GDRow *addAssetRow = gd_make_button_pair_row(
-        @"Add Asset", [UIColor colorWithRed:0.42 green:0.62 blue:1.0 alpha:1.0],
-        @" ", [UIColor clearColor]); // right slot deliberately blank - single action, no natural pairing
-    UIButton *addAssetButton = objc_getAssociatedObject(addAssetRow, "gd_button_left");
-    [addAssetButton addTarget:self action:@selector(addModAssetTapped) forControlEvents:UIControlEventTouchUpInside];
-    UIButton *addAssetRightSpacer = objc_getAssociatedObject(addAssetRow, "gd_button_right");
-    addAssetRightSpacer.enabled = NO;
-    addAssetRightSpacer.hidden = YES;
-    [self.stack addArrangedSubview:addAssetRow];
-
     self.modsLibraryExpandedFolders = [NSMutableSet set];
+    self.modsLibraryExpandedInfoEntries = [NSMutableSet set];
     self.modsLibraryStack = [[UIStackView alloc] init];
     self.modsLibraryStack.axis = UILayoutConstraintAxisVertical;
     self.modsLibraryStack.spacing = 4;
@@ -2863,13 +3040,12 @@ static const CGFloat kContentFadeHeight = 22;
 }
 
 // Associated-object key on a UIDocumentPickerViewController instance,
-// tagging which flow presented it: "mod" for the merged Import Mod(s)
-// button below (bank/bundle routing now happens by sniffing each file's
-// own magic bytes, not by which button was tapped - see
-// -gd_kindForFileAtURL:), or "libraryAdd:<folderName>" for the Mods
-// Library "Add Asset" picker (-addModAssetTapped) so the shared
-// didPickDocumentsAtURLs: delegate method knows which folder to import
-// into.
+// tagging which folder the picked files should be tracked into once
+// swapped: "modImport:<folderName>", used by both the main Import
+// Mod(s) button (-importModTapped prompts for the folder name first,
+// creating it if needed) and each folder row's own "Add" pill
+// (-gd_modsLibraryFolderAddTapped: already knows the folder, no prompt
+// needed) - see -documentPicker:didPickDocumentsAtURLs:.
 static void * const kGDModsPickerKindKey = (void *)&kGDModsPickerKindKey;
 
 #pragma mark Mods (import)
@@ -2878,6 +3054,36 @@ static void * const kGDModsPickerKindKey = (void *)&kGDModsPickerKindKey;
 // BankTransplant.h/BundleTransplant.h. See those files' headers for what
 // "transplant" means here.
 
+// Prompts for a folder name first (see -gd_promptForModFolderNameWithTitle:
+// message:completion: - the same compact prompt the folder rows'
+// "Add"/pencil paths reuse), so every import is tracked in the Mods
+// Library accordion as well as swapped in place, then opens the picker
+// tagged "modImport:<name>" - see -documentPicker:didPickDocumentsAtURLs:.
+// A name matching an already-existing folder just imports into that
+// folder instead of erroring, since re-using a folder for a follow-up
+// batch of files for the same mod is a completely normal thing to want.
+- (void)importModTapped {
+    __weak typeof(self) weakSelf = self;
+    [self gd_promptForModFolderNameWithTitle:@"Import Mod(s)"
+                                  actionTitle:@"Next"
+                                   completion:^(NSString *trimmedName) {
+        [weakSelf gd_beginModImportIntoFolder:trimmedName];
+    }];
+}
+
+- (void)gd_beginModImportIntoFolder:(NSString *)folderName {
+    NSError *error = nil;
+    BOOL created = [ModAssetLibrary createFolderNamed:folderName error:&error];
+    if (!created && error.code != ModAssetLibraryErrorFolderAlreadyExists) {
+        [self gd_presentModsAlertWithTitle:@"Couldn't Create Folder" message:error.localizedDescription ?: @"Unknown error."];
+        return;
+    }
+
+    [self.modsLibraryExpandedFolders addObject:folderName]; // open it right away - about to add files into it
+    [self gd_rebuildModsLibrary];
+    [self gd_presentModImportPickerForFolder:folderName];
+}
+
 // Presents the system file picker so the person can hand-pick one or
 // more modded files - banks and bundles alike, mixed in the same
 // selection if they want. There's no registered UTI for ".bank" (an
@@ -2885,7 +3091,7 @@ static void * const kGDModsPickerKindKey = (void *)&kGDModsPickerKindKey;
 // no extension at all, so this opens on the generic "any file" content
 // type rather than filtering - UIDocumentPickerViewController doesn't
 // offer filename-extension filtering separately from UTType anyway.
-- (void)importModTapped {
+- (void)gd_presentModImportPickerForFolder:(NSString *)folderName {
     UIDocumentPickerViewController *picker;
     if (@available(iOS 14.0, *)) {
         picker = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTTypeData, UTTypeItem]];
@@ -2895,7 +3101,7 @@ static void * const kGDModsPickerKindKey = (void *)&kGDModsPickerKindKey;
     }
     picker.delegate = self;
     picker.allowsMultipleSelection = YES;
-    objc_setAssociatedObject(picker, kGDModsPickerKindKey, @"mod", OBJC_ASSOCIATION_COPY);
+    objc_setAssociatedObject(picker, kGDModsPickerKindKey, [@"modImport:" stringByAppendingString:folderName], OBJC_ASSOCIATION_COPY);
 
     UIViewController *presenter = gd_key_window().rootViewController;
     if (!presenter) {
@@ -2925,20 +3131,16 @@ static void * const kGDModsPickerKindKey = (void *)&kGDModsPickerKindKey;
     return nil;
 }
 
-// Shared by both pickers this panel presents. "mod" partitions the
-// selection by -gd_kindForFileAtURL: and routes each file to whichever
-// transplant class handles it. "libraryAdd:<folder>" hands the whole
-// selection to ModAssetLibrary instead - see -addModAssetTapped.
+// Every picker this panel presents is now tagged "modImport:<folder>" -
+// see kGDModsPickerKindKey's own comment - so this just pulls the
+// folder name back out and hands the whole selection to
+// -gd_handlePickedModURLs:intoFolder:.
 - (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
     if (urls.count == 0) return;
 
     NSString *kind = objc_getAssociatedObject(controller, kGDModsPickerKindKey);
-    if ([kind hasPrefix:@"libraryAdd:"]) {
-        NSString *folderName = [kind substringFromIndex:@"libraryAdd:".length];
-        [self gd_handlePickedLibraryAssetURLs:urls intoFolder:folderName];
-    } else {
-        [self gd_handlePickedModURLs:urls];
-    }
+    NSString *folderName = [kind hasPrefix:@"modImport:"] ? [kind substringFromIndex:@"modImport:".length] : nil;
+    [self gd_handlePickedModURLs:urls intoFolder:folderName];
 }
 
 // Sniffs every picked file, splits into bank-kind/bundle-kind/
@@ -2948,8 +3150,13 @@ static void * const kGDModsPickerKindKey = (void *)&kGDModsPickerKindKey;
 // transplant calls on a background queue, then reports one combined
 // summary. Both transplant calls are genuinely independent (different
 // files, different directories) so there's no ordering requirement
-// between them.
-- (void)gd_handlePickedModURLs:(NSArray<NSURL *> *)urls {
+// between them. Once the swap side is done, the same URLs are also
+// handed to +[ModAssetLibrary importFileURLs:intoFolder:error:] so
+// they're tracked in the Mods Library accordion - a swap with no
+// matching folder to import into shouldn't be possible anymore (every
+// caller now supplies one - see kGDModsPickerKindKey), but folderName
+// is nullable here anyway as a defensive fallback.
+- (void)gd_handlePickedModURLs:(NSArray<NSURL *> *)urls intoFolder:(nullable NSString *)folderName {
     UIViewController *presenter = gd_key_window().rootViewController;
     UIAlertController *working = [UIAlertController alertControllerWithTitle:@"Swapping Files…"
                                                                        message:@"Matching modded files against stock/cached originals and swapping them in. This can take a while."
@@ -3016,8 +3223,23 @@ static void * const kGDModsPickerKindKey = (void *)&kGDModsPickerKindKey;
             [lines addObject:[NSString stringWithFormat:@"%@: not a recognized bank or bundle", name]];
         }
 
+        // Track every picked file (recognized or not) in the Mods
+        // Library folder, independent of whether the swap side actually
+        // matched anything - the accordion is bookkeeping of what was
+        // imported, not just what successfully swapped.
+        BOOL trackedInLibrary = NO;
+        if (folderName.length > 0) {
+            NSError *libraryErr = nil;
+            trackedInLibrary = [ModAssetLibrary importFileURLs:urls intoFolder:folderName error:&libraryErr];
+            if (!trackedInLibrary) {
+                ZLog(@"[Mods] couldn't track imported files in \"%@\": %@", folderName, libraryErr.localizedDescription);
+            }
+        }
+
         dispatch_async(dispatch_get_main_queue(), ^{
             void (^showResult)(void) = ^{
+                if (trackedInLibrary) [self gd_rebuildModsLibrary];
+
                 UINotificationFeedbackGenerator *haptic = [UINotificationFeedbackGenerator new];
                 [haptic notificationOccurred:(totalSwapped > 0) ? UINotificationFeedbackTypeSuccess : UINotificationFeedbackTypeWarning];
                 NSString *title = totalSwapped > 0 ? @"Files Swapped" : @"No Matches";
@@ -3036,34 +3258,75 @@ static void * const kGDModsPickerKindKey = (void *)&kGDModsPickerKindKey;
     });
 }
 
-// Restores every cached __data under Library/UnityCache/Shared that's ever
-// been swapped back to its untouched backup - see
-// +[BundleTransplant restoreAllBackedUpBundlesWithForce:error:]. Skips
-// any entry that's already the same byte size as its own backup (nothing
-// to actually undo - most often a bundle that got backed up but never
-// actually swapped, same root cause BankTransplant.h's own backup-timing
-// note describes). Backups are never deleted, safe to tap more than once.
-- (void)restoreOriginalBundlesTapped {
-    NSError *error = nil;
-    NSInteger restored = [BundleTransplant restoreAllBackedUpBundlesWithForce:NO error:&error];
+// Combined "Restore Bundles & Banks" handler - the merged counterpart
+// to the old separate Restore Bundles / Restore Originals (banks)
+// buttons (see this method's own header comment on the "Mods" section
+// build code above for why they're one button now). Runs the soft
+// (non-forcing) bundle restore - +[BundleTransplant
+// restoreAllBackedUpBundlesWithForce:NO error:] skips any entry
+// already the same byte size as its own backup, same as before - and
+// the unconditional bank restore, and reports one combined total. If
+// NEITHER restore actually did anything, shows the "No Assets to
+// Restore" alert with Force Restore as the red-text escape hatch
+// instead of a plain "nothing happened" message, per request.
+- (void)restoreOriginalsTapped {
+    NSError *bundleError = nil;
+    NSInteger bundlesRestored = [BundleTransplant restoreAllBackedUpBundlesWithForce:NO error:&bundleError];
+
+    NSError *bankError = nil;
+    NSInteger banksRestored = [BankTransplant restoreAllBackedUpBanksWithError:&bankError];
 
     UINotificationFeedbackGenerator *haptic = [UINotificationFeedbackGenerator new];
-    if (restored < 0) {
+
+    if (bundlesRestored < 0 || banksRestored < 0) {
         [haptic notificationOccurred:UINotificationFeedbackTypeError];
-        [self gd_presentModsAlertWithTitle:@"Restore Failed"
-                                    message:error.localizedDescription ?: @"Unknown error."];
+        NSString *message = bundlesRestored < 0
+            ? (bundleError.localizedDescription ?: @"Unknown error.")
+            : (bankError.localizedDescription ?: @"Unknown error.");
+        [self gd_presentModsAlertWithTitle:@"Restore Failed" message:message];
+        return;
+    }
+
+    NSInteger totalRestored = bundlesRestored + banksRestored;
+    if (totalRestored == 0) {
+        [haptic notificationOccurred:UINotificationFeedbackTypeWarning];
+        [self gd_presentNoAssetsToRestoreAlert];
         return;
     }
 
     [haptic notificationOccurred:UINotificationFeedbackTypeSuccess];
-    NSString *message = restored == 0
-        ? @"No backed-up bundles needed restoring - either nothing's been swapped, or every backup already matches its live file's size. Use Force Restore to override."
-        : [NSString stringWithFormat:@"Restored %ld bundle%@ to its cached stock state. Restart the game for it to take effect.",
-              (long)restored, restored == 1 ? @"" : @"s"];
-    [self gd_presentModsAlertWithTitle:@"Restore Bundles" message:message];
+    NSString *message = [NSString stringWithFormat:
+        @"Restored %ld bundle%@ and %ld bank%@ to their original state. Restart the game for it to take effect.",
+        (long)bundlesRestored, bundlesRestored == 1 ? @"" : @"s",
+        (long)banksRestored, banksRestored == 1 ? @"" : @"s"];
+    [self gd_presentModsAlertWithTitle:@"Restore Bundles & Banks" message:message];
 }
 
-// Same as the above, but unconditional - see
+// Shown when -restoreOriginalsTapped's soft pass restores nothing at
+// all - either nothing's ever been swapped, or every bundle backup
+// already matches its live file's size (banks have no such skip - if a
+// bank backup exists and didn't restore, something else is wrong and
+// force wouldn't help there anyway, so Force Restore only re-runs the
+// bundle side). Force Restore is styled destructive (native red action
+// text), per request.
+- (void)gd_presentNoAssetsToRestoreAlert {
+    UIViewController *presenter = gd_key_window().rootViewController;
+    if (!presenter) {
+        ZLog(@"[Mods] No Assets to Restore (no root view controller to present from)");
+        return;
+    }
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"No Assets to Restore"
+        message:@"Nothing needed restoring - either nothing's been swapped, or every bundle backup already matches its live file's size."
+        preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleCancel handler:nil]];
+    __weak typeof(self) weakSelf = self;
+    [alert addAction:[UIAlertAction actionWithTitle:@"Force Restore" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
+        [weakSelf forceRestoreOriginalBundlesTapped];
+    }]];
+    [presenter presentViewController:alert animated:YES completion:nil];
+}
+
+// Same restore as the soft pass above, but unconditional - see
 // +[BundleTransplant restoreAllBackedUpBundlesWithForce:error:]'s force:
 // parameter. The explicit escape hatch for a same-size coincidence
 // masking a real change the byte check can't see.
@@ -3087,30 +3350,6 @@ static void * const kGDModsPickerKindKey = (void *)&kGDModsPickerKindKey;
     [self gd_presentModsAlertWithTitle:@"Force Restore Bundles" message:message];
 }
 
-// Restores every stock bank under Assets/Sound/FMODBuilds/Mobile that's
-// ever been swapped back to its untouched backup - see
-// +[BankTransplant restoreAllBackedUpBanksWithError:]. Backups are never
-// deleted by this, so it's safe to tap more than once.
-- (void)restoreOriginalBanksTapped {
-    NSError *error = nil;
-    NSInteger restored = [BankTransplant restoreAllBackedUpBanksWithError:&error];
-
-    UINotificationFeedbackGenerator *haptic = [UINotificationFeedbackGenerator new];
-    if (restored < 0) {
-        [haptic notificationOccurred:UINotificationFeedbackTypeError];
-        [self gd_presentModsAlertWithTitle:@"Restore Failed"
-                                    message:error.localizedDescription ?: @"Unknown error."];
-        return;
-    }
-
-    [haptic notificationOccurred:UINotificationFeedbackTypeSuccess];
-    NSString *message = restored == 0
-        ? @"No backed-up banks found - nothing to restore."
-        : [NSString stringWithFormat:@"Restored %ld bank%@ to its stock state. Restart the game for it to take effect.",
-              (long)restored, restored == 1 ? @"" : @"s"];
-    [self gd_presentModsAlertWithTitle:@"Restore Originals" message:message];
-}
-
 - (void)gd_presentModsAlertWithTitle:(NSString *)title message:(NSString *)message {
     UIViewController *presenter = gd_key_window().rootViewController;
     if (!presenter) {
@@ -3124,79 +3363,154 @@ static void * const kGDModsPickerKindKey = (void *)&kGDModsPickerKindKey;
     [presenter presentViewController:alert animated:YES completion:nil];
 }
 
+// Handler for every gesture gd_attach_hold_to_confirm attaches (folder
+// X icons and entry X icons alike). minimumPressDuration:0 so -Began
+// fires on touch-down and -gd_holdConfirmTick: owns the real 1.5s
+// timing per-frame - see that method and gd_attach_hold_to_confirm's
+// own header comment for why (same shape as -handleSyslogButtonLongPress:).
+- (void)gd_handleHoldToConfirmGesture:(UILongPressGestureRecognizer *)gesture {
+    UIButton *button = (UIButton *)gesture.view;
+    switch (gesture.state) {
+        case UIGestureRecognizerStateBegan: {
+            // A second finger landing on a different X while one hold is
+            // already in flight shouldn't hijack it - only the first
+            // touch-down starts a hold; every button not already mid-
+            // hold reports Began as normal touch handling, but a stray
+            // interruption here can't happen without another button
+            // stealing the run loop tick, so this is mostly defensive.
+            if (self.holdConfirmActiveButton && self.holdConfirmActiveButton != button) break;
+
+            self.holdConfirmActiveButton = button;
+            self.holdConfirmStartTime = CACurrentMediaTime();
+            self.holdConfirmTriggered = NO;
+
+            [self.holdConfirmDisplayLink invalidate];
+            self.holdConfirmDisplayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(gd_holdConfirmTick:)];
+            [self.holdConfirmDisplayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+            break;
+        }
+        case UIGestureRecognizerStateEnded:
+        case UIGestureRecognizerStateCancelled:
+        case UIGestureRecognizerStateFailed: {
+            if (self.holdConfirmActiveButton != button) break;
+            [self.holdConfirmDisplayLink invalidate];
+            self.holdConfirmDisplayLink = nil;
+            if (!self.holdConfirmTriggered) {
+                // Released before the 1.5s mark - snap the icon back to
+                // its resting size/color instead of leaving it stranded
+                // mid-animation.
+                [self gd_resetHoldConfirmButton:button animated:YES];
+            }
+            self.holdConfirmActiveButton = nil;
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+// Drives the per-frame "expand then slowly redden" animation and fires
+// the button's completion block once the hold reaches
+// kGDHoldConfirmDuration. Scale ramps up over the hold's first 40% (a
+// quick, obvious "this is registering" pop) and then holds there while
+// color alone keeps interpolating toward red across the FULL duration,
+// per request ("expanding in size, then slowly turning red until the
+// time is up").
+- (void)gd_holdConfirmTick:(CADisplayLink *)link {
+    static const NSTimeInterval kGDHoldConfirmDuration = 1.5;
+    UIButton *button = self.holdConfirmActiveButton;
+    if (!button) {
+        [link invalidate];
+        return;
+    }
+
+    NSTimeInterval elapsed = CACurrentMediaTime() - self.holdConfirmStartTime;
+    CGFloat pct = (CGFloat)MIN(1.0, elapsed / kGDHoldConfirmDuration);
+    CGFloat scalePct = (CGFloat)MIN(1.0, elapsed / (kGDHoldConfirmDuration * 0.4));
+
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES]; // per-tick updates ARE the animation, same as the Syslog fill's own tick
+    button.transform = CGAffineTransformMakeScale(1.0 + 0.4 * scalePct, 1.0 + 0.4 * scalePct);
+    [CATransaction commit];
+
+    UIColor *baseTint = objc_getAssociatedObject(button, kGDHoldConfirmBaseTintKey);
+    UIImage *icon = objc_getAssociatedObject(button, kGDHoldConfirmIconKey);
+    UIColor *red = [UIColor colorWithRed:1.0 green:0.15 blue:0.15 alpha:1.0];
+    gd_style_icon_button_as_native_glass(button, icon, gd_color_lerp(baseTint ?: red, red, pct));
+
+    if (pct >= 1.0 && !self.holdConfirmTriggered) {
+        self.holdConfirmTriggered = YES;
+        [link invalidate];
+        self.holdConfirmDisplayLink = nil;
+
+        void (^completion)(void) = objc_getAssociatedObject(button, kGDHoldConfirmBlockKey);
+        [self gd_resetHoldConfirmButton:button animated:NO];
+        self.holdConfirmActiveButton = nil;
+
+        UINotificationFeedbackGenerator *haptic = [UINotificationFeedbackGenerator new];
+        [haptic notificationOccurred:UINotificationFeedbackTypeWarning];
+
+        if (completion) completion();
+    }
+}
+
+- (void)gd_resetHoldConfirmButton:(UIButton *)button animated:(BOOL)animated {
+    UIColor *baseTint = objc_getAssociatedObject(button, kGDHoldConfirmBaseTintKey);
+    UIImage *icon = objc_getAssociatedObject(button, kGDHoldConfirmIconKey);
+    void (^apply)(void) = ^{
+        button.transform = CGAffineTransformIdentity;
+        gd_style_icon_button_as_native_glass(button, icon, baseTint);
+    };
+    if (animated) {
+        [UIView animateWithDuration:0.18 animations:apply];
+    } else {
+        apply();
+    }
+}
+
 #pragma mark Mods Library
 
-// Prompts for a folder name (UIAlertController with a text field - same
-// mechanism as any other one-line text prompt in this panel), creates
-// it via +[ModAssetLibrary createFolderNamed:error:], then immediately
-// opens the multi-select file picker tagged "libraryAdd:<name>" so
-// -documentPicker:didPickDocumentsAtURLs: routes the selection into
-// that folder. Cancel at the name prompt just backs out - no folder is
-// created, no picker is shown.
-- (void)addModAssetTapped {
+// Compact one-field name prompt, reused by the main Import Mod(s) flow
+// and each folder row's own Rename button. Deliberately terser than
+// the old "New Mod Folder" alert (no descriptive message under the
+// title) - on a small phone, title + message + text field + two
+// buttons could push the alert tall enough that the keyboard covered
+// the field itself before the person had even typed anything.
+// completion only runs with a validated (non-empty, trimmed) name;
+// Cancel or an empty submission just backs out silently.
+- (void)gd_promptForModFolderNameWithTitle:(NSString *)title
+                                actionTitle:(NSString *)actionTitle
+                                 completion:(void (^)(NSString *trimmedName))completion {
     UIViewController *presenter = gd_key_window().rootViewController;
     if (!presenter) return;
 
-    UIAlertController *prompt = [UIAlertController alertControllerWithTitle:@"New Mod Folder"
-                                                                       message:@"Files you add will be tracked under this name."
-                                                                preferredStyle:UIAlertControllerStyleAlert];
+    UIAlertController *prompt = [UIAlertController alertControllerWithTitle:title
+                                                                      message:nil
+                                                               preferredStyle:UIAlertControllerStyleAlert];
     [prompt addTextFieldWithConfigurationHandler:^(UITextField *field) {
         field.placeholder = @"Folder name";
         field.autocapitalizationType = UITextAutocapitalizationTypeNone;
         field.autocorrectionType = UITextAutocorrectionTypeNo;
     }];
     [prompt addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
-    __weak typeof(self) weakSelf = self;
-    [prompt addAction:[UIAlertAction actionWithTitle:@"Create" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        NSString *name = prompt.textFields.firstObject.text ?: @"";
-        [weakSelf gd_createModFolderNamed:name];
+    [prompt addAction:[UIAlertAction actionWithTitle:actionTitle style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        NSString *trimmed = [(prompt.textFields.firstObject.text ?: @"")
+            stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (trimmed.length == 0) return;
+        completion(trimmed);
     }]];
     [presenter presentViewController:prompt animated:YES completion:nil];
-}
-
-- (void)gd_createModFolderNamed:(NSString *)name {
-    NSError *error = nil;
-    if (![ModAssetLibrary createFolderNamed:name error:&error]) {
-        [self gd_presentModsAlertWithTitle:@"Couldn't Create Folder" message:error.localizedDescription ?: @"Unknown error."];
-        return;
-    }
-
-    NSString *trimmed = [name stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    [self.modsLibraryExpandedFolders addObject:trimmed]; // open it right away - about to add files into it
-    [self gd_rebuildModsLibrary];
-
-    UIDocumentPickerViewController *picker;
-    if (@available(iOS 14.0, *)) {
-        picker = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTTypeData, UTTypeItem]];
-    } else {
-        picker = [[UIDocumentPickerViewController alloc] initWithDocumentTypes:@[@"public.data", @"public.item"]
-                                                                          inMode:UIDocumentPickerModeImport];
-    }
-    picker.delegate = self;
-    picker.allowsMultipleSelection = YES;
-    objc_setAssociatedObject(picker, kGDModsPickerKindKey, [@"libraryAdd:" stringByAppendingString:trimmed], OBJC_ASSOCIATION_COPY);
-
-    UIViewController *presenter = gd_key_window().rootViewController;
-    if (presenter) [presenter presentViewController:picker animated:YES completion:nil];
-}
-
-- (void)gd_handlePickedLibraryAssetURLs:(NSArray<NSURL *> *)urls intoFolder:(NSString *)folderName {
-    NSError *error = nil;
-    BOOL ok = [ModAssetLibrary importFileURLs:urls intoFolder:folderName error:&error];
-
-    UINotificationFeedbackGenerator *haptic = [UINotificationFeedbackGenerator new];
-    [haptic notificationOccurred:ok ? UINotificationFeedbackTypeSuccess : UINotificationFeedbackTypeError];
-    if (!ok) {
-        [self gd_presentModsAlertWithTitle:@"Add Asset Failed" message:error.localizedDescription ?: @"Unknown error."];
-    }
-    [self gd_rebuildModsLibrary]; // rebuild either way - a partial import still added something worth showing
 }
 
 // Full rebuild from +[ModAssetLibrary folderNames]/+entriesInFolder:error: -
 // same "just throw the whole stack away and re-render" approach as
 // -gd_rebuildSyslogBlacklistEntries, for the same reason (short lists,
-// trivial ordering). modsLibraryExpandedFolders is what survives the
-// rebuild so expand state doesn't reset on every add/reset action.
+// trivial ordering). modsLibraryExpandedFolders/modsLibraryExpandedInfoEntries
+// are what survive the rebuild so expand state doesn't reset on every
+// add/rename/delete. Entries are sorted bundles-first (entry.cab !=
+// nil), then A-Z within each group, per request - +entriesInFolder:
+// itself returns oldest-added-first, so this is purely a display-order
+// sort, not a manifest rewrite.
 - (void)gd_rebuildModsLibrary {
     if (!self.modsLibraryStack) return;
 
@@ -3215,10 +3529,24 @@ static void * const kGDModsPickerKindKey = (void *)&kGDModsPickerKindKey;
         return;
     }
 
+    UIImageSymbolConfiguration *xSymbolConfig = [UIImageSymbolConfiguration configurationWithPointSize:6 weight:UIImageSymbolWeightSemibold];
+    UIImage *xImage = [UIImage systemImageNamed:@"xmark" withConfiguration:xSymbolConfig];
+    UIColor *xTint = [UIColor colorWithWhite:1 alpha:0.55];
+    __weak typeof(self) weakSelf = self;
+
     for (NSString *folderName in folders) {
         BOOL expanded = [self.modsLibraryExpandedFolders containsObject:folderName];
-        [self.modsLibraryStack addArrangedSubview:
-            gd_make_mods_folder_row(folderName, expanded, self, @selector(gd_modsLibraryFolderRowTapped:))];
+        UIView *folderRow = gd_make_mods_folder_row(folderName, expanded, self,
+            @selector(gd_modsLibraryFolderRowTapped:),
+            @selector(gd_modsLibraryFolderAddTapped:),
+            @selector(gd_modsLibraryFolderRenameTapped:));
+
+        UIButton *folderDeleteButton = objc_getAssociatedObject(folderRow, "gd_button_delete");
+        NSString *folderNameForDelete = [folderName copy]; // own copy for the block below, independent of the loop variable
+        gd_attach_hold_to_confirm(folderDeleteButton, xImage, xTint, self, ^{
+            [weakSelf gd_deleteModFolderConfirmed:folderNameForDelete];
+        });
+        [self.modsLibraryStack addArrangedSubview:folderRow];
 
         if (!expanded) continue;
 
@@ -3232,10 +3560,31 @@ static void * const kGDModsPickerKindKey = (void *)&kGDModsPickerKindKey;
             [self.modsLibraryStack addArrangedSubview:emptyFolder];
             continue;
         }
-        for (ModAssetLibraryEntry *entry in entries) {
-            UIView *row = gd_make_mods_entry_row(entry, self, @selector(gd_modsLibraryEntryResetTapped:));
-            objc_setAssociatedObject(row, "gd_modsEntryFolder", folderName, OBJC_ASSOCIATION_COPY);
-            [self.modsLibraryStack addArrangedSubview:row];
+
+        // Bundles (parseable Unity bundle - entry.cab != nil) before
+        // bank/other files, A-Z within each group.
+        NSArray<ModAssetLibraryEntry *> *sortedEntries =
+            [entries sortedArrayUsingComparator:^NSComparisonResult(ModAssetLibraryEntry *a, ModAssetLibraryEntry *b) {
+                BOOL aIsBundle = (a.cab != nil);
+                BOOL bIsBundle = (b.cab != nil);
+                if (aIsBundle != bIsBundle) return aIsBundle ? NSOrderedAscending : NSOrderedDescending;
+                return [a.fileName localizedStandardCompare:b.fileName];
+            }];
+
+        for (ModAssetLibraryEntry *entry in sortedEntries) {
+            UIView *entryRow = gd_make_mods_entry_row(entry, self, @selector(gd_modsLibraryEntryInfoTapped:));
+
+            UIButton *entryDeleteButton = objc_getAssociatedObject(entryRow, "gd_button_delete");
+            ModAssetLibraryEntry *entryForDelete = entry;
+            NSString *folderNameForEntry = [folderName copy];
+            gd_attach_hold_to_confirm(entryDeleteButton, xImage, xTint, self, ^{
+                [weakSelf gd_deleteModEntryConfirmed:entryForDelete inFolder:folderNameForEntry];
+            });
+            [self.modsLibraryStack addArrangedSubview:entryRow];
+
+            if ([self.modsLibraryExpandedInfoEntries containsObject:entry.path]) {
+                [self.modsLibraryStack addArrangedSubview:gd_make_mods_entry_info_panel(entry)];
+            }
         }
     }
 }
@@ -3254,39 +3603,128 @@ static void * const kGDModsPickerKindKey = (void *)&kGDModsPickerKindKey;
     [self gd_rebuildModsLibrary];
 }
 
-// Wired to an entry row's Reset button (see gd_make_mods_entry_row) -
-// resets just THIS entry's own CAB via
-// +[BundleTransplant restoreBackedUpBundlesForCAB:force:error:], not
-// the whole folder and not the whole cache. force:YES - an explicit
-// per-entry tap is a deliberate single-item action, not something the
-// byte-size skip (see restoreOriginalBundlesTapped) should second-guess.
-// Entries with no CAB (not a parseable Unity bundle - most likely a
-// bank file tracked in here) have no reset button at all; this should
-// never fire for one, but bails cleanly if it somehow does.
-- (void)gd_modsLibraryEntryResetTapped:(UIButton *)sender {
-    ModAssetLibraryEntry *entry = objc_getAssociatedObject(sender, "gd_modsEntry");
-    if (!entry.cab) {
-        [self gd_presentModsAlertWithTitle:@"Can't Reset"
-                                    message:@"This entry isn't a Unity bundle, so there's no per-file reset for it - use Restore Originals for bank files."];
+// Wired to a folder row's "Add" pill - the folder already exists, so
+// this skips straight to the picker (tagged "modImport:<folder>",
+// same as the main Import Mod(s) flow - see
+// -gd_presentModImportPickerForFolder:) rather than prompting for a
+// name again.
+- (void)gd_modsLibraryFolderAddTapped:(UIButton *)sender {
+    NSString *folderName = objc_getAssociatedObject(sender, "gd_modsFolderName");
+    if (!folderName) return;
+    [self gd_presentModImportPickerForFolder:folderName];
+}
+
+// Wired to a folder row's pencil button - prompts for a new name (same
+// compact prompt as the main Import Mod(s) flow) and renames the
+// folder's directory in place via
+// +[ModAssetLibrary renameFolderNamed:to:error:].
+- (void)gd_modsLibraryFolderRenameTapped:(UIButton *)sender {
+    NSString *folderName = objc_getAssociatedObject(sender, "gd_modsFolderName");
+    if (!folderName) return;
+    __weak typeof(self) weakSelf = self;
+    [self gd_promptForModFolderNameWithTitle:@"Rename Folder"
+                                  actionTitle:@"Rename"
+                                   completion:^(NSString *trimmedName) {
+        [weakSelf gd_renameModFolderNamed:folderName to:trimmedName];
+    }];
+}
+
+- (void)gd_renameModFolderNamed:(NSString *)folderName to:(NSString *)newName {
+    NSError *error = nil;
+    if (![ModAssetLibrary renameFolderNamed:folderName to:newName error:&error]) {
+        [self gd_presentModsAlertWithTitle:@"Couldn't Rename Folder" message:error.localizedDescription ?: @"Unknown error."];
         return;
     }
+    if ([self.modsLibraryExpandedFolders containsObject:folderName]) {
+        [self.modsLibraryExpandedFolders removeObject:folderName];
+        [self.modsLibraryExpandedFolders addObject:newName];
+    }
+    [self gd_rebuildModsLibrary];
+}
+
+// Wired to an entry row's "Info" pill (see gd_make_mods_entry_row) -
+// toggles that one entry's dropdown (filepath/CAB/size, see
+// gd_make_mods_entry_info_panel) open or closed, keyed by the entry's
+// own on-disk path since that's stable across a rebuild the way the
+// entry object itself isn't (a fresh array of entries is read back
+// from the manifest on every -gd_rebuildModsLibrary call).
+- (void)gd_modsLibraryEntryInfoTapped:(UIButton *)sender {
+    ModAssetLibraryEntry *entry = objc_getAssociatedObject(sender, "gd_modsEntry");
+    if (!entry) return;
+    if ([self.modsLibraryExpandedInfoEntries containsObject:entry.path]) {
+        [self.modsLibraryExpandedInfoEntries removeObject:entry.path];
+    } else {
+        [self.modsLibraryExpandedInfoEntries addObject:entry.path];
+    }
+    [self gd_rebuildModsLibrary];
+}
+
+// Restores one tracked entry's swapped-in file back to stock before
+// it's forgotten (by a per-entry delete OR as part of a whole-folder
+// delete - see -gd_deleteModEntryConfirmed:inFolder:/
+// -gd_deleteModFolderConfirmed: below). Bundles go through their own
+// CAB via +[BundleTransplant restoreBackedUpBundlesForCAB:force:error:]
+// (force:YES - a deliberate delete is a deliberate single-item action,
+// same reasoning the old per-entry Reset button used); anything
+// without a CAB is treated as a bank and restored by filename via
+// +[BankTransplant restoreBackedUpBankNamed:error:]. Best-effort only:
+// a tracked file that was never actually swapped in (no backup exists)
+// just restores 0, which isn't a failure worth surfacing here - the
+// delete itself should never be blocked by that.
+- (void)gd_restoreModEntry:(ModAssetLibraryEntry *)entry {
+    NSError *error = nil;
+    if (entry.cab) {
+        [BundleTransplant restoreBackedUpBundlesForCAB:entry.cab force:YES error:&error];
+    } else {
+        [BankTransplant restoreBackedUpBankNamed:entry.fileName error:&error];
+    }
+    if (error) {
+        ZLog(@"[Mods] couldn't restore %@ before removing it from the library: %@", entry.fileName, error.localizedDescription);
+    }
+}
+
+// Fires once an entry row's X has been held for the full 1.5s (see
+// gd_attach_hold_to_confirm) - restores that one file (see
+// -gd_restoreModEntry:) and forgets it via
+// +[ModAssetLibrary removeEntry:fromFolder:error:].
+- (void)gd_deleteModEntryConfirmed:(ModAssetLibraryEntry *)entry inFolder:(NSString *)folderName {
+    [self gd_restoreModEntry:entry];
 
     NSError *error = nil;
-    NSInteger restored = [BundleTransplant restoreBackedUpBundlesForCAB:entry.cab force:YES error:&error];
+    BOOL ok = [ModAssetLibrary removeEntry:entry fromFolder:folderName error:&error];
+    [self.modsLibraryExpandedInfoEntries removeObject:entry.path];
 
     UINotificationFeedbackGenerator *haptic = [UINotificationFeedbackGenerator new];
-    if (restored < 0) {
-        [haptic notificationOccurred:UINotificationFeedbackTypeError];
-        [self gd_presentModsAlertWithTitle:@"Reset Failed" message:error.localizedDescription ?: @"Unknown error."];
-        return;
+    [haptic notificationOccurred:ok ? UINotificationFeedbackTypeSuccess : UINotificationFeedbackTypeError];
+    if (!ok) {
+        [self gd_presentModsAlertWithTitle:@"Couldn't Remove File" message:error.localizedDescription ?: @"Unknown error."];
+    }
+    [self gd_rebuildModsLibrary];
+}
+
+// Fires once a folder row's X has been held for the full 1.5s -
+// restores every entry still tracked in the folder (see
+// -gd_restoreModEntry:), then deletes the folder itself (manifest and
+// every file under it) via +[ModAssetLibrary deleteFolderNamed:error:].
+- (void)gd_deleteModFolderConfirmed:(NSString *)folderName {
+    NSError *entriesErr = nil;
+    NSArray<ModAssetLibraryEntry *> *entries = [ModAssetLibrary entriesInFolder:folderName error:&entriesErr] ?: @[];
+    for (ModAssetLibraryEntry *entry in entries) {
+        [self gd_restoreModEntry:entry];
     }
 
-    [haptic notificationOccurred:restored > 0 ? UINotificationFeedbackTypeSuccess : UINotificationFeedbackTypeWarning];
-    NSString *message = restored == 0
-        ? [NSString stringWithFormat:@"No cached match for %@ - it may never have been swapped in this cache.", entry.fileName]
-        : [NSString stringWithFormat:@"Restored %ld cached copy%@ of %@ to stock. Restart the game for it to take effect.",
-              (long)restored, restored == 1 ? @"" : @"ies", entry.fileName];
-    [self gd_presentModsAlertWithTitle:@"Reset" message:message];
+    NSError *deleteErr = nil;
+    BOOL ok = [ModAssetLibrary deleteFolderNamed:folderName error:&deleteErr];
+
+    [self.modsLibraryExpandedFolders removeObject:folderName];
+    for (ModAssetLibraryEntry *entry in entries) [self.modsLibraryExpandedInfoEntries removeObject:entry.path];
+
+    UINotificationFeedbackGenerator *haptic = [UINotificationFeedbackGenerator new];
+    [haptic notificationOccurred:ok ? UINotificationFeedbackTypeSuccess : UINotificationFeedbackTypeError];
+    if (!ok) {
+        [self gd_presentModsAlertWithTitle:@"Couldn't Delete Folder" message:deleteErr.localizedDescription ?: @"Unknown error."];
+    }
+    [self gd_rebuildModsLibrary];
 }
 
 // Recomputes syslogHandleHeight from the label's current text ("SYSLOG"
