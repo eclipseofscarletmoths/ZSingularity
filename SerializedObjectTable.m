@@ -280,12 +280,18 @@ static BOOL sot_skip_serialized_type(NSData *nodeData, size_t *pos, BOOL enableT
 // pre-located table offset to validate against - *outTableStart is
 // simply wherever this walk actually lands, since every field position
 // here is derived from the one before it (a genuine parse, not a
-// heuristic - see .h). Returns NO on any parse failure (out-params left
-// untouched); the caller is responsible for confirming the landing
-// position actually decodes as a plausible table before trusting it -
-// see sot_decode_table_at, called right after this in
-// -tableForSerializedFileNodeData:.
-static BOOL sot_walk_types_array(NSData *nodeData, const SOTHeader *header, size_t *outTableStart, NSDictionary<NSNumber *, NSNumber *> **outMap) {
+// heuristic - see .h). *outObjectCount is m_ObjectCount itself, handed
+// back so the caller can require the table it eventually decodes to
+// contain exactly that many entries - a much stronger check than "at
+// least kMinConsecutiveValidEntries decoded cleanly," which a handful
+// of coincidentally-plausible bytes can also satisfy (see the false
+// positive this whole PRIMARY/FALLBACK split was built to route around
+// - -tableForSerializedFileNodeData:'s comment has the story). Returns
+// NO on any parse failure (out-params left untouched); the caller is
+// responsible for confirming the landing position actually decodes as
+// a plausible table before trusting it - see sot_decode_table_at,
+// called right after this in -tableForSerializedFileNodeData:.
+static BOOL sot_walk_types_array(NSData *nodeData, const SOTHeader *header, size_t *outTableStart, NSDictionary<NSNumber *, NSNumber *> **outMap, int32_t *outObjectCount) {
     size_t pos = header->headerEnd;
 
     if (!sot_cur_cstring(nodeData, &pos)) return NO; // m_UnityVersion - version >= 7
@@ -310,10 +316,11 @@ static BOOL sot_walk_types_array(NSData *nodeData, const SOTHeader *header, size
 
     int32_t objectCount;
     if (!sot_cur_i32(nodeData, &pos, &objectCount)) return NO; // m_ObjectCount, immediately precedes the table itself
-    (void)objectCount;
+    if (objectCount < 0) return NO;
 
     if (outTableStart) *outTableStart = pos;
     if (outMap) *outMap = map;
+    if (outObjectCount) *outObjectCount = objectCount;
     return YES;
 }
 
@@ -385,10 +392,54 @@ static BOOL sot_locate_count_field(NSData *nodeData, NSUInteger firstEntryOffset
 - (NSArray<SerializedObject *> *)objects { return _objects; }
 - (BOOL)typesResolved { return _typesResolved; }
 
+// Bounded local search around `center` (the walk's landing position) for
+// an offset that decodes to EXACTLY `expectedCount` entries - tried in
+// order of increasing distance from center (0, +1, -1, +2, -2, ...) so
+// the closest match wins. Requiring an exact count match, not just
+// sot_decode_table_at's kMinConsecutiveValidEntries plausibility bar, is
+// what makes a small window safe to search at all: a handful of
+// coincidentally-valid-looking bytes is a realistic risk (that's the
+// false positive this file's whole PRIMARY/FALLBACK design exists to
+// route around), but a coincidental run that ALSO happens to be exactly
+// expectedCount entries long, ending inside the search window, is not.
+// Exists because the walk's landing position has been observed to drift
+// by a byte or two, run to run, on the same real device/bundle (see
+// -tableForSerializedFileNodeData:'s doc) - most likely a small content-
+// dependent field earlier in the walk (m_UnityVersion's length is the
+// prime suspect, being the one variable-length field read before
+// anything else) shifting by a byte or two between what this project
+// has on hand to test against and what's actually on-device, rather
+// than a fixed offset bug. A full blind sot_scan_for_table would also
+// eventually find the real table, but across a much larger window with
+// a much weaker (count-blind) acceptance bar - worth exhausting a tight,
+// strongly-validated search first.
+static const size_t kNearbySearchWindow = 512;
+
+static NSArray<SerializedObject *> *sot_decode_table_near(NSData *nodeData, const SOTHeader *header, size_t center, size_t searchStart, size_t searchEnd, int32_t expectedCount, size_t *outTableStart) {
+    for (size_t delta = 1; delta <= kNearbySearchWindow; delta++) {
+        size_t candidates[2];
+        int candidateCount = 0;
+        candidates[candidateCount++] = center + delta; // try forward first
+        if (delta <= center) candidates[candidateCount++] = center - delta; // then backward, if it wouldn't underflow
+
+        for (int i = 0; i < candidateCount; i++) {
+            size_t candidate = candidates[i];
+            if (candidate < searchStart) continue;
+            NSArray<SerializedObject *> *objects = sot_decode_table_at(nodeData, header, candidate, searchEnd);
+            if (objects && objects.count == (NSUInteger)expectedCount) {
+                if (outTableStart) *outTableStart = candidate;
+                return objects;
+            }
+        }
+    }
+    return nil;
+}
+
 + (nullable instancetype)tableForSerializedFileNodeData:(NSData *)nodeData error:(NSError **)error {
     SOTHeader header;
     if (!sot_parse_header(nodeData, &header, error)) return nil;
 
+    size_t searchStart = header.headerEnd;
     size_t searchEnd = (size_t)MIN((uint64_t)nodeData.length, header.dataOffset);
 
     // PRIMARY: sot_walk_types_array is a genuine structural parse - every
@@ -408,6 +459,13 @@ static BOOL sot_locate_count_field(NSData *nodeData, NSUInteger firstEntryOffset
     // false start, the walk's genuinely-correct position no longer
     // matched it, and the whole map was discarded - every object's
     // classIDResolved came back NO despite the walk having parsed fine.
+    //
+    // On-device, the walk's landing position has also been observed to
+    // land a few bytes off (and non-deterministically run to run, on
+    // what's presumably the same downloaded bundle content) rather than
+    // matching exactly - see sot_decode_table_near above for the most
+    // likely cause and why a tight, count-validated local search is
+    // tried before giving up to the full blind scan.
     size_t tableStart = 0;
     NSArray<SerializedObject *> *objects = nil;
     NSDictionary<NSNumber *, NSNumber *> *typeMap = nil;
@@ -415,23 +473,36 @@ static BOOL sot_locate_count_field(NSData *nodeData, NSUInteger firstEntryOffset
 
     size_t walkTableStart;
     NSDictionary<NSNumber *, NSNumber *> *walkMap;
-    if (sot_walk_types_array(nodeData, &header, &walkTableStart, &walkMap)) {
+    int32_t walkObjectCount;
+    if (sot_walk_types_array(nodeData, &header, &walkTableStart, &walkMap, &walkObjectCount)) {
         NSArray<SerializedObject *> *walkObjects = sot_decode_table_at(nodeData, &header, walkTableStart, searchEnd);
-        if (walkObjects) {
+        if (walkObjects && walkObjects.count == (NSUInteger)walkObjectCount) {
             objects = walkObjects;
             tableStart = walkTableStart;
             typeMap = walkMap;
             typesResolved = YES;
         } else {
-            ZLog(@"[SerializedObjectTable] m_Types walk parsed cleanly but landed at offset %lu, which doesn't decode as a plausible object table - falling back to byte-scan",
-                 (unsigned long)walkTableStart);
+            ZLog(@"[SerializedObjectTable] m_Types walk parsed cleanly and expects m_ObjectCount=%d, but landing offset %lu decoded %lu entries - trying a nearby window before falling back to byte-scan",
+                 walkObjectCount, (unsigned long)walkTableStart, (unsigned long)walkObjects.count);
+
+            size_t nearTableStart;
+            NSArray<SerializedObject *> *nearObjects = sot_decode_table_near(nodeData, &header, walkTableStart, searchStart, searchEnd, walkObjectCount, &nearTableStart);
+            if (nearObjects) {
+                ZLog(@"[SerializedObjectTable] found the real table %ld bytes from the walk's landing offset (at %lu) - using it, classID resolution still available",
+                     (long)((NSInteger)nearTableStart - (NSInteger)walkTableStart), (unsigned long)nearTableStart);
+                objects = nearObjects;
+                tableStart = nearTableStart;
+                typeMap = walkMap;
+                typesResolved = YES;
+            }
         }
     }
 
     // FALLBACK: only reached when the structural walk above either failed
-    // outright (unexpected field shape this project hasn't seen yet) or
-    // landed somewhere that isn't table-shaped. No classID resolution is
-    // available this way, same tradeoff as before.
+    // outright (unexpected field shape this project hasn't seen yet), or
+    // landed somewhere that isn't table-shaped and no nearby offset
+    // decoded to exactly m_ObjectCount entries either. No classID
+    // resolution is available this way, same tradeoff as before.
     if (!objects) {
         objects = sot_scan_for_table(nodeData, &header, &tableStart, error);
         if (!objects) return nil;
