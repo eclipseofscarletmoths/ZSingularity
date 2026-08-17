@@ -187,7 +187,8 @@
 #import "ZSyslogController.h" // FPS120Controller + every non-UI engine script this file used to own directly - see that file's header
 #import "ZTweakLog.h"
 #import "BankTransplant.h"
-#import "BundleTransplant.h"
+#import "BundleTransplant.h" // still used for +unityCacheSharedDirectory and legacy whole-file backup restore - see -gd_handlePickedModURLs:intoFolder: for why the whole-file swap call itself is gone
+#import "TextureAtlasTransplant.h" // object-level diff/transplant - see -gd_handlePickedModURLs:intoFolder:, this is now the only bundle-mod entry point
 #import "ModAssetLibrary.h"
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h> // UTType-based UIDocumentPickerViewController init, for the Mods section's "Import Bank Mod"/"Import Bundle Mod(s)" buttons
 #import "GDEmbeddedFont.h" // kExcelsiorSansTTF / kExcelsiorSansTTFLength - see that file's header
@@ -3657,22 +3658,49 @@ static void * const kGDModsPickerKindKey = (void *)&kGDModsPickerKindKey;
             }
         }
 
-        if (bundleURLs.count > 0) {
-            NSError *bundleErr = nil;
-            NSArray<BundleTransplantResult *> *results = [BundleTransplant transplantAndSwapModdedBundlesAtURLs:bundleURLs error:&bundleErr];
+        // Object-level transplant (TextureAtlasTransplant), NOT the old
+        // whole-file swap (BundleTransplant transplantAndSwapModdedBundlesAtURLs)
+        // - a PC-built mod bundle is StandaloneWindows-target and carries
+        // DXT/DXT5Crunched/RGBA32 Texture2D bytes an iOS Metal texture
+        // can't bind at all, so dropping it in whole (what the old path
+        // did) never actually loaded on device. This instead diffs every
+        // shared Texture2D/TextAsset PathID against the matching cached
+        // bundle, decodes+re-encodes any differing Texture2D into the
+        // formats this project targets, and appends genuinely new
+        // PathIDs the mod introduces - see TextureAtlasTransplant.h.
+        // One call per picked bundle URL (its own API is per-modded-file,
+        // returning one result per matching cached bundle) rather than
+        // one call for the whole batch.
+        for (NSURL *bundleURL in bundleURLs) {
+            NSError *atlasErr = nil;
+            NSArray<TextureAtlasTransplantResult *> *results = [TextureAtlasTransplant transplantFromModdedBundleAtURL:bundleURL error:&atlasErr];
+            NSString *name = bundleURL.lastPathComponent;
             if (!results) {
-                [lines addObject:[NSString stringWithFormat:@"Bundle scan failed: %@", bundleErr.localizedDescription ?: @"unknown error"]];
-            } else {
-                for (BundleTransplantResult *r in results) {
-                    totalSwapped += r.swappedCount;
-                    if (r.error) {
-                        [lines addObject:[NSString stringWithFormat:@"%@: %@", r.moddedFileName, r.error.localizedDescription]];
-                    } else if (r.swappedCount == 0) {
-                        [lines addObject:[NSString stringWithFormat:@"%@ (%@): no match in cache", r.moddedFileName, r.cab ?: @"?"]];
-                    } else {
-                        [lines addObject:[NSString stringWithFormat:@"%@ (%@): swapped %ld", r.moddedFileName, r.cab, (long)r.swappedCount]];
-                    }
+                [lines addObject:[NSString stringWithFormat:@"%@: %@", name, atlasErr.localizedDescription ?: @"bundle scan failed"]];
+                continue;
+            }
+            if (results.count == 0) {
+                [lines addObject:[NSString stringWithFormat:@"%@: no match in cache", name]];
+                continue;
+            }
+            for (TextureAtlasTransplantResult *r in results) {
+                if (r.error) {
+                    [lines addObject:[NSString stringWithFormat:@"%@ (%@): %@", name, r.cachedPath.lastPathComponent, r.error.localizedDescription]];
+                    continue;
                 }
+                NSInteger changed = r.objectsTransplanted + r.objectsAdded;
+                totalSwapped += changed;
+                if (changed == 0) {
+                    [lines addObject:[NSString stringWithFormat:@"%@: no differing objects", name]];
+                    continue;
+                }
+                NSMutableString *line = [NSMutableString stringWithFormat:@"%@: %ld transplanted", name, (long)r.objectsTransplanted];
+                if (r.objectsAdded > 0) [line appendFormat:@", %ld added", (long)r.objectsAdded];
+                NSInteger problems = r.texture2DFormatUnsupported + r.texture2DHeaderParseFailed
+                    + r.objectsAddedTexture2DFormatUnsupported + r.objectsAddedTexture2DHeaderParseFailed
+                    + r.objectsSkippedNotInTarget + r.objectsAddedPathIDCollision;
+                if (problems > 0) [line appendFormat:@", %ld skipped", (long)problems];
+                [lines addObject:line];
             }
         }
 
@@ -3727,24 +3755,37 @@ static void * const kGDModsPickerKindKey = (void *)&kGDModsPickerKindKey;
 // Restore" alert with Force Restore as the red-text escape hatch
 // instead of a plain "nothing happened" message, per request.
 - (void)restoreOriginalsTapped {
+    // Legacy whole-file backups (BundleTransplant) - nothing writes new
+    // ones anymore since the mod-import flow stopped calling
+    // +transplantAndSwapModdedBundlesAtURLs: (see
+    // -gd_handlePickedModURLs:intoFolder:), but any backup from before
+    // that switch should still be restorable.
     NSError *bundleError = nil;
     NSInteger bundlesRestored = [BundleTransplant restoreAllBackedUpBundlesWithForce:NO error:&bundleError];
+
+    // Object-level backups (TextureAtlasTransplant) - what the mod-import
+    // flow actually writes now. No same-size skip on this side (see
+    // TextureAtlasTransplant.h), so this always does a full pass.
+    NSError *atlasError = nil;
+    NSInteger atlasRestored = [TextureAtlasTransplant restoreAllBackedUpBundlesWithError:&atlasError];
 
     NSError *bankError = nil;
     NSInteger banksRestored = [BankTransplant restoreAllBackedUpBanksWithError:&bankError];
 
     UINotificationFeedbackGenerator *haptic = [UINotificationFeedbackGenerator new];
 
-    if (bundlesRestored < 0 || banksRestored < 0) {
+    if (bundlesRestored < 0 || atlasRestored < 0 || banksRestored < 0) {
         [haptic notificationOccurred:UINotificationFeedbackTypeError];
         NSString *message = bundlesRestored < 0
             ? (bundleError.localizedDescription ?: @"Unknown error.")
-            : (bankError.localizedDescription ?: @"Unknown error.");
+            : atlasRestored < 0
+                ? (atlasError.localizedDescription ?: @"Unknown error.")
+                : (bankError.localizedDescription ?: @"Unknown error.");
         [self gd_presentModsAlertWithTitle:@"Restore Failed" message:message];
         return;
     }
 
-    NSInteger totalRestored = bundlesRestored + banksRestored;
+    NSInteger totalRestored = bundlesRestored + atlasRestored + banksRestored;
     if (totalRestored == 0) {
         [haptic notificationOccurred:UINotificationFeedbackTypeWarning];
         [self gd_presentNoAssetsToRestoreAlert];
@@ -3752,9 +3793,10 @@ static void * const kGDModsPickerKindKey = (void *)&kGDModsPickerKindKey;
     }
 
     [haptic notificationOccurred:UINotificationFeedbackTypeSuccess];
+    NSInteger bundleTotal = bundlesRestored + atlasRestored;
     NSString *message = [NSString stringWithFormat:
         @"Restored %ld bundle%@ and %ld bank%@ to their original state. Restart the game for it to take effect.",
-        (long)bundlesRestored, bundlesRestored == 1 ? @"" : @"s",
+        (long)bundleTotal, bundleTotal == 1 ? @"" : @"s",
         (long)banksRestored, banksRestored == 1 ? @"" : @"s"];
     [self gd_presentModsAlertWithTitle:@"Restore Bundles & Banks" message:message];
 }
@@ -3789,16 +3831,26 @@ static void * const kGDModsPickerKindKey = (void *)&kGDModsPickerKindKey;
 // masking a real change the byte check can't see.
 - (void)forceRestoreOriginalBundlesTapped {
     NSError *error = nil;
-    NSInteger restored = [BundleTransplant restoreAllBackedUpBundlesWithForce:YES error:&error];
-
-    UINotificationFeedbackGenerator *haptic = [UINotificationFeedbackGenerator new];
-    if (restored < 0) {
+    NSInteger legacyRestored = [BundleTransplant restoreAllBackedUpBundlesWithForce:YES error:&error];
+    if (legacyRestored < 0) {
+        UINotificationFeedbackGenerator *haptic = [UINotificationFeedbackGenerator new];
         [haptic notificationOccurred:UINotificationFeedbackTypeError];
         [self gd_presentModsAlertWithTitle:@"Restore Failed"
                                     message:error.localizedDescription ?: @"Unknown error."];
         return;
     }
 
+    NSError *atlasError = nil;
+    NSInteger atlasRestored = [TextureAtlasTransplant restoreAllBackedUpBundlesWithError:&atlasError];
+    UINotificationFeedbackGenerator *haptic = [UINotificationFeedbackGenerator new];
+    if (atlasRestored < 0) {
+        [haptic notificationOccurred:UINotificationFeedbackTypeError];
+        [self gd_presentModsAlertWithTitle:@"Restore Failed"
+                                    message:atlasError.localizedDescription ?: @"Unknown error."];
+        return;
+    }
+
+    NSInteger restored = legacyRestored + atlasRestored;
     [haptic notificationOccurred:UINotificationFeedbackTypeSuccess];
     NSString *message = restored == 0
         ? @"No backed-up bundles found - nothing to restore."
@@ -4354,7 +4406,16 @@ static void * const kGDModsPickerKindKey = (void *)&kGDModsPickerKindKey;
 - (void)gd_restoreModEntry:(ModAssetLibraryEntry *)entry {
     NSError *error = nil;
     if (entry.cab) {
+        // Legacy whole-file backups (harmless no-op now that nothing
+        // writes new ones - see -gd_handlePickedModURLs:intoFolder:)
+        // plus the object-level backups TextureAtlasTransplant actually
+        // writes today.
         [BundleTransplant restoreBackedUpBundlesForCAB:entry.cab force:YES error:&error];
+        NSError *atlasError = nil;
+        [TextureAtlasTransplant restoreBackedUpBundlesForCAB:entry.cab error:&atlasError];
+        if (atlasError) {
+            ZLog(@"[Mods] couldn't restore atlas-patched bundles for %@ before removing it from the library: %@", entry.fileName, atlasError.localizedDescription);
+        }
     } else {
         [BankTransplant restoreBackedUpBankNamed:entry.fileName error:&error];
     }

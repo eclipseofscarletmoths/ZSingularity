@@ -5,6 +5,7 @@ on:
     branches: [latest]
     paths:
       - "**.m"
+      - "**.mm"
       - "**.h"
       - ".github/workflows/build.yml"
   workflow_dispatch:
@@ -33,6 +34,45 @@ jobs:
       # rest of the re-encode files. Bank swaps are now a direct file
       # copy, no codec linkage required.
 
+      # CrunchTextureDecoder.mm's own #if __has_include("crn_decomp.h")
+      # gate (see that file's top comment) means the build still
+      # succeeds without this step - DXT5Crunched Texture2D objects just
+      # get skipped (texture2DFormatUnsupported) at runtime instead.
+      # Pulled fresh from upstream every run rather than checked into
+      # this repo: it's a ~4-5k line third-party single-header library
+      # (public-domain/zlib-style, credit required - see
+      # CrunchTextureDecoder.h's top comment) that belongs staying an
+      # untouched upstream pull, not a vendored copy this repo has to
+      # keep in sync by hand.
+      - name: Fetch crn_decomp.h
+        run: |
+          mkdir -p inc
+          curl -fsSL -o inc/crn_decomp.h \
+            https://raw.githubusercontent.com/BinomialLLC/crunch/master/inc/crn_decomp.h
+          test -s inc/crn_decomp.h
+
+      # CrunchTextureDecoder.mm is Objective-C++ (crn_decomp.h is C++ -
+      # namespaces, the crnd_unpack_context typedef, etc. - see that
+      # file's own top comment on why it can't be a plain .m). clang's
+      # single-invocation-on-*.m trick below can't mix a .mm source into
+      # that same command, so this compiles it to its own object file
+      # first and the main invocation links the .o in and adds -lc++
+      # for the C++ runtime (Xcode adds that automatically when a
+      # target contains a .mm; the raw clang command below does not).
+      - name: Compile CrunchTextureDecoder.mm (Objective-C++)
+        run: |
+          clang \
+            -c \
+            -O2 \
+            -fobjc-arc \
+            -fmodules \
+            -isysroot "${{ steps.sdk.outputs.path }}" \
+            -arch arm64 \
+            -miphoneos-version-min=15.0 \
+            -I inc \
+            CrunchTextureDecoder.mm \
+            -o CrunchTextureDecoder.o
+
       # All .m files compile as one dylib in a single clang
       # invocation - small enough project that per-file .o caching
       # isn't worth the extra steps. Headers (FPS120LinkWatcher.h,
@@ -41,6 +81,14 @@ jobs:
       #
       # -fobjc-arc is required: FPS120LinkWatcher.h and the other
       # files use ARC-style `strong`/`assign` property attributes.
+      #
+      # Texture2DFields.m / Texture2DPixelDecoder.m / RawPixelPacker.m /
+      # SerializedObjectTable.m / TextureAtlasTransplant.m are the
+      # object-level texture-transplant pipeline (see
+      # TextureAtlasTransplant.h) - added alongside CrunchTextureDecoder.o
+      # below now that GraphicsDebugOverlay.m's mod-import flow actually
+      # calls into TextureAtlasTransplant instead of BundleTransplant's
+      # old whole-file swap for bundles.
       #
       # Adjust -miphoneos-version-min if your deployment target
       # differs - 15.0 covers all ProMotion (120Hz-capable) devices.
@@ -81,6 +129,13 @@ jobs:
             LZ4BlockDecoder.m \
             PatchManifestNetwork.m \
             ModAssetLibrary.m \
+            Texture2DFields.m \
+            Texture2DPixelDecoder.m \
+            RawPixelPacker.m \
+            SerializedObjectTable.m \
+            TextureAtlasTransplant.m \
+            CrunchTextureDecoder.o \
+            -lc++ \
             -o ZSingularity.dylib
 
       # Ad-hoc sign so the dylib is well-formed on its own; patch-ipa.yml

@@ -9,6 +9,7 @@
 
 #import "Texture2DPixelDecoder.h"
 #import "Texture2DFields.h" // for the TAT2TextureFormat raw values this switches on
+#import "CrunchTextureDecoder.h" // DXT5Crunched -> standard DXT5, see this file's DXT5Crunched branch below
 
 NSString * const Texture2DPixelDecoderErrorDomain = @"Texture2DPixelDecoderErrorDomain";
 
@@ -142,11 +143,38 @@ static NSUInteger t2pd_base_level_size(int32_t rawFormat, int32_t width, int32_t
         return nil;
     }
 
+    if (rawFormat == TAT2TextureFormatDXT5Crunched) {
+        // Decompress the crunch container down to standard DXT5 block
+        // bytes first (NSData, not compressed-in-place - crnd_unpack_level
+        // needs its own destination buffer, see CrunchTextureDecoder.m),
+        // then recurse into this SAME function with rawFormat swapped to
+        // plain DXT5 - the BC1/BC3 block-decode loop below doesn't need
+        // to know or care that its input passed through crunch first.
+        NSError *crunchErr = nil;
+        NSData *rawDXT5 = [CrunchTextureDecoder decodeDXT5CrunchedToRawDXT5:sourceBytes width:width height:height error:&crunchErr];
+        if (!rawDXT5) {
+            // Surface as this class's own Unsupported/Truncated codes
+            // (not CrunchTextureDecoder's) so callers (TextureAtlasTransplant.m's
+            // texture2DFormatUnsupported counter) don't need to know
+            // about a second error domain - the underlying message is
+            // preserved via NSUnderlyingErrorKey for anyone who does.
+            Texture2DPixelDecoderErrorCode code = (crunchErr.code == CrunchTextureDecoderErrorLibraryUnavailable)
+                ? Texture2DPixelDecoderErrorUnsupportedFormat
+                : Texture2DPixelDecoderErrorTruncatedData;
+            NSMutableDictionary *userInfo = [NSMutableDictionary dictionaryWithObject:(crunchErr.localizedDescription ?: @"DXT5Crunched decompression failed")
+                                                                                 forKey:NSLocalizedDescriptionKey];
+            if (crunchErr) userInfo[NSUnderlyingErrorKey] = crunchErr;
+            if (error) *error = [NSError errorWithDomain:Texture2DPixelDecoderErrorDomain code:code userInfo:userInfo];
+            return nil;
+        }
+        return [self decodeToRGBA32FromRawFormat:TAT2TextureFormatDXT5 sourceBytes:rawDXT5 width:width height:height error:error];
+    }
+
     if (rawFormat != TAT2TextureFormatRGBA32 && rawFormat != kTAT2FormatRGB24 &&
         rawFormat != TAT2TextureFormatDXT1 && rawFormat != TAT2TextureFormatDXT5) {
-        // Most notably DXT5Crunched (29) and RGBA ASTC 6x6 (50) - see
-        // this class's header top comment on why those are refused
-        // rather than guessed at.
+        // RGBA ASTC 6x6 (50) and anything else unlisted - see this
+        // class's header top comment on why those are refused rather
+        // than guessed at. DXT5Crunched (29) is handled above.
         if (error) *error = T2PDError(Texture2DPixelDecoderErrorUnsupportedFormat,
             [NSString stringWithFormat:@"m_TextureFormat %d has no decoder in this project - see Texture2DPixelDecoder.h", rawFormat]);
         return nil;

@@ -171,6 +171,19 @@ typedef NS_ENUM(NSInteger, TextureAtlasTransplantErrorCode) {
 // exist yet.
 + (NSInteger)restoreAllBackedUpBundlesWithError:(NSError **)error;
 
+// Same restore as above, narrowed to backups matching one CAB - the
+// per-object counterpart to +[BundleTransplant
+// restoreBackedUpBundlesForCAB:force:error:], used by the Mods Library's
+// per-entry Reset/delete-restore paths (see GraphicsDebugOverlay.m's
+// -gd_restoreModEntry:) so removing one tracked mod only reverts the
+// cached bundles that mod itself touched, not every atlas backup on
+// disk. Matches by reading each backup's own CAB (untouched stock
+// bytes, so its CAB is unaffected by whatever object-level patching
+// happened to the live copy) - same reasoning as
+// BundleTransplant.m's own per-CAB restore. Returns 0 (not an error) if
+// +atlasBackupDirectory doesn't exist or nothing matches.
++ (NSInteger)restoreBackedUpBundlesForCAB:(NSString *)cab error:(NSError **)error;
+
 @end
 
 NS_ASSUME_NONNULL_END

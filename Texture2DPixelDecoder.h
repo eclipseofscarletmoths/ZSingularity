@@ -25,14 +25,18 @@
 //     involved compression layer bolted on top of a DXT5 payload
 //     (its own entropy coding / codebook scheme, not just "DXT5 with
 //     extra steps") - this project has no verified from-scratch
-//     implementation of it and isn't guessing at one; a wrong guess
-//     here wouldn't fail loudly; it would silently scramble pixels.
-//     +decodeToRGBA32FromRawFormat:... refuses (returns nil,
-//     Texture2DPixelDecoderErrorUnsupportedFormat) for this format
-//     rather than attempt it - callers should count/skip these
-//     (TextureAtlasTransplant.m does, via
-//     TextureAtlasTransplantResult.texture2DFormatUnsupported) until a
-//     real crunch decoder is vendored in.
+//     implementation of it and isn't guessing at one. Handled now via
+//     CrunchTextureDecoder.h (a vendored reference transcoder, NOT a
+//     hand-rolled bitstream parser - see that header's top comment for
+//     why): this class decompresses crunch -> standard DXT5 block bytes
+//     first, then falls straight into the same BC1/BC3 block-decode
+//     path below that already handles plain DXT5, no separate pixel
+//     math needed. Still refuses (Texture2DPixelDecoderErrorUnsupportedFormat)
+//     if CrunchTextureDecoder itself reports its library dependency
+//     isn't vendored into the build yet, or Texture2DPixelDecoderErrorTruncatedData/
+//     a wrapped error if the crunch stream itself doesn't decompress -
+//     either way TextureAtlasTransplant.m's existing texture2DFormatUnsupported
+//     counter still catches it, no caller-side change needed there.
 //   - RGBA ASTC 6x6 (iOS stock's own format) and anything else not
 //     listed above: also refused, same reasoning - this project has no
 //     need to ever decode FROM those, only skip objects that show up
@@ -45,7 +49,7 @@ NS_ASSUME_NONNULL_BEGIN
 extern NSString * const Texture2DPixelDecoderErrorDomain;
 
 typedef NS_ENUM(NSInteger, Texture2DPixelDecoderErrorCode) {
-    Texture2DPixelDecoderErrorUnsupportedFormat = 1, // see this header's top comment - most notably DXT5Crunched (29)
+    Texture2DPixelDecoderErrorUnsupportedFormat = 1, // see this header's top comment - ASTC/anything unlisted, or DXT5Crunched (29) specifically when CrunchTextureDecoder's vendored dependency isn't in the build yet
     Texture2DPixelDecoderErrorTruncatedData,          // fewer bytes than this format/width/height needs for even the base mip level
     Texture2DPixelDecoderErrorInvalidDimensions,
 };

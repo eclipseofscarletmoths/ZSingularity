@@ -744,4 +744,46 @@ static TextureAtlasTransplantResult *tat_transplant_one(NSString *cachedPath,
     return restored;
 }
 
++ (NSInteger)restoreBackedUpBundlesForCAB:(NSString *)cab error:(NSError **)error {
+    NSString *backupDir = [self atlasBackupDirectory];
+    NSFileManager *fm = NSFileManager.defaultManager;
+    if (![fm fileExistsAtPath:backupDir]) return 0;
+
+    NSString *cacheDir = [BundleTransplant unityCacheSharedDirectory];
+    NSError *listErr = nil;
+    NSArray<NSString *> *entries = [fm contentsOfDirectoryAtPath:backupDir error:&listErr];
+    if (!entries) {
+        if (error) *error = listErr ?: TATError(TextureAtlasTransplantErrorBackupFailed, @"couldn't list backup directory");
+        return -1;
+    }
+
+    NSInteger restored = 0;
+    for (NSString *encodedRel in entries) {
+        if (![encodedRel hasSuffix:@".atlasbak"]) continue;
+        NSString *backupPath = [backupDir stringByAppendingPathComponent:encodedRel];
+
+        // The backup is untouched stock bytes, so reading its CAB gives
+        // the same identity the modded file was matched against at
+        // transplant time - no need to touch the live (possibly
+        // already object-patched) __data to find out which entries
+        // belong to this CAB.
+        NSError *cabErr = nil;
+        NSString *entryCAB = [UnityBundleCAB primaryCABForBundleAtPath:backupPath error:&cabErr];
+        if (!entryCAB || ![entryCAB isEqualToString:cab]) continue;
+
+        NSString *flat = [encodedRel substringToIndex:encodedRel.length - @".atlasbak".length];
+        NSString *relPath = [flat stringByReplacingOccurrencesOfString:@"%2F" withString:@"/"];
+        NSString *targetPath = [cacheDir stringByAppendingPathComponent:relPath];
+
+        NSError *copyErr = nil;
+        [fm removeItemAtPath:targetPath error:nil];
+        if ([fm copyItemAtPath:backupPath toPath:targetPath error:&copyErr]) {
+            restored++;
+        } else {
+            ZLog(@"[TextureAtlasTransplant] restore: couldn't restore %@: %@", targetPath, copyErr.localizedDescription);
+        }
+    }
+    return restored;
+}
+
 @end
