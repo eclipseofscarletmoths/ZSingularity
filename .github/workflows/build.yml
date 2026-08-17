@@ -72,6 +72,35 @@ jobs:
           # required for macOS/BSD sed, unlike GNU sed.
           sed -i '' 's/#include <malloc.h>/#include <malloc\/malloc.h>/' inc/crn_decomp.h
 
+          # crn_decomp.h's allocator calls malloc_usable_size(), which
+          # is glibc/Linux-only. Apple's <malloc/malloc.h> has the same
+          # thing under a different name: malloc_size(). Same
+          # signature (size_t f(const void*)), safe global rename.
+          sed -i '' 's/malloc_usable_size/malloc_size/g' inc/crn_decomp.h
+
+          # crn_decomp.h predates ARM64 - its "is this a 64-bit
+          # platform" check for the ptr_bits typedef only tests
+          # `_WIN64` / `__x86_64__`, so on arm64 it silently falls
+          # through to `typedef uint32 ptr_bits`. The alignment-check
+          # asserts then reinterpret_cast a real 64-bit pointer down
+          # into that 32-bit type, which arm64 clang correctly refuses
+          # to compile (cast from pointer to smaller type loses
+          # information). Widen the platform check to also catch
+          # arm64/aarch64 (and 64-bit generally via __LP64__).
+          sed -i '' 's/#ifdef __x86_64__/#if defined(__x86_64__) || defined(__aarch64__) || defined(__arm64__) || defined(__LP64__)/' inc/crn_decomp.h
+
+          # Two of the alignment asserts cast the raw pointer straight
+          # to `(uint32)` instead of going through ptr_bits at all -
+          # same underlying bug, needs its own fix even after the
+          # typedef above is corrected.
+          sed -i '' 's/(uint32)p_new & (CRND_MIN_ALLOC_ALIGNMENT - 1)/(ptr_bits)p_new \& (CRND_MIN_ALLOC_ALIGNMENT - 1)/g' inc/crn_decomp.h
+
+          # The remaining three sites do reinterpret_cast<ptr_bits>(p)
+          # correctly, but then immediately truncate that back down
+          # with a stray leading (uint32) cast - drop it now that
+          # ptr_bits is properly 64-bit wide on this target.
+          sed -i '' 's/(uint32)reinterpret_cast<ptr_bits>(p) & (CRND_MIN_ALLOC_ALIGNMENT - 1)/reinterpret_cast<ptr_bits>(p) \& (CRND_MIN_ALLOC_ALIGNMENT - 1)/g' inc/crn_decomp.h
+
       # CrunchTextureDecoder.mm is Objective-C++ (crn_decomp.h is C++ -
       # namespaces, the crnd_unpack_context typedef, etc. - see that
       # file's own top comment on why it can't be a plain .m). clang's
