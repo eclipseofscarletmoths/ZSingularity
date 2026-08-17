@@ -39,30 +39,50 @@
 // honestly as "detected structurally sound data" rather than "parsed
 // the exact preceding format."
 //
-// TYPES ARRAY (m_Types), NOW PARSED TOO - see typesResolved below: the
-// scan above is still what actually locates the object table (unchanged,
-// still the trusted anchor), but each entry's raw typeID field is an
-// INDEX into m_Types, not a Unity persistent class ID - a real bundle
-// this project inspected has Texture2D objects (class ID 28) sitting at
-// m_Types index 18, confirmed via an external report tool's separately-
-// resolved class_counts vs its own type_id_distribution on the same 179
-// objects (see /areas/120f-tweak.md). Code that compared typeID directly
-// against 28/49 was therefore silently misclassifying every Texture2D/
-// TextAsset as "wrong type" - no error, no log line, just an empty diff.
-// sot_parse_types_array (see the .m) now walks m_UnityVersion/
-// m_TargetPlatform/m_EnableTypeTree/m_Types structurally (skipping past
-// each entry's optional embedded type tree via its own declared node
-// count/string buffer size, never interpreting field names) to build a
-// typeIndex -> classID map. Since this walk (unlike the object-table
-// scan) genuinely IS "parse the exact preceding format" rather than
-// "detect structurally sound data," it self-validates the only way that
-// matters here: after parsing m_Types and the m_ObjectCount that follows
-// it, the resulting byte position must land EXACTLY on the table's own
-// start offset the independent scan already found. Any mismatch means
-// something about this file's version/flags wasn't the standard case
-// assumed - the map is discarded rather than trusted, typesResolved is
-// NO, and every object's classIDResolved is NO, rather than risk a
-// second silent misclassification.
+// TYPES ARRAY (m_Types), NOW PARSED TOO - see typesResolved below: each
+// object table entry's raw typeID field is an INDEX into m_Types, not a
+// Unity persistent class ID - a real bundle this project inspected has
+// Texture2D objects (class ID 28) sitting at m_Types index 18, confirmed
+// via an external report tool's separately-resolved class_counts vs its
+// own type_id_distribution on the same 179 objects. Code that compared
+// typeID directly against 28/49 was therefore silently misclassifying
+// every Texture2D/TextAsset as "wrong type" - no error, no log line,
+// just an empty diff. sot_walk_types_array (see the .m) walks
+// m_UnityVersion/m_TargetPlatform/m_EnableTypeTree/m_Types structurally
+// (skipping past each entry's optional embedded type tree via its own
+// declared node count/string buffer size, never interpreting field
+// names) to build a typeIndex -> classID map, continuing through
+// m_ObjectCount to see exactly where that walk lands.
+//
+// THIS WALK IS NOW THE PRIMARY WAY THE OBJECT TABLE ITSELF IS LOCATED,
+// not just a validator for a position found some other way: since every
+// field position it reads is derived from the one before it, it
+// genuinely IS "parse the exact preceding format" rather than "detect
+// structurally sound data," and -tableForSerializedFileNodeData: trusts
+// its landing position directly once sot_decode_table_at confirms that
+// position actually decodes as a plausible table (same
+// kMinConsecutiveValidEntries bar the scan below uses). Only when the
+// walk itself fails to parse (unexpected field shape this project
+// hasn't seen), or lands somewhere that isn't table-shaped, does the
+// code fall back to the blind byte-scan below - and only then is
+// typesResolved NO (classID resolution unavailable, every object's
+// classIDResolved NO).
+//
+// This replaced an earlier design where the scan below was the primary
+// anchor and this walk only cross-validated a scan-found position,
+// discarding the map on any disagreement. That order broke on a real
+// 213MB bundle: the scan (searching forward from the header) locked
+// onto a coincidental run of plausible-looking bytes in the tail of the
+// last SerializedType, exactly ONE BYTE before the walk's own correct
+// landing position - so the walk's genuinely-correct answer no longer
+// matched the scan's wrong one and got discarded, surfacing as every
+// object's classIDResolved being NO despite the walk having parsed
+// cleanly. Verified against that bundle: decoding the table at the
+// walk's position yields exactly m_ObjectCount (6541) contiguous,
+// self-chaining entries (each byteStart == previous byteStart+byteSize,
+// first entry at byteStart 0) ending right at the edge of dataOffset;
+// decoding at the scan's one-byte-earlier position yields only 57
+// entries before failing, nowhere near a real table.
 
 #import <Foundation/Foundation.h>
 
@@ -96,7 +116,7 @@ typedef NS_ENUM(NSInteger, SerializedObjectTableErrorCode) {
 // Resolved Unity persistent class ID (e.g. 28 for Texture2D, 49 for
 // TextAsset) via m_Types[typeID].classID - only meaningful when
 // classIDResolved is YES. See SerializedObjectTable.m's
-// sot_parse_types_array for how/when this is populated.
+// sot_walk_types_array for how/when this is populated.
 @property (nonatomic, assign) int32_t classID;
 @property (nonatomic, assign) BOOL classIDResolved;
 @property (nonatomic, assign) NSUInteger tableOffset; // byte offset of this entry's OWN 24 bytes within the node - see -patchObject:newByteStart:newByteSize:inNodeData:error: below
@@ -106,14 +126,15 @@ typedef NS_ENUM(NSInteger, SerializedObjectTableErrorCode) {
 
 @property (nonatomic, assign, readonly) int64_t dataOffset; // add to any entry's byteStart for an absolute node-data position
 @property (nonatomic, copy, readonly) NSArray<SerializedObject *> *objects;
-// YES if every object's classID/classIDResolved was populated via an
-// m_Types walk that landed EXACTLY on this table's own (independently
-// scan-located) start offset - see the .m's sot_parse_types_array. NO
-// means the walk failed or landed somewhere else and was discarded
-// rather than trusted; every object's classIDResolved is then NO and
-// callers that need to identify object types (Texture2D vs TextAsset
-// vs anything else) by real class rather than raw typeID index cannot
-// do so for this file.
+// YES if every object's classID/classIDResolved was populated via the
+// m_Types structural walk (sot_walk_types_array in the .m), used as the
+// PRIMARY way this table's own start offset was located. NO means that
+// walk failed to parse, or landed somewhere that didn't decode as a
+// plausible table, and the object table was instead found via the
+// blind byte-scan fallback; every object's classIDResolved is then NO
+// and callers that need to identify object types (Texture2D vs
+// TextAsset vs anything else) by real class rather than raw typeID
+// index cannot do so for this file.
 @property (nonatomic, assign, readonly) BOOL typesResolved;
 
 // Locates and parses the object table inside `nodeData` (one

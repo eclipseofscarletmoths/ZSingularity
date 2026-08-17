@@ -41,7 +41,7 @@ static int32_t sot_read_i32_le(const uint8_t *p) {
     return (int32_t)sot_read_u32_le(p);
 }
 
-// Cursor-based readers for the Types array walk below (sot_parse_types_array
+// Cursor-based readers for the Types array walk below (sot_walk_types_array
 // et al.) - unlike the fixed-offset header reads and the 24-byte-stride
 // object table decode above, this walk's field positions are only known
 // by having read everything before them, so each of these advances
@@ -157,8 +157,48 @@ static BOOL sot_decode_entry(const uint8_t *p, uint64_t dataOffset, uint64_t fil
     return YES;
 }
 
-static NSArray<SerializedObject *> *sot_scan_for_table(NSData *nodeData, const SOTHeader *header, size_t *outTableStart, NSError **error) {
+// Decodes a full object table under the assumption it starts EXACTLY at
+// `start` - kMinConsecutiveValidEntries entries must decode cleanly right
+// away (same plausibility bar sot_scan_for_table's blind search uses) or
+// this returns nil outright, rather than accepting a short/coincidental
+// run. Used both by that blind scan below (candidate-by-candidate) and by
+// -tableForSerializedFileNodeData:'s primary path, where `start` comes
+// from actually parsing every field between the header and the table
+// (sot_walk_types_array) instead of guessing.
+static NSArray<SerializedObject *> *sot_decode_table_at(NSData *nodeData, const SOTHeader *header, size_t start, size_t searchEnd) {
     const uint8_t *base = (const uint8_t *)nodeData.bytes;
+    size_t stride = 24;
+    if (start + stride * kMinConsecutiveValidEntries > searchEnd) return nil;
+    for (NSUInteger i = 0; i < kMinConsecutiveValidEntries; i++) {
+        SOTRawEntry e;
+        if (!sot_decode_entry(base + start + i * stride, header->dataOffset, header->fileSize, &e)) return nil;
+    }
+
+    // Plausible run confirmed - walk it to the end (table stops as soon
+    // as an entry stops decoding cleanly; the count itself isn't read
+    // separately since it isn't needed once the table's own extent is
+    // known this way).
+    NSMutableArray<SerializedObject *> *objects = [NSMutableArray array];
+    size_t off = start;
+    while (off + stride <= searchEnd) {
+        SOTRawEntry e;
+        if (!sot_decode_entry(base + off, header->dataOffset, header->fileSize, &e)) break;
+        SerializedObject *obj = [SerializedObject new];
+        obj.pathID = e.pathID; obj.byteStart = e.byteStart; obj.byteSize = e.byteSize; obj.typeID = e.typeID;
+        obj.tableOffset = off;
+        [objects addObject:obj];
+        off += stride;
+    }
+    return objects;
+}
+
+// Blind byte-by-byte fallback - see -tableForSerializedFileNodeData: for
+// why this is no longer the primary way the table is located. Still
+// needed for files where sot_walk_types_array itself fails to parse
+// (unexpected field shape this project hasn't seen yet), so classID
+// resolution is unavailable but the table can still be found and
+// objects still identified by raw typeID/pathID.
+static NSArray<SerializedObject *> *sot_scan_for_table(NSData *nodeData, const SOTHeader *header, size_t *outTableStart, NSError **error) {
     size_t len = nodeData.length;
     size_t stride = 24;
 
@@ -174,31 +214,8 @@ static NSArray<SerializedObject *> *sot_scan_for_table(NSData *nodeData, const S
     }
 
     for (size_t candidate = searchStart; candidate + stride * kMinConsecutiveValidEntries <= searchEnd; candidate++) {
-        BOOL allValid = YES;
-        for (NSUInteger i = 0; i < kMinConsecutiveValidEntries; i++) {
-            SOTRawEntry e;
-            if (!sot_decode_entry(base + candidate + i * stride, header->dataOffset, header->fileSize, &e)) {
-                allValid = NO;
-                break;
-            }
-        }
-        if (!allValid) continue;
-
-        // Found a plausible run - walk it to the end (table stops as
-        // soon as an entry stops decoding cleanly; the count itself
-        // isn't read separately since it isn't needed once the table's
-        // own extent is known this way).
-        NSMutableArray<SerializedObject *> *objects = [NSMutableArray array];
-        size_t off = candidate;
-        while (off + stride <= searchEnd) {
-            SOTRawEntry e;
-            if (!sot_decode_entry(base + off, header->dataOffset, header->fileSize, &e)) break;
-            SerializedObject *obj = [SerializedObject new];
-            obj.pathID = e.pathID; obj.byteStart = e.byteStart; obj.byteSize = e.byteSize; obj.typeID = e.typeID;
-            obj.tableOffset = off;
-            [objects addObject:obj];
-            off += stride;
-        }
+        NSArray<SerializedObject *> *objects = sot_decode_table_at(nodeData, header, candidate, searchEnd);
+        if (!objects) continue;
         if (outTableStart) *outTableStart = candidate;
         return objects;
     }
@@ -258,42 +275,46 @@ static BOOL sot_skip_serialized_type(NSData *nodeData, size_t *pos, BOOL enableT
 
 // Walks m_UnityVersion/m_TargetPlatform/m_EnableTypeTree/m_Types,
 // starting right after the fixed header, building a typeIndex -> classID
-// map - then keeps walking through m_ObjectCount and requires the
-// resulting position to land EXACTLY on tableStartOffset (the object
-// table's start, already independently located by sot_scan_for_table).
-// Returns nil (map discarded) on any parse failure OR on a clean parse
-// that simply lands somewhere else - see .h's "TYPES ARRAY" note on why
-// a mismatch is never trusted partially.
-static NSDictionary<NSNumber *, NSNumber *> *sot_parse_types_array(NSData *nodeData, const SOTHeader *header, size_t tableStartOffset) {
+// map - then keeps walking through m_ObjectCount. Unlike the old
+// sot_parse_types_array this replaced, this does NOT take a
+// pre-located table offset to validate against - *outTableStart is
+// simply wherever this walk actually lands, since every field position
+// here is derived from the one before it (a genuine parse, not a
+// heuristic - see .h). Returns NO on any parse failure (out-params left
+// untouched); the caller is responsible for confirming the landing
+// position actually decodes as a plausible table before trusting it -
+// see sot_decode_table_at, called right after this in
+// -tableForSerializedFileNodeData:.
+static BOOL sot_walk_types_array(NSData *nodeData, const SOTHeader *header, size_t *outTableStart, NSDictionary<NSNumber *, NSNumber *> **outMap) {
     size_t pos = header->headerEnd;
 
-    if (!sot_cur_cstring(nodeData, &pos)) return nil; // m_UnityVersion - version >= 7
+    if (!sot_cur_cstring(nodeData, &pos)) return NO; // m_UnityVersion - version >= 7
 
     int32_t targetPlatform;
-    if (!sot_cur_i32(nodeData, &pos, &targetPlatform)) return nil; // version >= 8
+    if (!sot_cur_i32(nodeData, &pos, &targetPlatform)) return NO; // version >= 8
     (void)targetPlatform;
 
     BOOL enableTypeTree;
-    if (!sot_cur_bool(nodeData, &pos, &enableTypeTree)) return nil; // version >= 13
+    if (!sot_cur_bool(nodeData, &pos, &enableTypeTree)) return NO; // version >= 13
 
     int32_t typeCount;
-    if (!sot_cur_i32(nodeData, &pos, &typeCount)) return nil;
-    if (typeCount < 0 || typeCount > 4096) return nil; // same generous-but-bounded posture as sot_decode_entry's typeID check
+    if (!sot_cur_i32(nodeData, &pos, &typeCount)) return NO;
+    if (typeCount < 0 || typeCount > 4096) return NO; // same generous-but-bounded posture as sot_decode_entry's typeID check
 
     NSMutableDictionary<NSNumber *, NSNumber *> *map = [NSMutableDictionary dictionaryWithCapacity:(NSUInteger)typeCount];
     for (int32_t i = 0; i < typeCount; i++) {
         int32_t classID;
-        if (!sot_skip_serialized_type(nodeData, &pos, enableTypeTree, &classID)) return nil;
+        if (!sot_skip_serialized_type(nodeData, &pos, enableTypeTree, &classID)) return NO;
         map[@(i)] = @(classID);
     }
 
     int32_t objectCount;
-    if (!sot_cur_i32(nodeData, &pos, &objectCount)) return nil; // m_ObjectCount, immediately precedes the table itself
+    if (!sot_cur_i32(nodeData, &pos, &objectCount)) return NO; // m_ObjectCount, immediately precedes the table itself
     (void)objectCount;
 
-    if (pos != tableStartOffset) return nil; // didn't land on the independently-scanned table start - don't trust this walk
-
-    return map;
+    if (outTableStart) *outTableStart = pos;
+    if (outMap) *outMap = map;
+    return YES;
 }
 
 #pragma mark - insertion (new PathIDs - see .h)
@@ -368,16 +389,56 @@ static BOOL sot_locate_count_field(NSData *nodeData, NSUInteger firstEntryOffset
     SOTHeader header;
     if (!sot_parse_header(nodeData, &header, error)) return nil;
 
-    size_t tableStart = 0;
-    NSArray<SerializedObject *> *objects = sot_scan_for_table(nodeData, &header, &tableStart, error);
-    if (!objects) return nil;
+    size_t searchEnd = (size_t)MIN((uint64_t)nodeData.length, header.dataOffset);
 
-    NSDictionary<NSNumber *, NSNumber *> *typeMap = sot_parse_types_array(nodeData, &header, tableStart);
-    BOOL typesResolved = (typeMap != nil);
-    if (!typesResolved) {
-        ZLog(@"[SerializedObjectTable] m_Types walk didn't cross-validate against the scanned table start (offset %lu) - classID resolution unavailable for this file, every object's classIDResolved will be NO",
+    // PRIMARY: sot_walk_types_array is a genuine structural parse - every
+    // field position it reads is derived from the one before it, all the
+    // way from m_UnityVersion through m_Types to m_ObjectCount - so once
+    // it succeeds, its landing position is trusted directly as the table
+    // start (after confirming it actually decodes as one; see
+    // sot_decode_table_at) rather than only used to cross-check a
+    // separately-found scan position, as this used to work. That older
+    // order let a coincidental run of plausible-looking bytes immediately
+    // BEFORE the real table (found first by the blind scan below, since
+    // it searches forward from the header) silently outrank a walk that
+    // had already computed the correct answer: a real 213MB bundle's
+    // last SerializedType's trailing bytes happened to satisfy
+    // kMinConsecutiveValidEntries starting exactly 1 byte before the
+    // walk's own (correct) landing position, so the scan grabbed that
+    // false start, the walk's genuinely-correct position no longer
+    // matched it, and the whole map was discarded - every object's
+    // classIDResolved came back NO despite the walk having parsed fine.
+    size_t tableStart = 0;
+    NSArray<SerializedObject *> *objects = nil;
+    NSDictionary<NSNumber *, NSNumber *> *typeMap = nil;
+    BOOL typesResolved = NO;
+
+    size_t walkTableStart;
+    NSDictionary<NSNumber *, NSNumber *> *walkMap;
+    if (sot_walk_types_array(nodeData, &header, &walkTableStart, &walkMap)) {
+        NSArray<SerializedObject *> *walkObjects = sot_decode_table_at(nodeData, &header, walkTableStart, searchEnd);
+        if (walkObjects) {
+            objects = walkObjects;
+            tableStart = walkTableStart;
+            typeMap = walkMap;
+            typesResolved = YES;
+        } else {
+            ZLog(@"[SerializedObjectTable] m_Types walk parsed cleanly but landed at offset %lu, which doesn't decode as a plausible object table - falling back to byte-scan",
+                 (unsigned long)walkTableStart);
+        }
+    }
+
+    // FALLBACK: only reached when the structural walk above either failed
+    // outright (unexpected field shape this project hasn't seen yet) or
+    // landed somewhere that isn't table-shaped. No classID resolution is
+    // available this way, same tradeoff as before.
+    if (!objects) {
+        objects = sot_scan_for_table(nodeData, &header, &tableStart, error);
+        if (!objects) return nil;
+        ZLog(@"[SerializedObjectTable] m_Types walk unavailable for this file - classID resolution unavailable, every object's classIDResolved will be NO (table start offset %lu, via byte-scan)",
              (unsigned long)tableStart);
     }
+
     for (SerializedObject *obj in objects) {
         NSNumber *resolved = typeMap[@(obj.typeID)];
         if (resolved) {
