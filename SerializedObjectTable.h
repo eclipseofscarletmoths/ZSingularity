@@ -38,6 +38,31 @@
 // position - so it's confirmed correct on real data, just framed
 // honestly as "detected structurally sound data" rather than "parsed
 // the exact preceding format."
+//
+// TYPES ARRAY (m_Types), NOW PARSED TOO - see typesResolved below: the
+// scan above is still what actually locates the object table (unchanged,
+// still the trusted anchor), but each entry's raw typeID field is an
+// INDEX into m_Types, not a Unity persistent class ID - a real bundle
+// this project inspected has Texture2D objects (class ID 28) sitting at
+// m_Types index 18, confirmed via an external report tool's separately-
+// resolved class_counts vs its own type_id_distribution on the same 179
+// objects (see /areas/120f-tweak.md). Code that compared typeID directly
+// against 28/49 was therefore silently misclassifying every Texture2D/
+// TextAsset as "wrong type" - no error, no log line, just an empty diff.
+// sot_parse_types_array (see the .m) now walks m_UnityVersion/
+// m_TargetPlatform/m_EnableTypeTree/m_Types structurally (skipping past
+// each entry's optional embedded type tree via its own declared node
+// count/string buffer size, never interpreting field names) to build a
+// typeIndex -> classID map. Since this walk (unlike the object-table
+// scan) genuinely IS "parse the exact preceding format" rather than
+// "detect structurally sound data," it self-validates the only way that
+// matters here: after parsing m_Types and the m_ObjectCount that follows
+// it, the resulting byte position must land EXACTLY on the table's own
+// start offset the independent scan already found. Any mismatch means
+// something about this file's version/flags wasn't the standard case
+// assumed - the map is discarded rather than trusted, typesResolved is
+// NO, and every object's classIDResolved is NO, rather than risk a
+// second silent misclassification.
 
 #import <Foundation/Foundation.h>
 
@@ -63,7 +88,17 @@ typedef NS_ENUM(NSInteger, SerializedObjectTableErrorCode) {
 @property (nonatomic, assign) int64_t pathID;
 @property (nonatomic, assign) int64_t byteStart;
 @property (nonatomic, assign) uint32_t byteSize;
+// Raw object-table field: an INDEX into this file's own m_Types array,
+// not a Unity persistent class ID (28, 49, ...) directly - see
+// SerializedObjectTable.typesResolved and classID/classIDResolved below.
+// Still needed as-is for -insertObjects:...'s own wire format.
 @property (nonatomic, assign) int32_t typeID;
+// Resolved Unity persistent class ID (e.g. 28 for Texture2D, 49 for
+// TextAsset) via m_Types[typeID].classID - only meaningful when
+// classIDResolved is YES. See SerializedObjectTable.m's
+// sot_parse_types_array for how/when this is populated.
+@property (nonatomic, assign) int32_t classID;
+@property (nonatomic, assign) BOOL classIDResolved;
 @property (nonatomic, assign) NSUInteger tableOffset; // byte offset of this entry's OWN 24 bytes within the node - see -patchObject:newByteStart:newByteSize:inNodeData:error: below
 @end
 
@@ -71,6 +106,15 @@ typedef NS_ENUM(NSInteger, SerializedObjectTableErrorCode) {
 
 @property (nonatomic, assign, readonly) int64_t dataOffset; // add to any entry's byteStart for an absolute node-data position
 @property (nonatomic, copy, readonly) NSArray<SerializedObject *> *objects;
+// YES if every object's classID/classIDResolved was populated via an
+// m_Types walk that landed EXACTLY on this table's own (independently
+// scan-located) start offset - see the .m's sot_parse_types_array. NO
+// means the walk failed or landed somewhere else and was discarded
+// rather than trusted; every object's classIDResolved is then NO and
+// callers that need to identify object types (Texture2D vs TextAsset
+// vs anything else) by real class rather than raw typeID index cannot
+// do so for this file.
+@property (nonatomic, assign, readonly) BOOL typesResolved;
 
 // Locates and parses the object table inside `nodeData` (one
 // UnityBundleNode's slice of a decompressed UnityBundleArchive.data -

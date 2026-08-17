@@ -41,6 +41,46 @@ static int32_t sot_read_i32_le(const uint8_t *p) {
     return (int32_t)sot_read_u32_le(p);
 }
 
+// Cursor-based readers for the Types array walk below (sot_parse_types_array
+// et al.) - unlike the fixed-offset header reads and the 24-byte-stride
+// object table decode above, this walk's field positions are only known
+// by having read everything before them, so each of these advances
+// *pos itself and fails (returning NO) rather than trusting the buffer
+// is long enough, same bounds-checked posture as the rest of this file.
+static BOOL sot_cur_i32(NSData *d, size_t *pos, int32_t *out) {
+    if (*pos + 4 > d.length) return NO;
+    *out = sot_read_i32_le((const uint8_t *)d.bytes + *pos);
+    *pos += 4;
+    return YES;
+}
+static BOOL sot_cur_i16(NSData *d, size_t *pos, int16_t *out) {
+    if (*pos + 2 > d.length) return NO;
+    const uint8_t *p = (const uint8_t *)d.bytes + *pos;
+    *out = (int16_t)((uint16_t)p[0] | ((uint16_t)p[1] << 8));
+    *pos += 2;
+    return YES;
+}
+static BOOL sot_cur_bool(NSData *d, size_t *pos, BOOL *out) {
+    if (*pos + 1 > d.length) return NO;
+    *out = (*((const uint8_t *)d.bytes + *pos)) != 0;
+    *pos += 1;
+    return YES;
+}
+static BOOL sot_cur_skip(NSData *d, size_t *pos, size_t n) {
+    if (*pos + n > d.length) return NO;
+    *pos += n;
+    return YES;
+}
+static BOOL sot_cur_cstring(NSData *d, size_t *pos) {
+    const uint8_t *base = (const uint8_t *)d.bytes;
+    size_t len = d.length;
+    size_t i = *pos;
+    while (i < len && base[i] != 0) i++;
+    if (i >= len) return NO; // unterminated
+    *pos = i + 1; // consume the NUL too
+    return YES;
+}
+
 #pragma mark - header (version 22 only - see .h)
 
 typedef struct {
@@ -117,7 +157,7 @@ static BOOL sot_decode_entry(const uint8_t *p, uint64_t dataOffset, uint64_t fil
     return YES;
 }
 
-static NSArray<SerializedObject *> *sot_scan_for_table(NSData *nodeData, const SOTHeader *header, NSError **error) {
+static NSArray<SerializedObject *> *sot_scan_for_table(NSData *nodeData, const SOTHeader *header, size_t *outTableStart, NSError **error) {
     const uint8_t *base = (const uint8_t *)nodeData.bytes;
     size_t len = nodeData.length;
     size_t stride = 24;
@@ -159,11 +199,101 @@ static NSArray<SerializedObject *> *sot_scan_for_table(NSData *nodeData, const S
             [objects addObject:obj];
             off += stride;
         }
+        if (outTableStart) *outTableStart = candidate;
         return objects;
     }
 
     if (error) *error = [NSError errorWithDomain:SerializedObjectTableErrorDomain code:SOTErrorTableNotFound userInfo:nil];
     return nil;
+}
+
+#pragma mark - types array (typeID index -> real classID - see .h "TYPES ARRAY")
+
+// Parses one m_Types[] entry (SerializedFile format version 22 - this
+// file only ever supports 22, see sot_parse_header - non-ref-type
+// shape; m_RefTypes, a separate trailing array this project has never
+// needed to reach, would use a slightly different shape and is not
+// handled here). Advances *pos past the whole entry and fills
+// *outClassID. The embedded type tree (if enabled) is walked past using
+// its own declared node count / string buffer size - never interpreted
+// field-by-field, since nothing here needs field names, only enough
+// structure to know where the NEXT SerializedType starts. Node size
+// (32 bytes) is the format-version>=19 shape (includes the trailing
+// 8-byte m_RefTypeHash) - version 22 is always >=19, so no narrower
+// variant is implemented.
+static BOOL sot_skip_serialized_type(NSData *nodeData, size_t *pos, BOOL enableTypeTree, int32_t *outClassID) {
+    int32_t classID;
+    if (!sot_cur_i32(nodeData, pos, &classID)) return NO;
+
+    BOOL isStrippedType;
+    if (!sot_cur_bool(nodeData, pos, &isStrippedType)) return NO; // version >= 16
+
+    int16_t scriptTypeIndex;
+    if (!sot_cur_i16(nodeData, pos, &scriptTypeIndex)) return NO; // version >= 17
+    (void)isStrippedType; (void)scriptTypeIndex; // read for correct cursor advance only - neither is needed past that
+
+    if (classID == 114) { // MonoBehaviour - carries its own Hash128 script ID
+        if (!sot_cur_skip(nodeData, pos, 16)) return NO;
+    }
+    if (!sot_cur_skip(nodeData, pos, 16)) return NO; // m_OldTypeHash (Hash128) - version >= 13, always present
+
+    if (enableTypeTree) {
+        int32_t nodeCount, stringBufferSize;
+        if (!sot_cur_i32(nodeData, pos, &nodeCount)) return NO;
+        if (!sot_cur_i32(nodeData, pos, &stringBufferSize)) return NO;
+        if (nodeCount < 0 || stringBufferSize < 0) return NO;
+        if (!sot_cur_skip(nodeData, pos, (size_t)nodeCount * 32)) return NO;
+        if (!sot_cur_skip(nodeData, pos, (size_t)stringBufferSize)) return NO;
+        // version >= 21, non-ref type: trailing i32-count array of type
+        // dependency indices.
+        int32_t depCount;
+        if (!sot_cur_i32(nodeData, pos, &depCount)) return NO;
+        if (depCount < 0) return NO;
+        if (!sot_cur_skip(nodeData, pos, (size_t)depCount * 4)) return NO;
+    }
+
+    if (outClassID) *outClassID = classID;
+    return YES;
+}
+
+// Walks m_UnityVersion/m_TargetPlatform/m_EnableTypeTree/m_Types,
+// starting right after the fixed header, building a typeIndex -> classID
+// map - then keeps walking through m_ObjectCount and requires the
+// resulting position to land EXACTLY on tableStartOffset (the object
+// table's start, already independently located by sot_scan_for_table).
+// Returns nil (map discarded) on any parse failure OR on a clean parse
+// that simply lands somewhere else - see .h's "TYPES ARRAY" note on why
+// a mismatch is never trusted partially.
+static NSDictionary<NSNumber *, NSNumber *> *sot_parse_types_array(NSData *nodeData, const SOTHeader *header, size_t tableStartOffset) {
+    size_t pos = header->headerEnd;
+
+    if (!sot_cur_cstring(nodeData, &pos)) return nil; // m_UnityVersion - version >= 7
+
+    int32_t targetPlatform;
+    if (!sot_cur_i32(nodeData, &pos, &targetPlatform)) return nil; // version >= 8
+    (void)targetPlatform;
+
+    BOOL enableTypeTree;
+    if (!sot_cur_bool(nodeData, &pos, &enableTypeTree)) return nil; // version >= 13
+
+    int32_t typeCount;
+    if (!sot_cur_i32(nodeData, &pos, &typeCount)) return nil;
+    if (typeCount < 0 || typeCount > 4096) return nil; // same generous-but-bounded posture as sot_decode_entry's typeID check
+
+    NSMutableDictionary<NSNumber *, NSNumber *> *map = [NSMutableDictionary dictionaryWithCapacity:(NSUInteger)typeCount];
+    for (int32_t i = 0; i < typeCount; i++) {
+        int32_t classID;
+        if (!sot_skip_serialized_type(nodeData, &pos, enableTypeTree, &classID)) return nil;
+        map[@(i)] = @(classID);
+    }
+
+    int32_t objectCount;
+    if (!sot_cur_i32(nodeData, &pos, &objectCount)) return nil; // m_ObjectCount, immediately precedes the table itself
+    (void)objectCount;
+
+    if (pos != tableStartOffset) return nil; // didn't land on the independently-scanned table start - don't trust this walk
+
+    return map;
 }
 
 #pragma mark - insertion (new PathIDs - see .h)
@@ -227,21 +357,42 @@ static BOOL sot_locate_count_field(NSData *nodeData, NSUInteger firstEntryOffset
 @implementation SerializedObjectTable {
     NSArray<SerializedObject *> *_objects;
     int64_t _dataOffset;
+    BOOL _typesResolved;
 }
 
 - (int64_t)dataOffset { return _dataOffset; }
 - (NSArray<SerializedObject *> *)objects { return _objects; }
+- (BOOL)typesResolved { return _typesResolved; }
 
 + (nullable instancetype)tableForSerializedFileNodeData:(NSData *)nodeData error:(NSError **)error {
     SOTHeader header;
     if (!sot_parse_header(nodeData, &header, error)) return nil;
 
-    NSArray<SerializedObject *> *objects = sot_scan_for_table(nodeData, &header, error);
+    size_t tableStart = 0;
+    NSArray<SerializedObject *> *objects = sot_scan_for_table(nodeData, &header, &tableStart, error);
     if (!objects) return nil;
+
+    NSDictionary<NSNumber *, NSNumber *> *typeMap = sot_parse_types_array(nodeData, &header, tableStart);
+    BOOL typesResolved = (typeMap != nil);
+    if (!typesResolved) {
+        ZLog(@"[SerializedObjectTable] m_Types walk didn't cross-validate against the scanned table start (offset %lu) - classID resolution unavailable for this file, every object's classIDResolved will be NO",
+             (unsigned long)tableStart);
+    }
+    for (SerializedObject *obj in objects) {
+        NSNumber *resolved = typeMap[@(obj.typeID)];
+        if (resolved) {
+            obj.classID = (int32_t)resolved.intValue;
+            obj.classIDResolved = YES;
+        } else {
+            obj.classID = 0;
+            obj.classIDResolved = NO;
+        }
+    }
 
     SerializedObjectTable *table = [SerializedObjectTable new];
     table->_dataOffset = (int64_t)header.dataOffset;
     table->_objects = objects;
+    table->_typesResolved = typesResolved;
     return table;
 }
 

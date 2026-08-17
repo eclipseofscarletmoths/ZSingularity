@@ -163,7 +163,7 @@ static NSData *tat_build_new_object_payload(SerializedObject *moddedObj,
                                              TATNewObjectOutcome *outOutcome) {
     *outOutcome = TATNewObjectOK;
 
-    if (moddedObj.typeID == kTAT2ClassIDTextAsset) {
+    if (moddedObj.classID == kTAT2ClassIDTextAsset) {
         NSUInteger streamFieldPos;
         NSMutableData *payload = [moddedBytes mutableCopy];
         if (moddedResSData && tat_find_stream_data_offset_field(moddedBytes, &streamFieldPos)) {
@@ -401,6 +401,10 @@ static TextureAtlasTransplantResult *tat_transplant_one(NSString *cachedPath,
         result.error = tableErr ?: TATError(TextureAtlasTransplantErrorModdedTableFailed, @"couldn't locate target's object table");
         return result;
     }
+    if (!targetTable.typesResolved) {
+        result.error = TATError(TextureAtlasTransplantErrorModdedTableFailed, @"couldn't resolve target bundle's Unity class IDs (m_Types) - see Verbose log");
+        return result;
+    }
 
     NSString *targetResSArchivePath = targetResSNode ? [NSString stringWithFormat:@"archive:/%@/%@", cab, resSNodePath] : nil;
     NSMutableArray<SerializedObject *> *pendingNewObjects = [NSMutableArray array];
@@ -409,7 +413,7 @@ static TextureAtlasTransplantResult *tat_transplant_one(NSString *cachedPath,
     for (SerializedObject *moddedObj in moddedTable.objects) {
         SerializedObject *targetObj = [targetTable objectWithPathID:moddedObj.pathID];
         if (!targetObj) {
-            if (moddedObj.typeID != kTAT2ClassIDTexture2D && moddedObj.typeID != kTAT2ClassIDTextAsset) {
+            if (!moddedObj.classIDResolved || (moddedObj.classID != kTAT2ClassIDTexture2D && moddedObj.classID != kTAT2ClassIDTextAsset)) {
                 result.objectsSkippedWrongType++;
                 continue; // same type filter as the diff path below - see .h "1) Type filtering"
             }
@@ -426,19 +430,31 @@ static TextureAtlasTransplantResult *tat_transplant_one(NSString *cachedPath,
             }
             SerializedObject *newEntry = [SerializedObject new];
             newEntry.pathID = moddedObj.pathID;
+            // NOTE: still modded's own raw typeID (an index into MODDED's
+            // m_Types array), written as-is into TARGET's table by
+            // -insertObjects:... Now that classID is resolved, this
+            // could instead look up TARGET's own type index for
+            // moddedObj.classID (via a reverse map this file doesn't
+            // build) - not done here since this pass only covers
+            // resolving classID at parse time, but it's the same
+            // index-vs-file mistake this file's top note describes,
+            // just in the one path classID resolution doesn't reach yet.
             newEntry.typeID = moddedObj.typeID;
             [pendingNewObjects addObject:newEntry];
             [pendingNewPayloads addObject:payload];
             continue;
         }
         // Type filter - see kTAT2ClassIDTexture2D/kTAT2ClassIDTextAsset's
-        // comment above. targetObj.typeID and moddedObj.typeID are
-        // trusted equally here since a PathID shared across a stock/mod
-        // pair is always the same underlying asset, just re-serialized -
-        // this project has never seen a PathID change class between the
-        // two (same assumption TextureAtlasTransplant.h's top comment
-        // already makes for PathID identity generally).
-        if (moddedObj.typeID != kTAT2ClassIDTexture2D && moddedObj.typeID != kTAT2ClassIDTextAsset) {
+        // comment above. Filtering on moddedObj.classID alone (not also
+        // checking targetObj.classID) is deliberate: a PathID shared
+        // across a stock/mod pair is always the same underlying asset,
+        // just re-serialized - this project has never seen a PathID
+        // change class between the two (same assumption
+        // TextureAtlasTransplant.h's top comment already makes for
+        // PathID identity generally) - and moddedTable.typesResolved is
+        // already required (checked in +transplantFromModdedBundleAtURL:)
+        // so moddedObj.classIDResolved is trustworthy here.
+        if (!moddedObj.classIDResolved || (moddedObj.classID != kTAT2ClassIDTexture2D && moddedObj.classID != kTAT2ClassIDTextAsset)) {
             result.objectsSkippedWrongType++;
             continue;
         }
@@ -448,7 +464,7 @@ static TextureAtlasTransplantResult *tat_transplant_one(NSString *cachedPath,
         NSData *targetBytes = [targetCABData subdataWithRange:NSMakeRange((NSUInteger)(targetTable.dataOffset + targetObj.byteStart), targetObj.byteSize)];
         if ([moddedBytes isEqualToData:targetBytes]) continue; // identical - nothing to do
 
-        if (moddedObj.typeID == kTAT2ClassIDTexture2D) {
+        if (moddedObj.classID == kTAT2ClassIDTexture2D) {
             // Parse both sides' headers before touching anything - (a)
             // confirms kTAT2ProfileDefault against this pair, (b) gives
             // modded's declared format/dimensions for the decode step
@@ -694,6 +710,15 @@ static TextureAtlasTransplantResult *tat_transplant_one(NSString *cachedPath,
     SerializedObjectTable *moddedTable = [SerializedObjectTable tableForSerializedFileNodeData:moddedCABData error:&tableErr];
     if (!moddedTable) {
         if (error) *error = tableErr ?: TATError(TextureAtlasTransplantErrorModdedTableFailed, @"couldn't locate modded file's object table");
+        return nil;
+    }
+    if (!moddedTable.typesResolved) {
+        // Every object's classIDResolved is NO in this case - proceeding
+        // would silently skip every Texture2D/TextAsset as "wrong type"
+        // again (see this file's top note on why that's exactly the bug
+        // this project hit). Fail loudly here instead - see Verbose log
+        // for why the m_Types walk didn't cross-validate.
+        if (error) *error = TATError(TextureAtlasTransplantErrorModdedTableFailed, @"couldn't resolve modded bundle's Unity class IDs (m_Types) - see Verbose log");
         return nil;
     }
 
