@@ -548,16 +548,64 @@ static void ubc_append_cstring(NSMutableData *d, NSString *s) {
             [out appendData:pad];
         }
     }
-    [out appendData:archive.data];
 
-    int64_t totalSize = (int64_t)out.length;
+    // Entry 5 fix: this used to be `[out appendData:archive.data]`
+    // followed by one `-writeToFile:...` call. archive.data is already
+    // a full-bundle-size buffer (rebuilt by tat_rebuild_archive) by the
+    // time it gets here - appendData: made a THIRD full-size copy
+    // (after targetCABData/targetResSData and tat_rebuild_archive's own
+    // newData) alive at the exact peak of the whole transplant, right
+    // before the write NSData itself would materialize a fourth copy
+    // internally for -writeToFile:. See overview.md Entry 4/5. `out` at
+    // this point is only the small header+blocksInfo portion (tens of
+    // bytes), so instead we know the total size arithmetically (no need
+    // to concatenate to measure it), backpatch that, then stream `out`
+    // and archive.data to a temp file as two separate writes and swap
+    // it into place - same atomicity `NSDataWritingAtomic` gave us,
+    // without ever holding both in one buffer.
+    int64_t totalSize = (int64_t)(out.length + archive.data.length);
     uint8_t sizeBytes[8];
     for (int i = 0; i < 8; i++) sizeBytes[i] = (uint8_t)((uint64_t)totalSize >> (8 * (7 - i)));
     [out replaceBytesInRange:NSMakeRange(totalSizeFieldOffset, 8) withBytes:sizeBytes];
 
-    NSError *writeErr = nil;
-    if (![out writeToFile:path options:NSDataWritingAtomic error:&writeErr]) {
-        if (error) *error = writeErr ?: [NSError errorWithDomain:UnityBundleCABErrorDomain code:UnityBundleCABErrorCantReadFile userInfo:nil];
+    NSString *tmpPath = [path stringByAppendingString:@".zsingularity-tmp"];
+    [NSFileManager.defaultManager removeItemAtPath:tmpPath error:nil]; // stale leftover from a prior crashed/killed write, if any
+
+    if (![NSFileManager.defaultManager createFileAtPath:tmpPath contents:nil attributes:nil]) {
+        if (error) *error = [NSError errorWithDomain:UnityBundleCABErrorDomain code:UnityBundleCABErrorCantReadFile userInfo:nil];
+        return NO;
+    }
+    NSError *handleErr = nil;
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingToURL:[NSURL fileURLWithPath:tmpPath] error:&handleErr];
+    if (!fh) {
+        if (error) *error = handleErr ?: [NSError errorWithDomain:UnityBundleCABErrorDomain code:UnityBundleCABErrorCantReadFile userInfo:nil];
+        [NSFileManager.defaultManager removeItemAtPath:tmpPath error:nil];
+        return NO;
+    }
+
+    @try {
+        [fh writeData:out];          // small: header + blocksInfo, already fully in memory
+        [fh writeData:archive.data]; // large: written straight from the caller's existing buffer, no extra copy made here
+        [fh closeFile];
+    } @catch (NSException *exc) {
+        [fh closeFile];
+        [NSFileManager.defaultManager removeItemAtPath:tmpPath error:nil];
+        if (error) *error = [NSError errorWithDomain:UnityBundleCABErrorDomain code:UnityBundleCABErrorCantReadFile userInfo:@{NSLocalizedDescriptionKey: exc.reason ?: @"write failed"}];
+        return NO;
+    }
+
+    // Atomic swap - matches NSDataWritingAtomic's guarantee that a
+    // reader never sees a partially-written file at `path`.
+    NSError *replaceErr = nil;
+    NSURL *resultingURL = nil;
+    if (![NSFileManager.defaultManager replaceItemAtURL:[NSURL fileURLWithPath:path]
+                                           withItemAtURL:[NSURL fileURLWithPath:tmpPath]
+                                          backupItemName:nil
+                                                 options:0
+                                        resultingItemURL:&resultingURL
+                                                   error:&replaceErr]) {
+        [NSFileManager.defaultManager removeItemAtPath:tmpPath error:nil];
+        if (error) *error = replaceErr ?: [NSError errorWithDomain:UnityBundleCABErrorDomain code:UnityBundleCABErrorCantReadFile userInfo:nil];
         return NO;
     }
     return YES;

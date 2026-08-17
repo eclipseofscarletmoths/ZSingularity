@@ -503,6 +503,16 @@ static TextureAtlasTransplantResult *tat_transplant_one(NSString *cachedPath,
     NSMutableArray<NSData *> *pendingNewPayloads = [NSMutableArray array];
 
     for (SerializedObject *moddedObj in moddedTable.objects) {
+      @autoreleasepool {
+        // Entry 5 fix: every iteration through this loop can decode a
+        // full-resolution RGBA32 scratch buffer (Texture2DPixelDecoder)
+        // and re-pack it (RawPixelPacker) - both autoreleased NSData.
+        // With no pool here, none of that is freed until
+        // tat_transplant_one itself returns, so a bundle with hundreds
+        // of large textures keeps every single decode/pack scratch
+        // buffer alive simultaneously on top of targetCABData/
+        // targetResSData. Draining per-object keeps only the current
+        // object's scratch buffers resident. See overview.md Entry 4/5.
         SerializedObject *targetObj = [targetTable objectWithPathID:moddedObj.pathID];
         if (!targetObj) {
             if (!moddedObj.classIDResolved || (moddedObj.classID != kTAT2ClassIDTexture2D && moddedObj.classID != kTAT2ClassIDTextAsset)) {
@@ -726,6 +736,7 @@ static TextureAtlasTransplantResult *tat_transplant_one(NSString *cachedPath,
             continue;
         }
         result.objectsTransplanted++;
+      } // @autoreleasepool
     }
 
     if (pendingNewObjects.count > 0) {
@@ -755,6 +766,18 @@ static TextureAtlasTransplantResult *tat_transplant_one(NSString *cachedPath,
     UnityBundleArchive *rebuilt = tat_rebuild_archive(targetArchive, targetCABNode.path, targetCABData,
                                                        targetResSNode ? resSNodePath : nil,
                                                        targetResSNode ? targetResSData : nil);
+
+    // Entry 5 fix: tat_rebuild_archive already copied every byte of
+    // targetCABData/targetResSData into rebuilt.data (see its
+    // appendData: loop over archive.nodes) - neither is read again
+    // below. Dropping these references here lets ARC free the two
+    // largest buffers in this function (up to ~bundle-size each)
+    // before +writeArchive:toPath: runs, instead of keeping them
+    // resident alongside rebuilt.data (and, previously, alongside
+    // writeArchive's own internal full-size copy - see
+    // UnityBundleCAB.m's Entry 5 fix) all the way to the write.
+    targetCABData = nil;
+    targetResSData = nil;
 
     NSError *writeErr = nil;
     if (![UnityBundleCAB writeArchive:rebuilt toPath:cachedPath error:&writeErr]) {
