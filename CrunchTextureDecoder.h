@@ -23,16 +23,20 @@
 // only DXT1/DXT5/RGBA32/RGB24/DXT5Crunched in Limbus Company's PC mod
 // bundles, no ETC crunch at all).
 //
-// VENDORING STEP: inc/crn_decomp.h is fetched fresh from that repo by
-// the "Fetch crn_decomp.h" step in .github/workflows/build.yml right
-// before the compile step, rather than being checked into this repo by
-// hand - it's a ~4-5k line third-party file with its own license header
-// that belongs staying an untouched, always-current pull from upstream,
-// not reproduced/paraphrased inside project-authored source. A local
-// build just needs that same file dropped at inc/crn_decomp.h next to
-// this one (single file, header+impl in one - see its own top comment
-// on the CRND_HEADER_FILE_ONLY/CRND_INCLUDE_CRND_H macros, neither of
-// which this project needs to define; a plain #include gets both the
+// VENDORING STEP: inc/crn_decomp.h AND inc/crnlib.h (the latter just for
+// a handful of basic CRN-related typedefs crn_decomp.h itself pulls in
+// via #include "crnlib.h", despite crn_decomp.h's own top comment
+// calling itself fully stand-alone - it isn't quite) are fetched fresh
+// from that repo by the "Fetch crn_decomp.h" step in
+// .github/workflows/build.yml right before the compile step, rather
+// than being checked into this repo by hand - they're third-party files
+// with their own license header that belong staying an untouched,
+// always-current pull from upstream, not reproduced/paraphrased inside
+// project-authored source. A local build just needs both files dropped
+// at inc/crn_decomp.h and inc/crnlib.h next to this one (single file,
+// header+impl in one - see crn_decomp.h's own top comment on the
+// CRND_HEADER_FILE_ONLY/CRND_INCLUDE_CRND_H macros, neither of which
+// this project needs to define; a plain #include gets both the
 // declarations and the implementation).
 //
 // WHY THIS ONLY EVER TARGETS THE BASE MIP LEVEL: same reasoning as

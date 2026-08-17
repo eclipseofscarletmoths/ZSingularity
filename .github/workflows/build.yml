@@ -44,12 +44,23 @@ jobs:
       # CrunchTextureDecoder.h's top comment) that belongs staying an
       # untouched upstream pull, not a vendored copy this repo has to
       # keep in sync by hand.
+      #
+      # crn_decomp.h's own top comment calls itself a fully stand-alone
+      # single-file library, but it isn't quite - line 16 is
+      # `#include "crnlib.h"`, just to pull in a handful of basic
+      # CRN-related types (crn_uint32 and friends), not anything from
+      # the actual crn COMPRESSION side. So crnlib.h has to be fetched
+      # alongside it into the same -I inc directory, even though this
+      # project never calls into crnlib itself.
       - name: Fetch crn_decomp.h
         run: |
           mkdir -p inc
           curl -fsSL -o inc/crn_decomp.h \
             https://raw.githubusercontent.com/BinomialLLC/crunch/master/inc/crn_decomp.h
+          curl -fsSL -o inc/crnlib.h \
+            https://raw.githubusercontent.com/BinomialLLC/crunch/master/inc/crnlib.h
           test -s inc/crn_decomp.h
+          test -s inc/crnlib.h
 
       # CrunchTextureDecoder.mm is Objective-C++ (crn_decomp.h is C++ -
       # namespaces, the crnd_unpack_context typedef, etc. - see that
