@@ -73,8 +73,26 @@ static NSArray<NSString *> *tat_find_cached_paths_for_cab(NSString *cab, NSStrin
 // object being specifically a Texture2D.
 //
 // Returns YES and fills *outOffsetFieldPos (the byte position, relative
-// to objectBytes' own start, of the 8-byte offset field - size/path
+// to objectBytes' own start, of the 8-byte offset field - size/pathLen/path
 // immediately follow it) if found.
+//
+// FIXED 2026-08-17 (see overview.md Entry 3): this used to return i-12,
+// which only reserves 8 (offset) + 4 bytes before the text - i.e. it
+// treated the path's own u32 length prefix (declaredLen, read from
+// base[i-4..i-1]) as if it were also StreamingInfo's separate u32 size
+// field, double-counting one 4-byte slot for two different fields. The
+// real layout is offset(8) + size(4) + pathLen(4) = 16 bytes before the
+// text, confirmed by hand against real Texture2D object bytes pulled from
+// Dumps.zip (offset field's own u64 landed on a plausible .resS byte
+// offset, and the size field 8 bytes later matched that same object's
+// independently-parsed m_CompleteImageSize exactly, only when using i-16 -
+// i-12 landed 4 bytes into the middle of the size field instead). This was
+// silently poisoning streamDataPositionConfirmed for every streamed
+// object, which in turn made every TAT2VersionProfile - correct or not -
+// fail Texture2DFields.m's cross-check, which is why
+// +detectVersionProfile:... was finding zero surviving candidates on real
+// device runs even though the leading-field profile itself was mostly
+// fine. Not a version-dependent bug - this is wrong on every build.
 static BOOL tat_find_stream_data_offset_field(NSData *objectBytes, NSUInteger *outOffsetFieldPos) {
     static const char *kNeedle = "archive:/";
     NSUInteger needleLen = strlen(kNeedle);
@@ -90,12 +108,12 @@ static BOOL tat_find_stream_data_offset_field(NSData *objectBytes, NSUInteger *o
         // NUL-free within this object, not necessarily NUL-terminated
         // since Unity string fields are length-prefixed, not
         // C-terminated).
-        if (i < 12) continue; // need 8 (offset) + 4 (size) bytes before the 4-byte length prefix too
+        if (i < 16) continue; // need 8 (offset) + 4 (size) bytes before the 4-byte length prefix too
         uint32_t declaredLen = (uint32_t)base[i-4] | ((uint32_t)base[i-3] << 8) | ((uint32_t)base[i-2] << 16) | ((uint32_t)base[i-1] << 24);
         if (declaredLen == 0 || i + declaredLen > len) continue;
         if (declaredLen < needleLen) continue;
-        // Plausible match - offset field is 12 bytes before the path text starts (8 for offset, 4 for size).
-        *outOffsetFieldPos = i - 12;
+        // Plausible match - offset field is 16 bytes before the path text starts (8 for offset, 4 for size, 4 for the path's own length prefix).
+        *outOffsetFieldPos = i - 16;
         return YES;
     }
     return NO;
