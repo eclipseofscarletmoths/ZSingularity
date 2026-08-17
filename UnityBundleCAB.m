@@ -91,7 +91,7 @@ typedef struct {
     size_t   headerEndPos;    // stream position immediately after the header (+ alignment)
 } UBCHeader;
 
-static BOOL ubc_parse_header(UBCCursor *c, UBCHeader *out, NSError **error) {
+static BOOL ubc_parse_header(UBCCursor *c, UBCHeader *out, NSString **outUnityVersion, NSString **outUnityRevision, NSError **error) {
     static const char kSig[] = "UnityFS";
     if (!ubc_need(c, sizeof(kSig))) {
         if (error) *error = [NSError errorWithDomain:UnityBundleCABErrorDomain code:UnityBundleCABErrorTooSmall userInfo:nil];
@@ -119,6 +119,8 @@ static BOOL ubc_parse_header(UBCCursor *c, UBCHeader *out, NSError **error) {
         return NO;
     }
     (void)formatVersion; // no longer branched on - see padding fix below
+    if (outUnityVersion) *outUnityVersion = unityVersion;
+    if (outUnityRevision) *outUnityRevision = unityRevision;
 
     // Bit 6 (0x40) is BlocksAndDirectoryInfoCombined - unrelated to
     // location, and set on essentially every modern bundle. Bit 7 (0x80)
@@ -130,20 +132,31 @@ static BOOL ubc_parse_header(UBCCursor *c, UBCHeader *out, NSError **error) {
     // real __data_modded [0xc3, bit 0x80 set] vs __data_unmodded [0x243,
     // bit 0x80 NOT set] - only the latter was affected).
     BOOL blocksInfoAtEnd = (flags & 0x80) != 0;
-    BOOL needsPaddingAtStart = (flags & 0x200) != 0;
 
-    // Stream alignment: gated on flags bit 9 (0x200,
-    // BlockInfoNeedPaddingAtStart), not on format version - and the pad
-    // target is a 16-byte boundary, not 4. Previously gated on
-    // `formatVersion >= 7` with a 4-byte target, which for
-    // __data_unmodded (header ends at byte 44, already 4-aligned) applied
-    // zero padding when 4 bytes were actually required to reach the real
-    // 16-byte-aligned start at byte 48 - corrupting the very first LZ4
-    // token blocksInfo decompression read. Only applies when blocksInfo
-    // is NOT at EOF - when it's stored at EOF instead, its location comes
-    // from the archive's total size, not this stream position, so there
-    // is nothing to align here.
-    if (!blocksInfoAtEnd && needsPaddingAtStart) {
+    // Stream alignment to a 16-byte boundary (from file start, not
+    // relative to the header) - UNCONDITIONAL, not gated on flags bit 9
+    // (0x200) as this used to be. That gating was itself a previous fix
+    // (see git history/comments this replaced) for a real bug where a
+    // 4-byte target did nothing on an already-4-aligned header - but
+    // gating the 16-byte fix on bit 9 turned out to be its own bug,
+    // caught by checking a bundle with bit 9 CLEAR: its blocks-info
+    // decompression read block_count as 0 (impossible for a real
+    // archive with data in it - see below) when read from the
+    // unaligned position 44, and a sane, size-consistent block_count
+    // when read from 48 instead - i.e. this file needed the same
+    // alignment despite bit 9 not asking for it. Confirmed against
+    // three independent real archives (two different flag combinations
+    // with bit 9 SET, one with it CLEAR) that the unconditional version
+    // below is what every one of them actually needs, both for where
+    // inline blocks-info starts and (see
+    // ubc_decompress_data_blocks below) for where the data blocks that
+    // follow it start. Only applies when blocksInfo is NOT at EOF -
+    // when it's stored at EOF instead, its location comes from the
+    // archive's total size, not this stream position, so there is
+    // nothing to align here (though the data blocks that precede it in
+    // that case still get their own alignment - see
+    // ubc_decompress_data_blocks).
+    if (!blocksInfoAtEnd) {
         size_t rem = c->pos % 16;
         if (rem != 0) {
             if (!ubc_skip(c, 16 - rem)) {
@@ -268,7 +281,7 @@ static NSArray<NSString *> *ubc_all_node_paths(NSString *path, NSError **error) 
 
     UBCCursor c = { .base = fileData.bytes, .size = fileData.length, .pos = 0 };
     UBCHeader header;
-    if (!ubc_parse_header(&c, &header, error)) return nil;
+    if (!ubc_parse_header(&c, &header, NULL, NULL, error)) return nil;
 
     NSData *blocksInfo = ubc_extract_blocks_info(fileData, &header, error);
     if (!blocksInfo) return nil;
@@ -276,7 +289,156 @@ static NSArray<NSString *> *ubc_all_node_paths(NSString *path, NSError **error) 
     return ubc_parse_node_paths(blocksInfo, error);
 }
 
+#pragma mark - Full data-block decompression (offset/size, not just names)
+
+// Same blocks-info structure ubc_parse_node_paths walks, but keeping the
+// per-block usize/csize/flags (needed to actually decompress the DATA
+// blocks that follow blocks-info in the file, not just skip over their
+// header entries) and the nodes' offset/size (needed so callers can slice
+// `data` per-node, not just identify which node is which by name).
+typedef struct { uint32_t uSize, cSize; uint16_t bFlags; } UBCBlockEntry;
+
+static BOOL ubc_parse_blocks_info_full(NSData *blocksInfo,
+                                        NSMutableArray<NSValue *> *outBlocks, // boxed UBCBlockEntry
+                                        NSMutableArray<UnityBundleNode *> *outNodes,
+                                        NSError **error) {
+    UBCCursor c = { .base = blocksInfo.bytes, .size = blocksInfo.length, .pos = 0 };
+    if (!ubc_skip(&c, 16)) goto malformed;
+
+    uint32_t blockCount;
+    if (!ubc_read_u32_be(&c, &blockCount)) goto malformed;
+    for (uint32_t i = 0; i < blockCount; i++) {
+        UBCBlockEntry be;
+        if (!ubc_read_u32_be(&c, &be.uSize) || !ubc_read_u32_be(&c, &be.cSize) || !ubc_read_u16_be(&c, &be.bFlags)) goto malformed;
+        [outBlocks addObject:[NSValue valueWithBytes:&be objCType:@encode(UBCBlockEntry)]];
+    }
+
+    uint32_t nodeCount;
+    if (!ubc_read_u32_be(&c, &nodeCount)) goto malformed;
+    for (uint32_t i = 0; i < nodeCount; i++) {
+        int64_t nOffset, nSize; uint32_t nFlags; NSString *path;
+        if (!ubc_read_i64_be(&c, &nOffset) || !ubc_read_i64_be(&c, &nSize) ||
+            !ubc_read_u32_be(&c, &nFlags) || !ubc_read_cstring(&c, &path)) goto malformed;
+        (void)nFlags;
+        UnityBundleNode *node = [UnityBundleNode new];
+        node.path = path; node.offset = nOffset; node.size = nSize;
+        [outNodes addObject:node];
+    }
+    if (outNodes.count == 0) {
+        if (error) *error = [NSError errorWithDomain:UnityBundleCABErrorDomain code:UnityBundleCABErrorNoNodes userInfo:nil];
+        return NO;
+    }
+    return YES;
+
+malformed:
+    if (error) *error = [NSError errorWithDomain:UnityBundleCABErrorDomain code:UnityBundleCABErrorMalformedBlocksInfo userInfo:nil];
+    return NO;
+}
+
+// Decompresses every DATA block (the payload that follows blocks-info in
+// the file - the actual node bytes, as opposed to the directory
+// metadata ubc_extract_blocks_info above already handles) into one
+// contiguous buffer, in block order.
+static NSData *ubc_decompress_data_blocks(NSData *fileData,
+                                           const UBCHeader *header,
+                                           NSArray<NSValue *> *blocks,
+                                           NSError **error) {
+    // Data blocks are stored right after this archive's own header (never
+    // at EOF regardless of where blocks-info itself lives - blocks-info's
+    // own EOF placement is a separate, independent choice from where the
+    // data blocks are), 16-byte aligned from file start the same
+    // UNCONDITIONAL way ubc_parse_header now aligns blocks-info's own
+    // start (see the comment there for the evidence this isn't gated on
+    // flags bit 9). Checked against all three real archives this project
+    // has on hand: when blocks-info is inline (bit 7 clear), data starts
+    // 16-byte-aligned right after it; when blocks-info is stored at EOF
+    // instead (bit 7 set), data starts 16-byte-aligned right after the
+    // header instead, since there's no inline blocks-info bytes to skip
+    // past first - both landed on byte 48 in every sample seen so far
+    // (headerEndPos 44, next 16-byte boundary), which is why this was
+    // easy to miss as "no alignment needed" if you only ever tested
+    // already-16-aligned headers.
+    size_t dataStart = header->headerEndPos;
+    if (!header->blocksInfoAtEnd) {
+        dataStart += header->compressedBlocksInfoSize;
+    }
+    {
+        size_t rem = dataStart % 16;
+        if (rem != 0) dataStart += (16 - rem);
+    }
+
+    NSMutableData *out = [NSMutableData data];
+    size_t cursor = dataStart;
+    size_t fileSize = fileData.length;
+    const uint8_t *base = (const uint8_t *)fileData.bytes;
+
+    for (NSValue *v in blocks) {
+        UBCBlockEntry be; [v getValue:&be];
+        if (cursor > fileSize || be.cSize > fileSize - cursor) {
+            if (error) *error = [NSError errorWithDomain:UnityBundleCABErrorDomain code:UnityBundleCABErrorMalformedBlocksInfo userInfo:nil];
+            return nil;
+        }
+        const uint8_t *blockBytes = base + cursor;
+        uint8_t compType = (uint8_t)(be.bFlags & 0x3F);
+        switch (compType) {
+            case 0: {
+                size_t n = MIN(be.cSize, be.uSize);
+                [out appendBytes:blockBytes length:n];
+                break;
+            }
+            case 2:
+            case 3: {
+                NSMutableData *chunk = [NSMutableData dataWithLength:be.uSize];
+                if (be.uSize > 0) {
+                    int written = LZ4BlockDecompress(blockBytes, be.cSize, (uint8_t *)chunk.mutableBytes, be.uSize);
+                    if (written < 0 || (uint32_t)written != be.uSize) {
+                        if (error) *error = [NSError errorWithDomain:UnityBundleCABErrorDomain code:UnityBundleCABErrorDecompressFailed userInfo:nil];
+                        return nil;
+                    }
+                }
+                [out appendData:chunk];
+                break;
+            }
+            default:
+                if (error) *error = [NSError errorWithDomain:UnityBundleCABErrorDomain code:UnityBundleCABErrorUnsupportedCompression userInfo:@{
+                    NSLocalizedDescriptionKey: [NSString stringWithFormat:@"Data block uses compression type %u (not none/LZ4/LZ4HC) - unsupported, see UnityBundleCAB.h", compType]
+                }];
+                return nil;
+        }
+        cursor += be.cSize;
+    }
+    return out;
+}
+
+#pragma mark - Writing (compression none, blocks-info inline, single block)
+
+static void ubc_append_u32_be(NSMutableData *d, uint32_t v) {
+    uint8_t b[4] = { (uint8_t)(v >> 24), (uint8_t)(v >> 16), (uint8_t)(v >> 8), (uint8_t)v };
+    [d appendBytes:b length:4];
+}
+static void ubc_append_u16_be(NSMutableData *d, uint16_t v) {
+    uint8_t b[2] = { (uint8_t)(v >> 8), (uint8_t)v };
+    [d appendBytes:b length:2];
+}
+static void ubc_append_i64_be(NSMutableData *d, int64_t v) {
+    uint64_t u = (uint64_t)v;
+    uint8_t b[8];
+    for (int i = 0; i < 8; i++) b[i] = (uint8_t)(u >> (8 * (7 - i)));
+    [d appendBytes:b length:8];
+}
+static void ubc_append_cstring(NSMutableData *d, NSString *s) {
+    [d appendData:[s dataUsingEncoding:NSUTF8StringEncoding]];
+    uint8_t nul = 0;
+    [d appendBytes:&nul length:1];
+}
+
 #pragma mark - Public API
+
+@implementation UnityBundleNode
+@end
+
+@implementation UnityBundleArchive
+@end
 
 @implementation UnityBundleCAB
 
@@ -287,6 +449,118 @@ static NSArray<NSString *> *ubc_all_node_paths(NSString *path, NSError **error) 
 
 + (nullable NSArray<NSString *> *)allNodePathsForBundleAtPath:(NSString *)path error:(NSError **)error {
     return ubc_all_node_paths(path, error);
+}
+
++ (nullable UnityBundleArchive *)decompressedArchiveAtPath:(NSString *)path error:(NSError **)error {
+    NSData *fileData = [NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:error];
+    if (!fileData) {
+        if (error && !*error) *error = [NSError errorWithDomain:UnityBundleCABErrorDomain code:UnityBundleCABErrorCantReadFile userInfo:nil];
+        return nil;
+    }
+
+    UBCCursor c = { .base = fileData.bytes, .size = fileData.length, .pos = 0 };
+    UBCHeader header;
+    NSString *unityVersion, *unityRevision;
+    if (!ubc_parse_header(&c, &header, &unityVersion, &unityRevision, error)) return nil;
+
+    NSData *blocksInfo = ubc_extract_blocks_info(fileData, &header, error);
+    if (!blocksInfo) return nil;
+
+    NSMutableArray<NSValue *> *blocks = [NSMutableArray array];
+    NSMutableArray<UnityBundleNode *> *nodes = [NSMutableArray array];
+    if (!ubc_parse_blocks_info_full(blocksInfo, blocks, nodes, error)) return nil;
+
+    NSData *decompressed = ubc_decompress_data_blocks(fileData, &header, blocks, error);
+    if (!decompressed) return nil;
+
+    UnityBundleArchive *archive = [UnityBundleArchive new];
+    archive.unityVersion = unityVersion;
+    archive.unityRevision = unityRevision;
+    archive.data = decompressed;
+    archive.nodes = nodes;
+    return archive;
+}
+
++ (BOOL)writeArchive:(UnityBundleArchive *)archive toPath:(NSString *)path error:(NSError **)error {
+    // 1) blocks-info blob: 16-byte hash (zero - not verified on read, so
+    //    not worth computing on write either), one block entry covering
+    //    the whole of archive.data uncompressed, then the node table
+    //    verbatim (same offsets/sizes/paths - this doesn't add, remove,
+    //    or reorder nodes, only what's already inside archive.data).
+    NSMutableData *blocksInfo = [NSMutableData data];
+    uint8_t zeroHash[16] = {0};
+    [blocksInfo appendBytes:zeroHash length:16];
+    ubc_append_u32_be(blocksInfo, 1); // block count
+    ubc_append_u32_be(blocksInfo, (uint32_t)archive.data.length); // uncompressed size
+    ubc_append_u32_be(blocksInfo, (uint32_t)archive.data.length); // compressed size (== uncompressed, type none)
+    ubc_append_u16_be(blocksInfo, 0); // compression type 0 (none), no other flags
+    ubc_append_u32_be(blocksInfo, (uint32_t)archive.nodes.count);
+    for (UnityBundleNode *node in archive.nodes) {
+        ubc_append_i64_be(blocksInfo, node.offset);
+        ubc_append_i64_be(blocksInfo, node.size);
+        ubc_append_u32_be(blocksInfo, 4); // node flags - 4 (kSerializedFile-ish) on every real sample seen; not verified beyond that
+        ubc_append_cstring(blocksInfo, node.path);
+    }
+
+    // 2) fixed header, blocks-info stored inline (bit 7 clear) - flags =
+    //    combined(0x40) only; compression type 0 in the low bits is
+    //    already 0 so nothing to OR in there. No bit 9: this is a fresh
+    //    write, header always ends already 16-byte aligned (see below),
+    //    so there's genuinely nothing to pad - bit 9's real trigger
+    //    condition isn't confirmed (see the read-side comment), so this
+    //    just doesn't claim it either way rather than setting a flag
+    //    whose meaning here isn't verified.
+    NSMutableData *out = [NSMutableData data];
+    [out appendData:[@"UnityFS\0" dataUsingEncoding:NSUTF8StringEncoding]];
+    ubc_append_u32_be(out, 8); // format version - copying the one every real sample has used so far
+    ubc_append_cstring(out, archive.unityVersion ?: @"5.x.x");
+    ubc_append_cstring(out, archive.unityRevision ?: @"0.0.0");
+
+    // total archive size gets backpatched once we know the final length
+    NSUInteger totalSizeFieldOffset = out.length;
+    ubc_append_i64_be(out, 0);
+
+    ubc_append_u32_be(out, (uint32_t)blocksInfo.length); // compressed == uncompressed, type none
+    ubc_append_u32_be(out, (uint32_t)blocksInfo.length);
+    ubc_append_u32_be(out, 0x40); // flags: combined bit only
+
+    // Header is 8("UnityFS\0")+4+len(unityVersion)+1+len(unityRevision)+1+8+4+4+4.
+    // Every real sample this project has seen puts this at exactly 44
+    // bytes for "5.x.x\0"/"0.0.0\0", which is already 16-byte aligned -
+    // but pad explicitly rather than assume, since a longer/different
+    // version string would change that.
+    {
+        size_t rem = out.length % 16;
+        if (rem != 0) {
+            NSMutableData *pad = [NSMutableData dataWithLength:16 - rem];
+            [out appendData:pad];
+        }
+    }
+
+    [out appendData:blocksInfo];
+    // Data blocks also 16-byte align from this point per the read-side
+    // finding - true here too since blocksInfo.length isn't generally a
+    // multiple of 16.
+    {
+        size_t rem = out.length % 16;
+        if (rem != 0) {
+            NSMutableData *pad = [NSMutableData dataWithLength:16 - rem];
+            [out appendData:pad];
+        }
+    }
+    [out appendData:archive.data];
+
+    int64_t totalSize = (int64_t)out.length;
+    uint8_t sizeBytes[8];
+    for (int i = 0; i < 8; i++) sizeBytes[i] = (uint8_t)((uint64_t)totalSize >> (8 * (7 - i)));
+    [out replaceBytesInRange:NSMakeRange(totalSizeFieldOffset, 8) withBytes:sizeBytes];
+
+    NSError *writeErr = nil;
+    if (![out writeToFile:path options:NSDataWritingAtomic error:&writeErr]) {
+        if (error) *error = writeErr ?: [NSError errorWithDomain:UnityBundleCABErrorDomain code:UnityBundleCABErrorCantReadFile userInfo:nil];
+        return NO;
+    }
+    return YES;
 }
 
 @end

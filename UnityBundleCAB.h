@@ -74,7 +74,55 @@ typedef NS_ENUM(NSInteger, UnityBundleCABErrorCode) {
     UnityBundleCABErrorNoNodes,                 // parsed fine, but the directory table is empty
 };
 
+// One directory-table entry, WITH its offset/size (not just its name -
+// see UnityBundleCAB's own array-of-names methods below for the
+// names-only version). offset/size are into +decompressedArchiveAtPath:'s
+// .data - i.e. already resolved past whatever block layout/compression
+// the file used on disk.
+@interface UnityBundleNode : NSObject
+@property (nonatomic, copy) NSString *path;   // e.g. @"CAB-...", or @"CAB-....resS"
+@property (nonatomic, assign) int64_t offset; // into the owning archive's .data
+@property (nonatomic, assign) int64_t size;
+@end
+
+// A UnityFS archive with every block actually decompressed and
+// concatenated into one buffer - what TextureAtlasTransplant.h (and
+// anything else that needs to read/patch bytes INSIDE a node, not just
+// identify nodes by name) needs that +primaryCABForBundleAtPath:error:
+// and +allNodePathsForBundleAtPath:error: don't provide, since those two
+// only ever decompress the much smaller blocks-info blob.
+@interface UnityBundleArchive : NSObject
+@property (nonatomic, copy) NSString *unityVersion;   // preserved as-is for the rewrite
+@property (nonatomic, copy) NSString *unityRevision;  // preserved as-is for the rewrite
+@property (nonatomic, strong) NSData *data;           // every node's bytes, concatenated, decompressed
+@property (nonatomic, copy) NSArray<UnityBundleNode *> *nodes;
+@end
+
 @interface UnityBundleCAB : NSObject
+
+// Like +allNodePathsForBundleAtPath:error:, but decompresses every data
+// block (not just blocks-info) and hands back the whole thing as one
+// contiguous buffer plus each node's offset/size into it - LZMA/LZHAM
+// are still unsupported (see the error codes above), and now so is any
+// bundle whose DATA blocks (as opposed to just its blocks-info) use one
+// of those, for the same reason.
++ (nullable UnityBundleArchive *)decompressedArchiveAtPath:(NSString *)path error:(NSError **)error;
+
+// Serializes `archive` back out as a valid UnityFS file at `path` and
+// writes it atomically. Always writes uncompressed (compression type 0)
+// blocks-info stored inline (not at EOF) as a single block covering the
+// whole of `archive.data` - this is deliberately the simplest valid
+// shape this format allows, not a byte-for-byte reproduction of
+// whatever compression/block-count the original had. Confirmed
+// on-device (see PatchManifestNetwork's own manifest-patching, and the
+// uncompressed-bundle test that preceded this file) that the mobile
+// client's UnityFS loader accepts fully uncompressed archives without
+// issue, so there's no reason to reimplement an LZ4 *encoder* (only
+// LZ4BlockDecoder.h's decoder exists in this project) just to preserve
+// the original's compression.
++ (BOOL)writeArchive:(UnityBundleArchive *)archive toPath:(NSString *)path error:(NSError **)error;
+
+
 
 // The archive's own name (its first directory node's path), e.g.
 // @"CAB-3832197875c1bd4d48da9ab24c88e996". nil + error filled if this

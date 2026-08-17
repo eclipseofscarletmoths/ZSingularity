@@ -1,0 +1,178 @@
+// Texture2DFields.h
+//
+// TextureAtlasTransplant.m's existing object-level diff/copy treats
+// every object as an opaque blob - fine for TextAsset (identical bytes
+// across platforms - see BundleTransplant.m's own README note) but not
+// for Texture2D, where the SAME PathID's bytes differ across platforms
+// on purpose: PC's are DXT/DXT5Crunched, iOS's are ASTC 6x6, and the
+// object's own header fields (m_TextureFormat/m_Width/m_Height/
+// m_MipCount/m_CompleteImageSize) declare which. A verbatim byte copy
+// carries PC's header (and PC's compressed pixels) into an iOS bundle
+// wholesale - Metal can't bind DXT at all, so the object doesn't just
+// look wrong, texture creation fails outright.
+//
+// This file is ONLY the reader/writer for those header fields inside
+// one already-located Texture2D object's own byte range (from
+// SerializedObjectTable - see that header for how the object itself is
+// found). It does not decode pixels - that's a separate module this
+// plugs into once it exists. It also does not decide WHAT to write;
+// callers (TextureAtlasTransplant.m) own that decision.
+//
+// WHY A "VERSION PROFILE" INSTEAD OF ONE FIXED LAYOUT: Texture2D's
+// serialized field list has grown new bool/int fields across Unity
+// versions (m_IsAlphaChannelOptional in 2020.2, m_MipsStripped in
+// 2020.1, m_StreamingMipmaps/Priority in 2020.2, m_IgnoreMipmapLimit's
+// 2022.2 rename, m_PlatformBlob in 2020.1...) - same "genuinely complex,
+// deeply version/flag-conditional layout" problem
+// SerializedObjectTable.h already flagged for the Types array, and this
+// project has the same answer for it here as it did there: don't
+// silently trust one hardcoded guess. kTAT2ProfileDefault below is a
+// STARTING POINT (Unity 2021/2022 LTS field set, the likely range for a
+// game built in the last few years) - it has NOT been confirmed against
+// one of this project's own real Texture2D dumps the way
+// SerializedObjectTable's table-scan and TextureAtlasTransplant's
+// StreamingInfo pattern-match were. +parseHeaderInObjectBytes:... below
+// self-validates its landing spot (width/height in a plausible pixel
+// range, format in the known enum set, and - if the object streams -
+// the computed header-end lines up with where
+// tat_find_stream_data_offset_field independently found "archive:/...")
+// and refuses to return a result if any of that disagrees, rather than
+// returning field offsets that merely didn't crash. If it refuses on
+// real data, the fix is adjusting the profile's flags against one
+// actual object dump, not loosening the validation.
+
+#import <Foundation/Foundation.h>
+
+NS_ASSUME_NONNULL_BEGIN
+
+extern NSString * const Texture2DFieldsErrorDomain;
+
+// Known m_TextureFormat values this project cares about - see the
+// project's own notes (PC mods: RGBA32/DXT1/DXT5/DXT5Crunched; iOS
+// stock: RGBA ASTC 6x6 only). Anything else encountered is still
+// reported (rawFormat on Texture2DHeader is unfiltered) but
+// +decodeSupportedFormat: below only claims these four.
+typedef NS_ENUM(int32_t, TAT2TextureFormat) {
+    TAT2TextureFormatRGBA32          = 4,
+    TAT2TextureFormatDXT1            = 10,
+    TAT2TextureFormatDXT5            = 12,
+    TAT2TextureFormatRGBAASTC6x6     = 50,
+    TAT2TextureFormatDXT5Crunched    = 29,
+};
+
+// Which version-conditional fields are present, in Unity's own
+// serialization order, between m_Name and m_Width. See this header's
+// top comment - kTAT2ProfileDefault is a best-guess starting point, not
+// a confirmed one.
+typedef struct {
+    BOOL hasForcedFallbackFormat;     // int, 2017.3+
+    BOOL hasDownscaleFallback;        // bool, 2017.3+
+    BOOL hasIsAlphaChannelOptional;   // bool, 2020.2+
+    // (m_Width, m_Height, m_CompleteImageSize always present here)
+    BOOL hasMipsStripped;             // int, 2020.1+
+    // (m_TextureFormat always present here)
+    BOOL hasMipCountAsInt;            // 2017.3+: int m_MipCount. Pre-2017.3 used bool m_MipMap instead - NOT supported, this project has no pre-2017.3 sample and Limbus Company is not that old.
+    BOOL hasIsPreProcessed;           // bool, long-standing
+    BOOL hasIgnoreMipmapLimit;        // bool, present under this name or the older m_IgnoreMasterTextureLimit across the whole range this project targets
+    BOOL hasStreamingMipmaps;         // bool, 2020.2+
+    BOOL hasStreamingMipmapsPriority; // int, 2020.2+ (only meaningful if hasStreamingMipmaps)
+    // (m_ImageCount, m_TextureDimension, GLTextureSettings block,
+    //  m_LightmapFormat, m_ColorSpace always present here, fixed size -
+    //  see the .m for their sizes)
+    BOOL hasPlatformBlob;             // byte array (u32 len + bytes, aligned), 2020.1+
+    // then: image data byte array (u32 len + bytes, aligned), then
+    // m_StreamData (StreamingInfo) IF this object streams - detected
+    // via tat_find_stream_data_offset_field, not via this profile.
+} TAT2VersionProfile;
+
+// Unity 2021/2022 LTS field set - see top comment. Confirm against one
+// real dump before trusting in production; +parseHeaderInObjectBytes:...
+// will refuse rather than silently misparse if this is wrong, but
+// "refuses" and "silently off by one bool" are different failure modes
+// and only the validation catches the first one.
+extern const TAT2VersionProfile kTAT2ProfileDefault;
+
+// Everything this module can locate/patch about one Texture2D object's
+// own bytes. All offsets are relative to the object's own byte range
+// (i.e. objectBytes[0] is this object's first byte, same convention
+// TextureAtlasTransplant.m already uses for moddedBytes/targetBytes -
+// NOT relative to the owning node's dataOffset).
+@interface Texture2DHeader : NSObject
+
+@property (nonatomic, assign, readonly) int32_t width;
+@property (nonatomic, assign, readonly) int32_t height;
+@property (nonatomic, assign, readonly) int32_t completeImageSize;
+@property (nonatomic, assign, readonly) int32_t rawFormat;   // unfiltered m_TextureFormat value - see TAT2TextureFormat for the known ones
+@property (nonatomic, assign, readonly) int32_t mipCount;
+
+// Byte offsets of each field above, for patching - see
+// -patchWidth:height:completeImageSize:format:mipCount:inObjectBytes:.
+@property (nonatomic, assign, readonly) NSUInteger widthOffset;
+@property (nonatomic, assign, readonly) NSUInteger heightOffset;
+@property (nonatomic, assign, readonly) NSUInteger completeImageSizeOffset;
+@property (nonatomic, assign, readonly) NSUInteger formatOffset;
+@property (nonatomic, assign, readonly) NSUInteger mipCountOffset;
+
+// The inline image-data byte array (u32 length prefix + that many
+// bytes) that sits after the fixed header fields and before
+// m_StreamData (if any). imageDataLengthFieldOffset points at the u32
+// length prefix itself; imageDataOffset/imageDataLength describe the
+// bytes right after it. For a streamed object this array is normally
+// empty (imageDataLength == 0) - the real pixels live in .resS,
+// reached via TextureAtlasTransplant.m's existing
+// tat_find_stream_data_offset_field, not through this array.
+@property (nonatomic, assign, readonly) NSUInteger imageDataLengthFieldOffset;
+@property (nonatomic, assign, readonly) NSUInteger imageDataOffset;
+@property (nonatomic, assign, readonly) NSUInteger imageDataLength;
+
+// YES if streamDataOffsetFieldPos (as found by
+// tat_find_stream_data_offset_field, pass NSNotFound if the caller
+// hasn't found one / this object doesn't stream) sits exactly where
+// this parse expects m_StreamData to start (immediately after the
+// image-data array, 4-byte aligned). This is the main cross-check that
+// catches a wrong TAT2VersionProfile - see this header's top comment.
+@property (nonatomic, assign, readonly) BOOL streamDataPositionConfirmed;
+
+// Parses objectBytes (one Texture2D object's own byte range - see this
+// class's top comment on the offset convention) using `profile` for the
+// version-conditional fields before m_Width. streamDataOffsetFieldPos:
+// pass the value tat_find_stream_data_offset_field already found for
+// this same objectBytes (or NSNotFound if it found none / this object
+// doesn't stream) - used only for streamDataPositionConfirmed's
+// cross-check, not for locating anything itself.
+//
+// Returns nil if: objectBytes is too short to hold the fixed fields
+// this profile implies, OR width/height parse outside 1...8192, OR
+// rawFormat parses outside a generous plausible int32 enum range, OR
+// (when streamDataOffsetFieldPos != NSNotFound) the computed image-data
+// array's end doesn't land exactly on streamDataOffsetFieldPos. Any of
+// these means `profile` is wrong for this object, not that the object
+// itself is malformed - see this header's top comment before loosening
+// this check.
++ (nullable instancetype)parseHeaderInObjectBytes:(NSData *)objectBytes
+                                           profile:(TAT2VersionProfile)profile
+                        streamDataOffsetFieldPos:(NSUInteger)streamDataOffsetFieldPos
+                                             error:(NSError **)error;
+
+// In-place patch of the five fixed-size int32 fields this header
+// located - does NOT touch imageData (that's a variable-length array;
+// callers replace it themselves the same way
+// TextureAtlasTransplant.m's tat_transplant_one already grows/appends
+// payload, then re-run a fresh parse against the rebuilt bytes if they
+// need updated array offsets afterward, since appending shifts nothing
+// before the array but the array's own length prefix and bytes do move
+// relative to nothing - only mipCount/format/width/height/
+// completeImageSize live before it and are fixed-size, so this patch
+// alone never invalidates imageDataOffset). objectBytes must be the
+// exact same NSMutableData this header was parsed from - the offset
+// properties are only meaningful against that buffer.
+- (void)patchWidth:(int32_t)width
+            height:(int32_t)height
+ completeImageSize:(int32_t)completeImageSize
+            format:(int32_t)format
+          mipCount:(int32_t)mipCount
+     inObjectBytes:(NSMutableData *)objectBytes;
+
+@end
+
+NS_ASSUME_NONNULL_END
