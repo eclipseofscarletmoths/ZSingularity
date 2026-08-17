@@ -62,6 +62,16 @@ jobs:
           test -s inc/crn_decomp.h
           test -s inc/crnlib.h
 
+          # Apple's iOS SDK doesn't ship a top-level malloc.h (it's
+          # <malloc/malloc.h>, with plain malloc/free coming from
+          # <stdlib.h>). Upstream crn_decomp.h unconditionally does
+          # `#include <malloc.h>`, which is a Linux/Windows-ism and
+          # breaks the isysroot'd clang compile below. Patch it in
+          # place right after fetching, before anything tries to
+          # include it - note the `-i ''` (empty-string arg) is
+          # required for macOS/BSD sed, unlike GNU sed.
+          sed -i '' 's/#include <malloc.h>/#include <malloc\/malloc.h>/' inc/crn_decomp.h
+
       # CrunchTextureDecoder.mm is Objective-C++ (crn_decomp.h is C++ -
       # namespaces, the crnd_unpack_context typedef, etc. - see that
       # file's own top comment on why it can't be a plain .m). clang's
