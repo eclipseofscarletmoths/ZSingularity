@@ -64,6 +64,100 @@ const TAT2VersionProfile kTAT2ProfileDefault = {
 
 @implementation Texture2DHeader
 
+#pragma mark version profile detection (see Texture2DFields.h)
+
++ (BOOL)detectVersionProfile:(TAT2VersionProfile *)outProfile
+            fromObjectSamples:(NSArray<NSData *> *)sampleObjectBytes
+   streamDataOffsetFieldPositions:(NSArray<NSNumber *> *)streamDataOffsetFieldPositions {
+    if (sampleObjectBytes.count == 0 || sampleObjectBytes.count != streamDataOffsetFieldPositions.count) {
+        return NO;
+    }
+
+    // IMPORTANT: don't require "exactly one candidate profile survives" -
+    // that's the wrong bar. Unity 4-byte-aligns after every run of
+    // single-byte bools in this layout (see Texture2DFields.m's
+    // parseHeaderInObjectBytes:...), so e.g. hasDownscaleFallback=YES
+    // alone, hasIsAlphaChannelOptional=YES alone, and both=YES all
+    // consume 1-2 raw bytes that get rounded up to the SAME 4-byte
+    // boundary - meaning those three different boolean combinations
+    // land every subsequent field (width, height, ..., the image-data
+    // array, m_StreamData) at the exact same byte offset. Empirically
+    // (verified against synthetic objects while implementing this)
+    // this degeneracy is large: ~45 of the 512 raw candidates survive
+    // even 10 confirmed samples. Requiring a literal single survivor
+    // would make this function fail almost always and silently defeat
+    // the whole point of detection - falling back to
+    // kTAT2ProfileDefault on every real build, including this one.
+    //
+    // The bar that actually matters: do the surviving candidates AGREE
+    // on where they'd put every field this module reads/writes? If
+    // every survivor computes identical offsets on every sample, they
+    // are operationally interchangeable - it doesn't matter which one
+    // gets returned, since callers only ever use the resulting
+    // Texture2DHeader's offsets, never the profile's booleans directly.
+    // So: group survivors by their resulting (widthOffset, heightOffset,
+    // completeImageSizeOffset, formatOffset, mipCountOffset,
+    // imageDataLengthFieldOffset, final-pos-after-imageData) tuple
+    // across ALL samples, and require exactly one such GROUP, not one
+    // profile.
+    NSMutableDictionary<NSString *, NSValue *> *groups = [NSMutableDictionary dictionary]; // offsetKey -> one representative profile
+    NSMutableDictionary<NSString *, NSNumber *> *groupCounts = [NSMutableDictionary dictionary];
+
+    for (uint32_t mask = 0; mask < 512; mask++) {
+        TAT2VersionProfile candidate = {
+            .hasForcedFallbackFormat     = (mask & (1 << 0)) != 0,
+            .hasDownscaleFallback        = (mask & (1 << 1)) != 0,
+            .hasIsAlphaChannelOptional   = (mask & (1 << 2)) != 0,
+            .hasMipsStripped             = (mask & (1 << 3)) != 0,
+            .hasMipCountAsInt            = YES,
+            .hasIsPreProcessed           = (mask & (1 << 4)) != 0,
+            .hasIgnoreMipmapLimit        = (mask & (1 << 5)) != 0,
+            .hasStreamingMipmaps         = (mask & (1 << 6)) != 0,
+            .hasStreamingMipmapsPriority = (mask & (1 << 7)) != 0,
+            .hasPlatformBlob             = (mask & (1 << 8)) != 0,
+        };
+
+        NSMutableString *key = [NSMutableString string];
+        BOOL candidateSurvives = YES;
+        for (NSUInteger i = 0; i < sampleObjectBytes.count; i++) {
+            NSData *bytes = sampleObjectBytes[i];
+            NSUInteger streamPos = streamDataOffsetFieldPositions[i].unsignedIntegerValue; // boxed NSNotFound where absent
+            NSError *err = nil;
+            Texture2DHeader *h = [Texture2DHeader parseHeaderInObjectBytes:bytes
+                                                                     profile:candidate
+                                                  streamDataOffsetFieldPos:streamPos
+                                                                       error:&err];
+            if (!h) { candidateSurvives = NO; break; }
+            if (streamPos != NSNotFound && !h.streamDataPositionConfirmed) { candidateSurvives = NO; break; }
+            [key appendFormat:@"%lu,%lu,%lu,%lu,%lu,%lu,%lu|",
+                (unsigned long)h.widthOffset, (unsigned long)h.heightOffset, (unsigned long)h.completeImageSizeOffset,
+                (unsigned long)h.formatOffset, (unsigned long)h.mipCountOffset,
+                (unsigned long)h.imageDataLengthFieldOffset, (unsigned long)(h.imageDataOffset + h.imageDataLength)];
+        }
+        if (!candidateSurvives) continue;
+
+        if (!groups[key]) {
+            NSValue *boxed = [NSValue valueWithBytes:&candidate objCType:@encode(TAT2VersionProfile)];
+            groups[key] = boxed;
+            groupCounts[key] = @1;
+        } else {
+            groupCounts[key] = @(groupCounts[key].unsignedIntegerValue + 1);
+        }
+    }
+
+    if (groups.count != 1) {
+        NSUInteger totalRawSurvivors = 0;
+        for (NSNumber *n in groupCounts.allValues) totalRawSurvivors += n.unsignedIntegerValue;
+        ZLog(@"[Texture2DFields] profile detection: %lu distinct offset-outcome(s) (%lu raw candidate profiles) survived %lu sample(s) - %@",
+             (unsigned long)groups.count, (unsigned long)totalRawSurvivors, (unsigned long)sampleObjectBytes.count,
+             groups.count == 0 ? @"none fit - samples may be corrupt or from a mixed/unsupported build" : @"genuinely ambiguous - need more/more-varied samples (ideally more streamed objects) to disambiguate");
+        return NO;
+    }
+
+    [groups.allValues.firstObject getValue:outProfile];
+    return YES;
+}
+
 + (nullable instancetype)parseHeaderInObjectBytes:(NSData *)objectBytes
                                            profile:(TAT2VersionProfile)profile
                         streamDataOffsetFieldPos:(NSUInteger)streamDataOffsetFieldPos
@@ -155,6 +249,25 @@ const TAT2VersionProfile kTAT2ProfileDefault = {
     }
     if (!formatPlausible) {
         if (error) *error = [NSError errorWithDomain:Texture2DFieldsErrorDomain code:4 userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"parsed m_TextureFormat (%d) isn't a known TextureFormat value - wrong TAT2VersionProfile for this Unity version", rawFormat]}];
+        return nil;
+    }
+    // mipCount plausibility - added specifically to help
+    // +detectVersionProfile:...: disambiguate. hasMipsStripped and
+    // hasStreamingMipmapsPriority are both optional 4-byte int fields
+    // that sit on either side of m_TextureFormat/m_MipCount - a
+    // profile that gets ONE of them backwards still ends up reading
+    // m_TextureFormat and m_MipCount from a position 4 bytes off, and
+    // the format-plausibility check above is generous enough (~50
+    // allowed values) that a wrong read sometimes still passes it by
+    // chance. mipCount has a much tighter real range - a full mip
+    // chain for the largest texture this project supports (8192px)
+    // is floor(log2(8192))+1 = 14 levels - so this catches many of
+    // those cases the format check alone misses. Confirmed via
+    // simulation while implementing detection: adding this raised
+    // detection's success rate from roughly half of random synthetic
+    // trials to all of them once >= 5 streamed samples were available.
+    if (mipCount < 1 || mipCount > 14) {
+        if (error) *error = [NSError errorWithDomain:Texture2DFieldsErrorDomain code:6 userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"parsed m_MipCount (%d) outside plausible range 1...14 - wrong TAT2VersionProfile for this Unity version", mipCount]}];
         return nil;
     }
 

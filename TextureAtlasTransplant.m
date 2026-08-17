@@ -120,6 +120,78 @@ static void tat_write_u32_le(NSMutableData *data, NSUInteger pos, uint32_t v) {
     for (int i = 0; i < 4; i++) p[i] = (uint8_t)(v >> (8 * i));
 }
 
+#pragma mark - version profile resolution (see Texture2DFields.h)
+
+// Per this project's own finding (documented in overview.md): the
+// profile only describes fields shared by every Texture2D object in
+// one Unity build, so it needs solving once per distinct build, not
+// per object or per bundle. Cached by archive.unityVersion so repeat
+// calls within the same run (many bundles, same game build) skip
+// re-detecting - see UnityBundleCAB.h, which already preserves this
+// string through a rebuild.
+static NSMutableDictionary<NSString *, NSValue *> *tat_profileCache;
+
+// How many streamed Texture2D samples to gather before giving up and
+// falling back to kTAT2ProfileDefault - see Texture2DFields.h's
+// +detectVersionProfile:...: doc on why more samples disambiguate
+// better. 10 keeps startup cost trivial (512 candidates x 10 parses
+// is nothing) while still being enough to rule out spurious
+// width/height-only passes in practice.
+static const NSUInteger kTATProfileDetectionSampleTarget = 10;
+
+// Resolves (and caches) the real TAT2VersionProfile for moddedArchive's
+// own Unity build, using moddedTable's already-resolved classIDs to
+// find sample Texture2D objects. Falls back to kTAT2ProfileDefault
+// (logged loudly) if unityVersion is missing/unrecognized or detection
+// is inconclusive - see Texture2DFields.h.
+static TAT2VersionProfile tat_resolve_profile(UnityBundleArchive *moddedArchive,
+                                               NSData *moddedCABData,
+                                               SerializedObjectTable *moddedTable,
+                                               NSData * _Nullable moddedResSData) {
+    NSString *versionKey = moddedArchive.unityVersion.length > 0 ? moddedArchive.unityVersion : @"(unknown unityVersion)";
+
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        tat_profileCache = [NSMutableDictionary dictionary];
+    });
+
+    NSValue *cached = tat_profileCache[versionKey];
+    if (cached) {
+        TAT2VersionProfile profile;
+        [cached getValue:&profile];
+        return profile;
+    }
+
+    NSMutableArray<NSData *> *samples = [NSMutableArray array];
+    NSMutableArray<NSNumber *> *samplePositions = [NSMutableArray array];
+    for (SerializedObject *obj in moddedTable.objects) {
+        if (samples.count >= kTATProfileDetectionSampleTarget) break;
+        if (!obj.classIDResolved || obj.classID != kTAT2ClassIDTexture2D) continue;
+        NSData *bytes = [moddedCABData subdataWithRange:NSMakeRange((NSUInteger)(moddedTable.dataOffset + obj.byteStart), obj.byteSize)];
+        NSUInteger streamPos = NSNotFound;
+        if (moddedResSData) {
+            tat_find_stream_data_offset_field(bytes, &streamPos); // leaves streamPos untouched (still NSNotFound) if it returns NO
+        }
+        [samples addObject:bytes];
+        [samplePositions addObject:@(streamPos)];
+    }
+
+    TAT2VersionProfile detected;
+    TAT2VersionProfile resolved;
+    if ([Texture2DHeader detectVersionProfile:&detected fromObjectSamples:samples streamDataOffsetFieldPositions:samplePositions]) {
+        resolved = detected;
+        ZLog(@"[TextureAtlasTransplant] unityVersion %@: detected TAT2VersionProfile from %lu Texture2D sample(s)", versionKey, (unsigned long)samples.count);
+    } else {
+        resolved = kTAT2ProfileDefault;
+        ZLog(@"[TextureAtlasTransplant] unityVersion %@: profile detection inconclusive (%lu sample(s) available) - falling back to kTAT2ProfileDefault; expect Texture2D header parse failures if this build's layout differs",
+             versionKey, (unsigned long)samples.count);
+    }
+
+    NSValue *boxed = [NSValue valueWithBytes:&resolved objCType:@encode(TAT2VersionProfile)];
+    tat_profileCache[versionKey] = boxed;
+    return resolved;
+}
+
 #pragma mark - node lookup helpers
 
 static UnityBundleNode *tat_find_node(UnityBundleArchive *archive, NSString *path) {
@@ -160,6 +232,7 @@ static NSData *tat_build_new_object_payload(SerializedObject *moddedObj,
                                              BOOL targetHasResS,
                                              NSString * _Nullable targetResSArchivePath, // e.g. "archive:/CAB-xxx/CAB-xxx.resS" - target's OWN, used to build a correct StreamingInfo.path for a newly-streamed object (see below)
                                              NSMutableData *targetResSData,
+                                             TAT2VersionProfile profile, // resolved once per Unity build - see tat_resolve_profile
                                              TATNewObjectOutcome *outOutcome) {
     *outOutcome = TATNewObjectOK;
 
@@ -184,7 +257,7 @@ static NSData *tat_build_new_object_payload(SerializedObject *moddedObj,
     BOOL moddedStreams = moddedResSData && tat_find_stream_data_offset_field(moddedBytes, &moddedStreamFieldPos);
     NSError *headerErr = nil;
     Texture2DHeader *moddedHeader = [Texture2DHeader parseHeaderInObjectBytes:moddedBytes
-                                                                        profile:kTAT2ProfileDefault
+                                                                        profile:profile
                                                      streamDataOffsetFieldPos:moddedStreams ? moddedStreamFieldPos : NSNotFound
                                                                           error:&headerErr];
     if (!moddedHeader) {
@@ -345,6 +418,7 @@ static TextureAtlasTransplantResult *tat_transplant_one(NSString *cachedPath,
                                                           UnityBundleArchive *moddedArchive,
                                                           NSData *moddedCABData,
                                                           SerializedObjectTable *moddedTable,
+                                                          TAT2VersionProfile profile, // resolved once per Unity build - see tat_resolve_profile
                                                           NSString *backupDir) {
     TextureAtlasTransplantResult *result = [TextureAtlasTransplantResult new];
     result.cachedPath = cachedPath;
@@ -421,7 +495,7 @@ static TextureAtlasTransplantResult *tat_transplant_one(NSString *cachedPath,
             TATNewObjectOutcome outcome;
             NSData *payload = tat_build_new_object_payload(moddedObj, moddedBytes, moddedResSData,
                                                              targetResSNode != nil, targetResSArchivePath,
-                                                             targetResSData, &outcome);
+                                                             targetResSData, profile, &outcome);
             if (!payload) {
                 if (outcome == TATNewObjectHeaderParseFailed) result.objectsAddedTexture2DHeaderParseFailed++;
                 else result.objectsAddedTexture2DFormatUnsupported++;
@@ -466,7 +540,8 @@ static TextureAtlasTransplantResult *tat_transplant_one(NSString *cachedPath,
 
         if (moddedObj.classID == kTAT2ClassIDTexture2D) {
             // Parse both sides' headers before touching anything - (a)
-            // confirms kTAT2ProfileDefault against this pair, (b) gives
+            // confirms the resolved profile (see tat_resolve_profile)
+            // against this pair, (b) gives
             // modded's declared format/dimensions for the decode step
             // below, and (c) gives target's own field offsets/streaming
             // shape for the patch step, which is NOT assumed to match
@@ -477,19 +552,19 @@ static TextureAtlasTransplantResult *tat_transplant_one(NSString *cachedPath,
             BOOL moddedStreams = moddedResSData && tat_find_stream_data_offset_field(moddedBytes, &moddedStreamFieldPos);
             NSError *moddedHeaderErr = nil;
             Texture2DHeader *moddedHeader = [Texture2DHeader parseHeaderInObjectBytes:moddedBytes
-                                                                                profile:kTAT2ProfileDefault
+                                                                                profile:profile
                                                              streamDataOffsetFieldPos:moddedStreams ? moddedStreamFieldPos : NSNotFound
                                                                                   error:&moddedHeaderErr];
             NSUInteger targetStreamFieldPos;
             BOOL targetStreams = targetResSNode && tat_find_stream_data_offset_field(targetBytes, &targetStreamFieldPos);
             NSError *targetHeaderErr = nil;
             Texture2DHeader *targetHeader = [Texture2DHeader parseHeaderInObjectBytes:targetBytes
-                                                                                profile:kTAT2ProfileDefault
+                                                                                profile:profile
                                                              streamDataOffsetFieldPos:targetStreams ? targetStreamFieldPos : NSNotFound
                                                                                   error:&targetHeaderErr];
             if (!moddedHeader || !targetHeader) {
                 result.texture2DHeaderParseFailed++;
-                ZLog(@"[TextureAtlasTransplant] pathID %lld: Texture2D header parse failed (modded: %@, target: %@) - skipping until kTAT2ProfileDefault is confirmed for this Unity version",
+                ZLog(@"[TextureAtlasTransplant] pathID %lld: Texture2D header parse failed (modded: %@, target: %@) - skipping (resolved profile for this Unity version didn't fit this object)",
                      (long long)moddedObj.pathID, moddedHeaderErr.localizedDescription, targetHeaderErr.localizedDescription);
                 continue;
             }
@@ -728,12 +803,24 @@ static TextureAtlasTransplantResult *tat_transplant_one(NSString *cachedPath,
         return nil;
     }
 
+    // Resolved once per modded bundle (cached per unityVersion, so
+    // repeat mod installs against the same game build skip
+    // re-detection entirely) - see tat_resolve_profile. Needs
+    // moddedResSData for the streamDataPositionConfirmed cross-check,
+    // same .resS node every match below would otherwise look up
+    // individually since it only depends on moddedArchive/cab, not on
+    // which cached target bundle is being patched.
+    NSString *moddedResSNodePath = [cab stringByAppendingString:@".resS"];
+    UnityBundleNode *moddedResSNode = tat_find_node(moddedArchive, moddedResSNodePath);
+    NSData *moddedResSData = moddedResSNode ? tat_node_slice(moddedArchive, moddedResSNode) : nil;
+    TAT2VersionProfile profile = tat_resolve_profile(moddedArchive, moddedCABData, moddedTable, moddedResSData);
+
     NSArray<NSString *> *matches = tat_find_cached_paths_for_cab(cab, cacheDir);
     NSString *backupDir = [self atlasBackupDirectory];
 
     NSMutableArray<TextureAtlasTransplantResult *> *results = [NSMutableArray array];
     for (NSString *cachedPath in matches) {
-        [results addObject:tat_transplant_one(cachedPath, cab, moddedArchive, moddedCABData, moddedTable, backupDir)];
+        [results addObject:tat_transplant_one(cachedPath, cab, moddedArchive, moddedCABData, moddedTable, profile, backupDir)];
     }
     return results;
 }

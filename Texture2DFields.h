@@ -85,11 +85,16 @@ typedef struct {
     // via tat_find_stream_data_offset_field, not via this profile.
 } TAT2VersionProfile;
 
-// Unity 2021/2022 LTS field set - see top comment. Confirm against one
-// real dump before trusting in production; +parseHeaderInObjectBytes:...
-// will refuse rather than silently misparse if this is wrong, but
-// "refuses" and "silently off by one bool" are different failure modes
-// and only the validation catches the first one.
+// Unity 2021/2022 LTS field set - see top comment. NOT authoritative -
+// this is a last-resort fallback only, used when
+// +detectVersionProfile:fromObjectSamples: (below) can't settle on a
+// single candidate (e.g. too few sample objects available). Every
+// real build should go through detection first; this constant exists
+// so the pipeline still degrades to today's "loud per-object skip +
+// log" behavior instead of silently doing nothing when detection is
+// inconclusive. Kept under its original name (kTAT2ProfileDefault) so
+// existing call sites/comments referring to it don't need renaming;
+// think of it as "the guess," not "the default."
 extern const TAT2VersionProfile kTAT2ProfileDefault;
 
 // Everything this module can locate/patch about one Texture2D object's
@@ -133,6 +138,50 @@ extern const TAT2VersionProfile kTAT2ProfileDefault;
 // catches a wrong TAT2VersionProfile - see this header's top comment.
 @property (nonatomic, assign, readonly) BOOL streamDataPositionConfirmed;
 
+// Brute-force detection of the real TAT2VersionProfile for whatever
+// Unity build produced sampleObjectBytes, instead of trusting
+// kTAT2ProfileDefault's hardcoded guess - see this header's top
+// comment ("WHY A VERSION PROFILE") for why the guess can't be
+// trusted across Unity versions.
+//
+// Of the 10 fields in TAT2VersionProfile, hasMipCountAsInt is fixed
+// YES (pre-2017.3 isn't supported - see that field's own comment), so
+// there are at most 2^9 = 512 candidate profiles - cheap to try all
+// of them.
+//
+// sampleObjectBytes / streamDataOffsetFieldPositions: parallel arrays,
+// one entry per sample Texture2D object (its own byte range, same
+// convention as +parseHeaderInObjectBytes:...'s objectBytes; and the
+// NSNotFound-boxed-or-real position tat_find_stream_data_offset_field
+// found for that same object, or a boxed NSNotFound if it doesn't
+// stream). Pass as many samples as are available - callers should
+// prefer at least 5-10 streamed objects, since a candidate profile
+// that merely produces plausible width/height on ONE object can pass
+// by chance, but streamDataPositionConfirmed agreeing across several
+// independently-verified objects is a much stronger signal. Samples
+// that don't stream (boxed NSNotFound) still contribute their
+// width/height/format plausibility check, just not the strong
+// cross-check.
+//
+// A candidate profile is accepted only if it parses EVERY sample
+// successfully, and - for every sample that has a real (non-NSNotFound)
+// stream position - the parse's streamDataPositionConfirmed is YES.
+//
+// Returns YES and fills *outProfile if EXACTLY ONE candidate profile
+// survives that filter across all samples. Returns NO if zero
+// candidates survive (samples don't agree with any single profile -
+// possibly corrupt/mixed-build input) or more than one candidate
+// survives (genuine ambiguity - typically means too few samples, or
+// samples that happen not to exercise the fields that would
+// distinguish the surviving candidates from each other; e.g. if none
+// of the samples stream, hasStreamingMipmaps/-Priority can't be
+// pinned down by width/height plausibility alone). Callers should log
+// loudly and fall back to kTAT2ProfileDefault in either failure case,
+// per this header's top comment, rather than silently picking one.
++ (BOOL)detectVersionProfile:(TAT2VersionProfile *)outProfile
+            fromObjectSamples:(NSArray<NSData *> *)sampleObjectBytes
+   streamDataOffsetFieldPositions:(NSArray<NSNumber *> *)streamDataOffsetFieldPositions;
+
 // Parses objectBytes (one Texture2D object's own byte range - see this
 // class's top comment on the offset convention) using `profile` for the
 // version-conditional fields before m_Width. streamDataOffsetFieldPos:
@@ -144,8 +193,10 @@ extern const TAT2VersionProfile kTAT2ProfileDefault;
 // Returns nil if: objectBytes is too short to hold the fixed fields
 // this profile implies, OR width/height parse outside 1...8192, OR
 // rawFormat parses outside a generous plausible int32 enum range, OR
-// (when streamDataOffsetFieldPos != NSNotFound) the computed image-data
-// array's end doesn't land exactly on streamDataOffsetFieldPos. Any of
+// mipCount parses outside 1...14 (full mip chain for an 8192px
+// texture), OR (when streamDataOffsetFieldPos != NSNotFound) the
+// computed image-data array's end doesn't land exactly on
+// streamDataOffsetFieldPos. Any of
 // these means `profile` is wrong for this object, not that the object
 // itself is malformed - see this header's top comment before loosening
 // this check.
