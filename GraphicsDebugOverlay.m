@@ -3336,8 +3336,8 @@ static const CGFloat kContentFadeHeight = 22;
 
     // --- Mods ---
     // BankTransplant.h/BundleTransplant.h do the actual splice/swap - see
-    // those files' headers. Import Mod(s) sniffs each picked file (RIFF/
-    // FEV magic -> bank, UnityFS magic -> bundle - see
+    // those files' headers. Import Mod(s) sniffs each picked file
+    // (.bank extension -> bank, UnityFS magic -> bundle - see
     // -gd_kindForFileAtURL:) and routes it to whichever transplant class
     // actually handles that file type, and immediately prompts for a
     // folder name so every import also lands in the Mods Library
@@ -3569,22 +3569,32 @@ static void * const kGDModsPickerKindKey = (void *)&kGDModsPickerKindKey;
     [presenter presentViewController:picker animated:YES completion:nil];
 }
 
-// First 12 bytes are enough to tell the two apart without reading the
-// whole file: RIFF/FEV is BankTransplant's wrapper (see
-// bt_find_wrapper_info's own check), UnityFS is BundleTransplant's
-// (see UnityBundleCAB.h's format note). Returns nil for anything that
-// matches neither - reported to the person as unrecognized rather than
-// guessed at.
+// Bank detection is by extension, not content: BankTransplant does a
+// direct whole-file swap now (see that header's "REPURPOSED again"
+// note) and never inspects the modded file's bytes, it only matches
+// moddedURL.lastPathComponent against a stock file on disk - so there's
+// no wrapper format left to sniff here either. This used to check for
+// "RIFF"+"FEV " at bytes 0/8, which was BankTransplant's old wrapper
+// format from before that rewrite (parsed by a bt_find_wrapper_info
+// this project no longer has) - real .bank files never had that
+// signature to begin with, so every legitimate bank picked alongside a
+// bundle fell through to the UnityFS check below, and either matched it
+// by accident-adjacent behavior or (more often) came back nil and got
+// silently reclassified downstream. Bundle detection stays
+// content-based since UnityFS's signature is reliable and cheap to
+// check (see UnityBundleCAB.h's format note) and doesn't depend on the
+// picked file having kept its original extension.
 - (nullable NSString *)gd_kindForFileAtURL:(NSURL *)url {
+    if ([url.pathExtension caseInsensitiveCompare:@"bank"] == NSOrderedSame) return @"bank";
+
     BOOL accessing = [url startAccessingSecurityScopedResource];
     NSFileHandle *fh = [NSFileHandle fileHandleForReadingAtPath:url.path];
-    NSData *head = [fh readDataOfLength:12];
+    NSData *head = [fh readDataOfLength:7];
     [fh closeFile];
     if (accessing) [url stopAccessingSecurityScopedResource];
-    if (head.length < 12) return nil;
+    if (head.length < 7) return nil;
 
     const uint8_t *b = head.bytes;
-    if (memcmp(b, "RIFF", 4) == 0 && memcmp(b + 8, "FEV ", 4) == 0) return @"bank";
     if (memcmp(b, "UnityFS", 7) == 0) return @"bundle";
     return nil;
 }
@@ -3690,15 +3700,30 @@ static void * const kGDModsPickerKindKey = (void *)&kGDModsPickerKindKey;
                 }
                 NSInteger changed = r.objectsTransplanted + r.objectsAdded;
                 totalSwapped += changed;
+                // Computed once, used by both branches below - previously
+                // only the "differs" branch computed this, so a bundle
+                // where EVERY candidate object failed (e.g. all
+                // DXT5Crunched with inc/crn_decomp.h not vendored - see
+                // CrunchTextureDecoder.h) reported the same "no differing
+                // objects" line as a bundle that genuinely had zero diffs,
+                // hiding the real cause. See ZLog output (Verbose syslog)
+                // for the specific per-object reason either way.
+                NSInteger problems = r.texture2DFormatUnsupported + r.texture2DHeaderParseFailed
+                    + r.objectsAddedTexture2DFormatUnsupported + r.objectsAddedTexture2DHeaderParseFailed
+                    + r.objectsSkippedNotInTarget + r.objectsAddedPathIDCollision;
                 if (changed == 0) {
-                    [lines addObject:[NSString stringWithFormat:@"%@: no differing objects", name]];
+                    if (problems > 0) {
+                        [lines addObject:[NSString stringWithFormat:@"%@: 0 transplanted, %ld skipped (%ld format unsupported, %ld header parse failed) - check Verbose log",
+                            name, (long)problems,
+                            (long)(r.texture2DFormatUnsupported + r.objectsAddedTexture2DFormatUnsupported),
+                            (long)(r.texture2DHeaderParseFailed + r.objectsAddedTexture2DHeaderParseFailed)]];
+                    } else {
+                        [lines addObject:[NSString stringWithFormat:@"%@: no differing objects", name]];
+                    }
                     continue;
                 }
                 NSMutableString *line = [NSMutableString stringWithFormat:@"%@: %ld transplanted", name, (long)r.objectsTransplanted];
                 if (r.objectsAdded > 0) [line appendFormat:@", %ld added", (long)r.objectsAdded];
-                NSInteger problems = r.texture2DFormatUnsupported + r.texture2DHeaderParseFailed
-                    + r.objectsAddedTexture2DFormatUnsupported + r.objectsAddedTexture2DHeaderParseFailed
-                    + r.objectsSkippedNotInTarget + r.objectsAddedPathIDCollision;
                 if (problems > 0) [line appendFormat:@", %ld skipped", (long)problems];
                 [lines addObject:line];
             }
