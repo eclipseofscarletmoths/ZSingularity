@@ -212,7 +212,11 @@ extern const TAT2VersionProfile kTAT2ProfileDefault;
 // mipCount parses outside 1...14 (full mip chain for an 8192px
 // texture), OR (when streamDataOffsetFieldPos != NSNotFound) the
 // computed image-data array's end doesn't land exactly on
-// streamDataOffsetFieldPos. Any of
+// streamDataOffsetFieldPos, OR (when streamDataOffsetFieldPos ==
+// NSNotFound, i.e. the caller believes this object doesn't stream) the
+// trailing m_StreamData (StreamingInfo) struct - offset(8)+size(4)+
+// pathLen(4), always present even when unused - doesn't have pathLen==0
+// and exactly consume the rest of objectBytes. Any of
 // these means `profile` is wrong for this object, not that the object
 // itself is malformed - see this header's top comment before loosening
 // this check.

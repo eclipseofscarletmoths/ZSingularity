@@ -351,11 +351,51 @@ const TAT2VersionProfile kTAT2ProfileDefault = {
             if (error) *error = [NSError errorWithDomain:Texture2DFieldsErrorDomain code:5 userInfo:@{NSLocalizedDescriptionKey: @"computed header end doesn't match tat_find_stream_data_offset_field's independently-found StreamingInfo position - wrong TAT2VersionProfile for this Unity version"}];
             return nil;
         }
+    } else {
+        // NEW (see overview.md Entry 13): until now, a NON-streaming
+        // object (caller found no "archive:/" needle - see
+        // pbr_/tat_find_stream_data_offset_field) had NO cross-check at
+        // all here - width/height/format/mipCount plausibility above was
+        // the only guard, and real archive.zip data proved that's not
+        // enough: pathID -6256345162963367343 (a 2048x2048 DXT5 Spine
+        // atlas page, m_StreamData.size==0/path=="") passed every
+        // plausibility check yet came out of this function with
+        // imageDataLength==1 - which is exactly m_ColorSpace's own real
+        // value (1) misread as a length prefix, i.e. `pos` was already 4
+        // bytes short by the time it got here, silently, with nothing to
+        // catch it. TextureAtlasTransplant.m's moddedHeader.imageDataLength
+        // and PlatformBundleRetarget.m's header.imageDataLength both trust
+        // this value directly with no bounds re-check of their own, so a
+        // wrong-but-small value like this reads a near-empty pixel buffer
+        // and fails downstream as a confusing "format N not decodable ...
+        // only got 1" rather than the real "wrong profile" error.
+        //
+        // m_StreamData is a StreamingInfo struct - offset(u64,8) +
+        // size(u32,4) + pathLen(u32,4) + path bytes - ALWAYS present as
+        // the object's trailing field, even when unused (path=="",
+        // size==0), same 16-byte-before-the-text layout
+        // tat_find_stream_data_offset_field already established (see that
+        // function's Entry 3 comment). Reaching this `else` branch means
+        // the caller found no "archive:/" text anywhere in this object,
+        // which is only possible if that trailing path really is empty -
+        // so this struct, unconditionally, must consume EXACTLY the rest
+        // of objectBytes with pathLen==0. If it doesn't, `pos` was wrong
+        // before we ever got here, regardless of how plausible
+        // width/height/format/mipCount looked.
+        T2F_NEED(16);
+        NSUInteger trailingStructStart = pos;
+        NSUInteger trailingPos = pos + 12; // offset(8) + size(4), not otherwise validated here
+        uint32_t trailingPathLen = t2f_read_u32_le(objectBytes, trailingPos);
+        NSUInteger computedEnd = trailingPos + 4 + trailingPathLen;
+        if (trailingPathLen != 0 || computedEnd != len) {
+            ZLog(@"[Texture2DFields] non-streaming object: trailing StreamingInfo struct (assumed to start at %lu) doesn't exactly consume the rest of objectBytes (computed end %lu vs actual length %lu, trailing pathLen read as %u) - imageDataLength (%u) is very likely wrong for this object",
+                 (unsigned long)trailingStructStart, (unsigned long)computedEnd, (unsigned long)len, trailingPathLen, imageDataLength);
+            ZLog(@"[Texture2DFields] [DIAG] window around computed header end (no independent confirmed position - non-streaming object):%@",
+                 t2f_hexdump_around(objectBytes, trailingStructStart, trailingStructStart));
+            if (error) *error = [NSError errorWithDomain:Texture2DFieldsErrorDomain code:7 userInfo:@{NSLocalizedDescriptionKey: @"non-streaming object's trailing StreamingInfo struct doesn't exactly consume the rest of the object bytes - wrong TAT2VersionProfile (or misread imageDataLength) for this object"}];
+            return nil;
+        }
     }
-    // If streamDataOffsetFieldPos == NSNotFound (object doesn't stream -
-    // pixels are the inline imageData array itself), there's nothing
-    // independent left to cross-check against; width/height/format
-    // plausibility above is the only guard for that case.
 
     #undef T2F_NEED
 
