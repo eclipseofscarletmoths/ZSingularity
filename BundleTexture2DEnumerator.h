@@ -32,16 +32,16 @@
 // get RGBA32 is the next step, not this one.
 //
 // MEMORY NOTE (see Rework.txt, "Layer D - Disk-backed bundle writer" /
-// "next-generation UnityBundleCAB API"): this still goes through
-// +[UnityBundleCAB decompressedArchiveAtPath:error:], which holds the
-// entire decompressed bundle as one NSData - Rework.txt is explicit
-// that this whole-bundle representation is the major remaining memory
-// problem for the FINAL pipeline and calls for a streaming replacement.
-// That replacement is out of scope here: this class exists to get
-// enumeration/parsing correct first (Layer A + Layer B), against a
-// real in-memory archive that's simple to reason about and verify. The
-// disk-backed rewrite of the read path is a Layer D concern for the
-// write side of this pipeline, not a blocker for enumeration.
+// "next-generation UnityBundleCAB API"): this goes through
+// +[UnityBundleCAB decompressedArchiveAtPath:error:], whose `.data` is
+// now a memory-mapped view of a disk-streamed decompression (the
+// "next-generation UnityBundleCAB API" Rework.txt called for - see that
+// file's implementation and UnityBundleCAB.h's own MEMORY note) rather
+// than one heap NSMutableData sized to the whole decompressed bundle.
+// This class's own per-object slicing (-sourcePixelBytesForObject:,
+// the enumeration loop below) was already written against `.data` as
+// plain NSData and needed no changes for that - it benefits from the
+// mapped backing automatically.
 //
 // TARGET PLATFORM RETARGET (m_TargetPlatform: 19 StandaloneWindows64 ->
 // 9 iOS) is a whole-SerializedFile-header patch, not a per-Texture2D

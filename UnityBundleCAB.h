@@ -85,16 +85,26 @@ typedef NS_ENUM(NSInteger, UnityBundleCABErrorCode) {
 @property (nonatomic, assign) int64_t size;
 @end
 
-// A UnityFS archive with every block actually decompressed and
-// concatenated into one buffer - what TextureAtlasTransplant.h (and
+// A UnityFS archive with every block actually decompressed, in node
+// order, and exposed as one `.data` - what TextureAtlasTransplant.h (and
 // anything else that needs to read/patch bytes INSIDE a node, not just
 // identify nodes by name) needs that +primaryCABForBundleAtPath:error:
 // and +allNodePathsForBundleAtPath:error: don't provide, since those two
 // only ever decompress the much smaller blocks-info blob.
+//
+// MEMORY: `.data` is a memory-MAPPED view of a temp file the
+// decompressor streamed to disk one block at a time (never a
+// heap NSMutableData built up to the whole bundle's decompressed
+// size) - see +decompressedArchiveAtPath:error:'s implementation.
+// Slicing it (subdataWithRange:, dataWithBytesNoCopy: over its
+// .bytes, ...) faults in only the pages touched; the OS can discard
+// clean pages under memory pressure. The backing temp file is deleted
+// automatically once this archive instance is deallocated - no
+// explicit cleanup call needed.
 @interface UnityBundleArchive : NSObject
 @property (nonatomic, copy) NSString *unityVersion;   // preserved as-is for the rewrite
 @property (nonatomic, copy) NSString *unityRevision;  // preserved as-is for the rewrite
-@property (nonatomic, strong) NSData *data;           // every node's bytes, concatenated, decompressed
+@property (nonatomic, strong) NSData *data;           // every node's bytes, concatenated, decompressed - memory-mapped, see MEMORY note above
 @property (nonatomic, copy) NSArray<UnityBundleNode *> *nodes;
 @end
 
@@ -102,10 +112,12 @@ typedef NS_ENUM(NSInteger, UnityBundleCABErrorCode) {
 
 // Like +allNodePathsForBundleAtPath:error:, but decompresses every data
 // block (not just blocks-info) and hands back the whole thing as one
-// contiguous buffer plus each node's offset/size into it - LZMA/LZHAM
-// are still unsupported (see the error codes above), and now so is any
-// bundle whose DATA blocks (as opposed to just its blocks-info) use one
-// of those, for the same reason.
+// contiguous, memory-mapped `.data` plus each node's offset/size into
+// it - LZMA/LZHAM are still unsupported (see the error codes above),
+// and now so is any bundle whose DATA blocks (as opposed to just its
+// blocks-info) use one of those, for the same reason. Decompression
+// itself is disk-backed and streams one block at a time - see
+// UnityBundleArchive's MEMORY note above.
 + (nullable UnityBundleArchive *)decompressedArchiveAtPath:(NSString *)path error:(NSError **)error;
 
 // Serializes `archive` back out as a valid UnityFS file at `path` and

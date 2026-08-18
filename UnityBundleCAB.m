@@ -12,6 +12,7 @@
 #import "LZ4BlockDecoder.h"
 #import "ZTweakLog.h"
 #include <stdint.h>
+#include <objc/runtime.h>
 
 NSString * const UnityBundleCABErrorDomain = @"UnityBundleCABErrorDomain";
 
@@ -149,13 +150,13 @@ static BOOL ubc_parse_header(UBCCursor *c, UBCHeader *out, NSString **outUnityVe
     // with bit 9 SET, one with it CLEAR) that the unconditional version
     // below is what every one of them actually needs, both for where
     // inline blocks-info starts and (see
-    // ubc_decompress_data_blocks below) for where the data blocks that
+    // ubc_decompress_data_blocks_to_temp_file below) for where the data blocks that
     // follow it start. Only applies when blocksInfo is NOT at EOF -
     // when it's stored at EOF instead, its location comes from the
     // archive's total size, not this stream position, so there is
     // nothing to align here (though the data blocks that precede it in
     // that case still get their own alignment - see
-    // ubc_decompress_data_blocks).
+    // ubc_decompress_data_blocks_to_temp_file).
     if (!blocksInfoAtEnd) {
         size_t rem = c->pos % 16;
         if (rem != 0) {
@@ -335,14 +336,73 @@ malformed:
     return NO;
 }
 
+// Decompresses (or copies, for "none") exactly one DATA block into `fh`
+// at the current write position, then advances `*cursor` past its
+// COMPRESSED span in `fileData` - the per-block unit
+// ubc_decompress_data_blocks_to_temp_file below calls once per block,
+// inside its own @autoreleasepool, so at most one block's decompressed
+// bytes (a few hundred KB to low single-digit MB on every real bundle
+// this project has seen - Unity's own LZ4 chunking, not the archive
+// total) are ever resident at once - never the whole bundle.
+static BOOL ubc_write_one_data_block(NSFileHandle *fh, const uint8_t *base, size_t fileSize,
+                                      size_t *cursor, UBCBlockEntry be, NSError **error) {
+    if (*cursor > fileSize || be.cSize > fileSize - *cursor) {
+        if (error) *error = [NSError errorWithDomain:UnityBundleCABErrorDomain code:UnityBundleCABErrorMalformedBlocksInfo userInfo:nil];
+        return NO;
+    }
+    const uint8_t *blockBytes = base + *cursor;
+    uint8_t compType = (uint8_t)(be.bFlags & 0x3F);
+    @try {
+        switch (compType) {
+            case 0: {
+                size_t n = MIN(be.cSize, be.uSize);
+                // No-copy wrapper straight over fileData's own (mapped)
+                // bytes - writeData: reads through it once, nothing extra
+                // is allocated for a stored-uncompressed block.
+                [fh writeData:[NSData dataWithBytesNoCopy:(void *)blockBytes length:n freeWhenDone:NO]];
+                break;
+            }
+            case 2:
+            case 3: { // LZ4 / LZ4HC - same bitstream, see LZ4BlockDecoder.h
+                NSMutableData *chunk = [NSMutableData dataWithLength:be.uSize];
+                if (be.uSize > 0) {
+                    int written = LZ4BlockDecompress(blockBytes, be.cSize, (uint8_t *)chunk.mutableBytes, be.uSize);
+                    if (written < 0 || (uint32_t)written != be.uSize) {
+                        if (error) *error = [NSError errorWithDomain:UnityBundleCABErrorDomain code:UnityBundleCABErrorDecompressFailed userInfo:nil];
+                        return NO;
+                    }
+                }
+                [fh writeData:chunk]; // this one block's decompressed bytes - released when this @autoreleasepool drains, not held for the rest of the archive
+                break;
+            }
+            default:
+                if (error) *error = [NSError errorWithDomain:UnityBundleCABErrorDomain code:UnityBundleCABErrorUnsupportedCompression userInfo:@{
+                    NSLocalizedDescriptionKey: [NSString stringWithFormat:@"Data block uses compression type %u (not none/LZ4/LZ4HC) - unsupported, see UnityBundleCAB.h", compType]
+                }];
+                return NO;
+        }
+    } @catch (NSException *exc) {
+        if (error) *error = [NSError errorWithDomain:UnityBundleCABErrorDomain code:UnityBundleCABErrorCantReadFile userInfo:@{NSLocalizedDescriptionKey: exc.reason ?: @"write failed"}];
+        return NO;
+    }
+    *cursor += be.cSize;
+    return YES;
+}
+
 // Decompresses every DATA block (the payload that follows blocks-info in
 // the file - the actual node bytes, as opposed to the directory
-// metadata ubc_extract_blocks_info above already handles) into one
-// contiguous buffer, in block order.
-static NSData *ubc_decompress_data_blocks(NSData *fileData,
-                                           const UBCHeader *header,
-                                           NSArray<NSValue *> *blocks,
-                                           NSError **error) {
+// metadata ubc_extract_blocks_info above already handles) straight to a
+// fresh temp file, in block order, one block at a time - never building
+// a whole-bundle buffer in RAM. This is the "next-generation
+// UnityBundleCAB API" Rework.txt calls for (see that file's "Bundle
+// writer redesign" section and BundleTexture2DEnumerator.h's own MEMORY
+// NOTE): the caller gets back a path it can memory-map instead of one
+// concatenated NSData occupying real (anonymous, Jetsam-countable) RAM
+// for the entire pipeline run.
+static NSString *ubc_decompress_data_blocks_to_temp_file(NSData *fileData,
+                                                           const UBCHeader *header,
+                                                           NSArray<NSValue *> *blocks,
+                                                           NSError **error) {
     // Data blocks are stored right after this archive's own header (never
     // at EOF regardless of where blocks-info itself lives - blocks-info's
     // own EOF placement is a separate, independent choice from where the
@@ -367,47 +427,65 @@ static NSData *ubc_decompress_data_blocks(NSData *fileData,
         if (rem != 0) dataStart += (16 - rem);
     }
 
-    NSMutableData *out = [NSMutableData data];
     size_t cursor = dataStart;
     size_t fileSize = fileData.length;
     const uint8_t *base = (const uint8_t *)fileData.bytes;
 
-    for (NSValue *v in blocks) {
-        UBCBlockEntry be; [v getValue:&be];
-        if (cursor > fileSize || be.cSize > fileSize - cursor) {
-            if (error) *error = [NSError errorWithDomain:UnityBundleCABErrorDomain code:UnityBundleCABErrorMalformedBlocksInfo userInfo:nil];
-            return nil;
-        }
-        const uint8_t *blockBytes = base + cursor;
-        uint8_t compType = (uint8_t)(be.bFlags & 0x3F);
-        switch (compType) {
-            case 0: {
-                size_t n = MIN(be.cSize, be.uSize);
-                [out appendBytes:blockBytes length:n];
-                break;
-            }
-            case 2:
-            case 3: {
-                NSMutableData *chunk = [NSMutableData dataWithLength:be.uSize];
-                if (be.uSize > 0) {
-                    int written = LZ4BlockDecompress(blockBytes, be.cSize, (uint8_t *)chunk.mutableBytes, be.uSize);
-                    if (written < 0 || (uint32_t)written != be.uSize) {
-                        if (error) *error = [NSError errorWithDomain:UnityBundleCABErrorDomain code:UnityBundleCABErrorDecompressFailed userInfo:nil];
-                        return nil;
-                    }
-                }
-                [out appendData:chunk];
-                break;
-            }
-            default:
-                if (error) *error = [NSError errorWithDomain:UnityBundleCABErrorDomain code:UnityBundleCABErrorUnsupportedCompression userInfo:@{
-                    NSLocalizedDescriptionKey: [NSString stringWithFormat:@"Data block uses compression type %u (not none/LZ4/LZ4HC) - unsupported, see UnityBundleCAB.h", compType]
-                }];
-                return nil;
-        }
-        cursor += be.cSize;
+    NSString *tmpPath = [NSTemporaryDirectory() stringByAppendingPathComponent:
+        [NSString stringWithFormat:@"zsingularity-ubc-decompressed-%@", [[NSUUID UUID] UUIDString]]];
+    if (![NSFileManager.defaultManager createFileAtPath:tmpPath contents:nil attributes:nil]) {
+        if (error) *error = [NSError errorWithDomain:UnityBundleCABErrorDomain code:UnityBundleCABErrorCantReadFile userInfo:nil];
+        return nil;
     }
-    return out;
+    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:tmpPath];
+    if (!fh) {
+        [NSFileManager.defaultManager removeItemAtPath:tmpPath error:nil];
+        if (error) *error = [NSError errorWithDomain:UnityBundleCABErrorDomain code:UnityBundleCABErrorCantReadFile userInfo:nil];
+        return nil;
+    }
+
+    BOOL ok = YES;
+    NSError *blockError = nil;
+    for (NSValue *v in blocks) {
+        @autoreleasepool {
+            UBCBlockEntry be; [v getValue:&be];
+            if (!ubc_write_one_data_block(fh, base, fileSize, &cursor, be, &blockError)) {
+                ok = NO;
+            }
+        } // this block's bytes (if any were decompressed) are released here, before the next block is even read
+        if (!ok) break;
+    }
+
+    [fh closeFile];
+    if (!ok) {
+        [NSFileManager.defaultManager removeItemAtPath:tmpPath error:nil];
+        if (error) *error = blockError;
+        return nil;
+    }
+    return tmpPath;
+}
+
+// Ties a temp file's lifetime to a `UnityBundleArchive` instance via an
+// associated object, so the file backing its memory-mapped `.data` gets
+// deleted automatically once the archive (and everything holding a
+// slice of its `.data`) is done and deallocated - no explicit cleanup
+// call needed from any of this project's several callers (enumerator,
+// retargeter, validator).
+static const void *kUBCTempFileCleanupKey = &kUBCTempFileCleanupKey;
+
+@interface UBCTempFileCleanup : NSObject
+@property (nonatomic, copy) NSString *path;
+@end
+@implementation UBCTempFileCleanup
+- (void)dealloc {
+    if (self.path) [NSFileManager.defaultManager removeItemAtPath:self.path error:nil];
+}
+@end
+
+static void ubc_bind_temp_file_lifetime(UnityBundleArchive *archive, NSString *tmpPath) {
+    UBCTempFileCleanup *cleanup = [UBCTempFileCleanup new];
+    cleanup.path = tmpPath;
+    objc_setAssociatedObject(archive, kUBCTempFileCleanupKey, cleanup, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
 }
 
 #pragma mark - Writing (compression none, blocks-info inline, single block)
@@ -470,14 +548,39 @@ static void ubc_append_cstring(NSMutableData *d, NSString *s) {
     NSMutableArray<UnityBundleNode *> *nodes = [NSMutableArray array];
     if (!ubc_parse_blocks_info_full(blocksInfo, blocks, nodes, error)) return nil;
 
-    NSData *decompressed = ubc_decompress_data_blocks(fileData, &header, blocks, error);
-    if (!decompressed) return nil;
+    // Decompressed straight to a temp file, one block at a time (see
+    // ubc_decompress_data_blocks_to_temp_file) instead of one
+    // NSMutableData growing to the whole bundle's decompressed size.
+    // `.data` below is then a memory-MAPPED view of that file: every
+    // downstream subdataWithRange: call (enumerator, converter,
+    // retargeter, validator) faults in only the pages it actually
+    // touches, and those pages are clean/file-backed, so the OS can
+    // discard and re-fault them under memory pressure instead of Jetsam
+    // treating them as unreclaimable anonymous memory. This is the one
+    // piece of Rework.txt's architecture that hadn't landed yet - see
+    // BundleTexture2DEnumerator.h's own MEMORY NOTE, now stale.
+    NSString *tmpPath = ubc_decompress_data_blocks_to_temp_file(fileData, &header, blocks, error);
+    if (!tmpPath) return nil;
+
+    NSError *mapError = nil;
+    NSData *decompressed = [NSData dataWithContentsOfFile:tmpPath options:NSDataReadingMappedIfSafe error:&mapError];
+    if (!decompressed) {
+        [NSFileManager.defaultManager removeItemAtPath:tmpPath error:nil];
+        if (error) *error = mapError ?: [NSError errorWithDomain:UnityBundleCABErrorDomain code:UnityBundleCABErrorCantReadFile userInfo:nil];
+        return nil;
+    }
 
     UnityBundleArchive *archive = [UnityBundleArchive new];
     archive.unityVersion = unityVersion;
     archive.unityRevision = unityRevision;
     archive.data = decompressed;
     archive.nodes = nodes;
+    // Deletes tmpPath once `archive` is deallocated - see
+    // ubc_bind_temp_file_lifetime's own comment. Safe to unlink out from
+    // under an active mmap (POSIX keeps mapped pages backed by the
+    // inode until the mapping itself goes away), so this never races
+    // against `.data` still being read.
+    ubc_bind_temp_file_lifetime(archive, tmpPath);
     return archive;
 }
 
