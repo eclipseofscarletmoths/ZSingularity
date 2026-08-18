@@ -127,15 +127,16 @@ static uint32_t pbr_read_u32_le(NSData *data, NSUInteger pos) {
 
 @implementation PlatformBundleRetarget
 
-+ (nullable UnityBundleArchive *)retargetedArchiveFromDesktopBundleAtPath:(NSString *)desktopBundlePath
-                                                            targetPlatform:(int32_t)targetPlatform
-                                                                    result:(PlatformBundleRetargetResult * _Nullable * _Nullable)outResult
-                                                                     error:(NSError **)error {
++ (BOOL)retargetDesktopBundleAtPath:(NSString *)desktopBundlePath
+                      targetPlatform:(int32_t)targetPlatform
+                              toPath:(NSString *)outPath
+                              result:(PlatformBundleRetargetResult * _Nullable * _Nullable)outResult
+                               error:(NSError **)error {
     NSError *archiveErr = nil;
     UnityBundleArchive *archive = [UnityBundleCAB decompressedArchiveAtPath:desktopBundlePath error:&archiveErr];
     if (!archive) {
         if (error) *error = PBRError(PlatformBundleRetargetErrorArchiveReadFailed, archiveErr.localizedDescription ?: @"couldn't read/decompress archive");
-        return nil;
+        return NO;
     }
 
     NSError *cabErr = nil;
@@ -143,15 +144,24 @@ static uint32_t pbr_read_u32_le(NSData *data, NSUInteger pos) {
     UnityBundleNode *cabNode = cab ? pbr_find_node(archive, cab) : nil;
     if (!cabNode) {
         if (error) *error = PBRError(PlatformBundleRetargetErrorNoCABNode, @"couldn't locate this archive's own primary CAB node");
-        return nil;
+        return NO;
     }
 
     // .resS is only ever a SOURCE of existing pixel bytes here (a
     // streamed object being converted to inline) - see this file's top
-    // comment on why nothing is ever written back into it.
+    // comment on why nothing is ever written back into it. Unlike an
+    // earlier version of this function, this does NOT eagerly copy the
+    // whole .resS node into its own buffer up front - resSNode/archive
+    // are kept instead, and each object's pixel bytes are sliced
+    // straight out of archive.data (still the OS-mapped/decompressed
+    // buffer from decompressedArchiveAtPath:error:) only when that
+    // object actually needs them, in the per-object loop below. For a
+    // bundle with hundreds of streamed textures, a multi-hundred-MB
+    // .resS node no longer has to be resident as a second full copy for
+    // the entire duration of the retarget just so a handful of bytes at
+    // a time can be read out of it.
     NSString *resSNodePath = [cab stringByAppendingString:@".resS"];
     UnityBundleNode *resSNode = pbr_find_node(archive, resSNodePath);
-    NSData *resSData = resSNode ? pbr_node_slice(archive, resSNode) : nil;
 
     NSMutableData *cabData = [pbr_node_slice(archive, cabNode) mutableCopy];
 
@@ -159,18 +169,18 @@ static uint32_t pbr_read_u32_le(NSData *data, NSUInteger pos) {
     SerializedObjectTable *table = [SerializedObjectTable tableForSerializedFileNodeData:cabData error:&tableErr];
     if (!table) {
         if (error) *error = PBRError(PlatformBundleRetargetErrorTableParseFailed, tableErr.localizedDescription ?: @"couldn't parse this bundle's object table");
-        return nil;
+        return NO;
     }
     if (!table.typesResolved) {
         // Refuse rather than guess which typeID index means Texture2D -
         // same posture SerializedObjectTable.h's own top comment already
         // takes for -insertObjects:...'s count-field lookup.
         if (error) *error = PBRError(PlatformBundleRetargetErrorTypesUnresolved, @"m_Types walk didn't resolve for this bundle - can't identify Texture2D objects by real classID, refusing rather than guessing by typeID");
-        return nil;
+        return NO;
     }
     if (!table.targetPlatformFieldOffsetKnown) {
         if (error) *error = PBRError(PlatformBundleRetargetErrorTargetPlatformFieldUnknown, @"m_TargetPlatform's offset wasn't resolved for this bundle");
-        return nil;
+        return NO;
     }
 
     PlatformBundleRetargetResult *result = [PlatformBundleRetargetResult new];
@@ -195,7 +205,7 @@ static uint32_t pbr_read_u32_le(NSData *data, NSUInteger pos) {
         if (samples.count >= kSampleTarget) break;
         NSData *bytes = [cabData subdataWithRange:NSMakeRange((NSUInteger)(table.dataOffset + obj.byteStart), obj.byteSize)];
         NSUInteger streamPos = NSNotFound;
-        if (resSData) pbr_find_stream_data_offset_field(bytes, &streamPos);
+        if (resSNode) pbr_find_stream_data_offset_field(bytes, &streamPos);
         [samples addObject:bytes];
         [samplePositions addObject:@(streamPos)];
     }
@@ -210,13 +220,25 @@ static uint32_t pbr_read_u32_le(NSData *data, NSUInteger pos) {
     }
 
     // Step 3: walk every Texture2D and rebuild it in place.
+    //
+    // MEMORY FIX (this session, see overview.md): every iteration used to
+    // leave its Texture2DPixelDecoder/RawPixelPacker scratch buffers
+    // (roughly width*height*4 bytes each for the RGBA32 intermediate
+    // alone) autoreleased but undrained until this whole function
+    // returned - for "hundreds of images" in one bundle, all of those
+    // stayed resident simultaneously, on top of cabData itself. Wrapping
+    // the loop body in its own @autoreleasepool drains each object's
+    // scratch memory the moment that object is done, the same fix
+    // Entry 4/5 already applied to TextureAtlasTransplant.m's equivalent
+    // loop - this file just never got it since it was written afterward.
     for (SerializedObject *obj in table.objects) {
+        @autoreleasepool {
         if (!obj.classIDResolved || obj.classID != kPBRClassIDTexture2D) continue;
         result->_texture2DCount++;
 
         NSData *objBytesConst = [cabData subdataWithRange:NSMakeRange((NSUInteger)(table.dataOffset + obj.byteStart), obj.byteSize)];
         NSUInteger streamFieldPos = NSNotFound;
-        BOOL streams = resSData && pbr_find_stream_data_offset_field(objBytesConst, &streamFieldPos);
+        BOOL streams = resSNode && pbr_find_stream_data_offset_field(objBytesConst, &streamFieldPos);
 
         NSError *headerErr = nil;
         Texture2DHeader *header = [Texture2DHeader parseHeaderInObjectBytes:objBytesConst
@@ -239,8 +261,12 @@ static uint32_t pbr_read_u32_le(NSData *data, NSUInteger pos) {
         if (streams) {
             uint64_t off = pbr_read_u64_le(objBytesConst, streamFieldPos);
             uint32_t size = pbr_read_u32_le(objBytesConst, streamFieldPos + 8);
-            if (off + size <= resSData.length) {
-                pixelBytes = [resSData subdataWithRange:NSMakeRange((NSUInteger)off, size)];
+            // Sliced straight out of archive.data (the decompressed
+            // source buffer) for just this one object's window, instead
+            // of out of a pre-copied whole-.resS buffer - see the
+            // resSNode comment above.
+            if ((int64_t)off + size <= resSNode.size) {
+                pixelBytes = [archive.data subdataWithRange:NSMakeRange((NSUInteger)(resSNode.offset + (int64_t)off), size)];
             }
         } else if (header.imageDataLength > 0) {
             pixelBytes = [objBytesConst subdataWithRange:NSMakeRange(header.imageDataOffset, header.imageDataLength)];
@@ -308,41 +334,64 @@ static uint32_t pbr_read_u32_le(NSData *data, NSUInteger pos) {
             ZLog(@"[PlatformBundleRetarget] pathID %lld: table patch failed (%@) - object bytes were appended but not repointed, this object is now effectively lost from the table; treating as a hard failure",
                  (long long)obj.pathID, patchErr.localizedDescription);
             if (error) *error = patchErr;
-            return nil;
+            return NO;
         }
         result->_texture2DRetargeted++;
+        } // @autoreleasepool
     }
 
     if (outResult) *outResult = result;
 
-    // Single-node rebuild (only cabData changed) - same
-    // append-in-original-order-and-record-new-offsets approach
-    // TextureAtlasTransplant.m's tat_rebuild_archive uses, just inlined
-    // here since only one node ever needs substituting in this file
-    // (see top comment on why .resS is never written to).
-    NSMutableData *newData = [NSMutableData data];
+    // Final write: stream straight to outPath instead of building one
+    // more full-bundle-size buffer first (an earlier version of this
+    // function built `newData` here by re-copying cabData's bytes AND
+    // every other node's bytes into a second combined buffer, which sat
+    // alongside cabData - already grown by every retargeted texture in
+    // the bundle - right at the moment of peak memory use; see
+    // overview.md). `newNodes` below only needs final offset/size per
+    // entry, which is known from lengths alone; the actual bytes are
+    // fetched by +writeArchiveStreamingToPath:...: one node at a time,
+    // written straight to disk, and released before the next node is
+    // even requested. cabData (already resident, already grown) is
+    // handed back as-is when its node comes up rather than copied again;
+    // every OTHER node is sliced fresh from archive.data on demand
+    // rather than pre-copied - this is the "let the disk do the work"
+    // option the earlier all-in-memory approach didn't have.
     NSMutableArray<UnityBundleNode *> *newNodes = [NSMutableArray array];
+    int64_t runningOffset = 0;
     for (UnityBundleNode *node in archive.nodes) {
-        NSData *bytes = [node.path isEqualToString:cab] ? cabData : pbr_node_slice(archive, node);
+        int64_t size = [node.path isEqualToString:cab] ? (int64_t)cabData.length : node.size;
         UnityBundleNode *newNode = [UnityBundleNode new];
         newNode.path = node.path;
-        newNode.offset = (int64_t)newData.length;
-        newNode.size = (int64_t)bytes.length;
-        [newData appendData:bytes];
+        newNode.offset = runningOffset;
+        newNode.size = size;
+        runningOffset += size;
         [newNodes addObject:newNode];
     }
-    UnityBundleArchive *out = [UnityBundleArchive new];
-    out.unityVersion = archive.unityVersion;
-    out.unityRevision = archive.unityRevision;
-    out.data = newData;
-    out.nodes = newNodes;
+
+    NSError *writeErr = nil;
+    BOOL wrote = [UnityBundleCAB writeArchiveStreamingToPath:outPath
+                                                 unityVersion:archive.unityVersion
+                                                unityRevision:archive.unityRevision
+                                                        nodes:newNodes
+                                              nodeDataAtIndex:^NSData * _Nullable(NSUInteger idx) {
+        UnityBundleNode *srcNode = archive.nodes[idx];
+        if ([srcNode.path isEqualToString:cab]) return cabData;
+        return pbr_node_slice(archive, srcNode);
+    }
+                                                        error:&writeErr];
+    cabData = nil; // no longer needed once the write loop above has consumed it
+    if (!wrote) {
+        if (error) *error = PBRError(PlatformBundleRetargetErrorArchiveWriteFailed, writeErr.localizedDescription ?: @"couldn't write retargeted archive");
+        return NO;
+    }
 
     ZLog(@"[PlatformBundleRetarget] %@: retargeted %ld/%ld Texture2D object(s) (%ld already packed, %ld header parse failed, %ld format unsupported), m_TargetPlatform -> %d",
          cab, (long)result->_texture2DRetargeted, (long)result->_texture2DCount,
          (long)result->_texture2DAlreadyPacked, (long)result->_texture2DHeaderParseFailed, (long)result->_texture2DFormatUnsupported,
          targetPlatform);
 
-    return out;
+    return YES;
 }
 
 @end

@@ -481,121 +481,88 @@ static void ubc_append_cstring(NSMutableData *d, NSString *s) {
     return archive;
 }
 
-+ (BOOL)writeArchive:(UnityBundleArchive *)archive toPath:(NSString *)path error:(NSError **)error {
-    // 1) blocks-info blob: 16-byte hash (zero - not verified on read, so
-    //    not worth computing on write either), one block entry covering
-    //    the whole of archive.data uncompressed, then the node table
-    //    verbatim (same offsets/sizes/paths - this doesn't add, remove,
-    //    or reorder nodes, only what's already inside archive.data).
+// Shared by +writeArchive:toPath:error: and +writeArchiveStreamingToPath:...
+// below - builds the small header+blocksInfo prefix (tens/low-hundreds of
+// bytes: hash, one block entry covering totalDataLength, then the node
+// table) and opens+returns a ready-to-append NSFileHandle at a
+// ".zsingularity-tmp" sibling of `path`. Every multi-byte field here is
+// computed from lengths the caller already knows (node.offset/size,
+// totalDataLength) - nothing here ever needs the actual node BYTES, only
+// their sizes, which is what lets the streaming variant avoid touching
+// node data until the write loop itself.
+static NSFileHandle *ubc_open_temp_and_write_prefix(NSString *path, NSString *unityVersion, NSString *unityRevision,
+                                                     NSArray<UnityBundleNode *> *nodes, int64_t totalDataLength,
+                                                     NSString **outTmpPath, NSError **error) {
     NSMutableData *blocksInfo = [NSMutableData data];
     uint8_t zeroHash[16] = {0};
     [blocksInfo appendBytes:zeroHash length:16];
     ubc_append_u32_be(blocksInfo, 1); // block count
-    ubc_append_u32_be(blocksInfo, (uint32_t)archive.data.length); // uncompressed size
-    ubc_append_u32_be(blocksInfo, (uint32_t)archive.data.length); // compressed size (== uncompressed, type none)
+    ubc_append_u32_be(blocksInfo, (uint32_t)totalDataLength); // uncompressed size
+    ubc_append_u32_be(blocksInfo, (uint32_t)totalDataLength); // compressed size (== uncompressed, type none)
     ubc_append_u16_be(blocksInfo, 0); // compression type 0 (none), no other flags
-    ubc_append_u32_be(blocksInfo, (uint32_t)archive.nodes.count);
-    for (UnityBundleNode *node in archive.nodes) {
+    ubc_append_u32_be(blocksInfo, (uint32_t)nodes.count);
+    for (UnityBundleNode *node in nodes) {
         ubc_append_i64_be(blocksInfo, node.offset);
         ubc_append_i64_be(blocksInfo, node.size);
         ubc_append_u32_be(blocksInfo, 4); // node flags - 4 (kSerializedFile-ish) on every real sample seen; not verified beyond that
         ubc_append_cstring(blocksInfo, node.path);
     }
 
-    // 2) fixed header, blocks-info stored inline (bit 7 clear) - flags =
-    //    combined(0x40) only; compression type 0 in the low bits is
-    //    already 0 so nothing to OR in there. No bit 9: this is a fresh
-    //    write, header always ends already 16-byte aligned (see below),
-    //    so there's genuinely nothing to pad - bit 9's real trigger
-    //    condition isn't confirmed (see the read-side comment), so this
-    //    just doesn't claim it either way rather than setting a flag
-    //    whose meaning here isn't verified.
     NSMutableData *out = [NSMutableData data];
     [out appendData:[@"UnityFS\0" dataUsingEncoding:NSUTF8StringEncoding]];
     ubc_append_u32_be(out, 8); // format version - copying the one every real sample has used so far
-    ubc_append_cstring(out, archive.unityVersion ?: @"5.x.x");
-    ubc_append_cstring(out, archive.unityRevision ?: @"0.0.0");
+    ubc_append_cstring(out, unityVersion ?: @"5.x.x");
+    ubc_append_cstring(out, unityRevision ?: @"0.0.0");
 
-    // total archive size gets backpatched once we know the final length
     NSUInteger totalSizeFieldOffset = out.length;
-    ubc_append_i64_be(out, 0);
+    ubc_append_i64_be(out, 0); // backpatched below
 
     ubc_append_u32_be(out, (uint32_t)blocksInfo.length); // compressed == uncompressed, type none
     ubc_append_u32_be(out, (uint32_t)blocksInfo.length);
     ubc_append_u32_be(out, 0x40); // flags: combined bit only
 
-    // Header is 8("UnityFS\0")+4+len(unityVersion)+1+len(unityRevision)+1+8+4+4+4.
-    // Every real sample this project has seen puts this at exactly 44
-    // bytes for "5.x.x\0"/"0.0.0\0", which is already 16-byte aligned -
-    // but pad explicitly rather than assume, since a longer/different
-    // version string would change that.
     {
         size_t rem = out.length % 16;
-        if (rem != 0) {
-            NSMutableData *pad = [NSMutableData dataWithLength:16 - rem];
-            [out appendData:pad];
-        }
+        if (rem != 0) [out appendData:[NSMutableData dataWithLength:16 - rem]];
     }
-
     [out appendData:blocksInfo];
-    // Data blocks also 16-byte align from this point per the read-side
-    // finding - true here too since blocksInfo.length isn't generally a
-    // multiple of 16.
     {
         size_t rem = out.length % 16;
-        if (rem != 0) {
-            NSMutableData *pad = [NSMutableData dataWithLength:16 - rem];
-            [out appendData:pad];
-        }
+        if (rem != 0) [out appendData:[NSMutableData dataWithLength:16 - rem]];
     }
 
-    // Entry 5 fix: this used to be `[out appendData:archive.data]`
-    // followed by one `-writeToFile:...` call. archive.data is already
-    // a full-bundle-size buffer (rebuilt by tat_rebuild_archive) by the
-    // time it gets here - appendData: made a THIRD full-size copy
-    // (after targetCABData/targetResSData and tat_rebuild_archive's own
-    // newData) alive at the exact peak of the whole transplant, right
-    // before the write NSData itself would materialize a fourth copy
-    // internally for -writeToFile:. See overview.md Entry 4/5. `out` at
-    // this point is only the small header+blocksInfo portion (tens of
-    // bytes), so instead we know the total size arithmetically (no need
-    // to concatenate to measure it), backpatch that, then stream `out`
-    // and archive.data to a temp file as two separate writes and swap
-    // it into place - same atomicity `NSDataWritingAtomic` gave us,
-    // without ever holding both in one buffer.
-    int64_t totalSize = (int64_t)(out.length + archive.data.length);
+    int64_t totalSize = (int64_t)out.length + totalDataLength;
     uint8_t sizeBytes[8];
     for (int i = 0; i < 8; i++) sizeBytes[i] = (uint8_t)((uint64_t)totalSize >> (8 * (7 - i)));
     [out replaceBytesInRange:NSMakeRange(totalSizeFieldOffset, 8) withBytes:sizeBytes];
 
     NSString *tmpPath = [path stringByAppendingString:@".zsingularity-tmp"];
     [NSFileManager.defaultManager removeItemAtPath:tmpPath error:nil]; // stale leftover from a prior crashed/killed write, if any
-
     if (![NSFileManager.defaultManager createFileAtPath:tmpPath contents:nil attributes:nil]) {
         if (error) *error = [NSError errorWithDomain:UnityBundleCABErrorDomain code:UnityBundleCABErrorCantReadFile userInfo:nil];
-        return NO;
+        return nil;
     }
     NSError *handleErr = nil;
     NSFileHandle *fh = [NSFileHandle fileHandleForWritingToURL:[NSURL fileURLWithPath:tmpPath] error:&handleErr];
     if (!fh) {
         if (error) *error = handleErr ?: [NSError errorWithDomain:UnityBundleCABErrorDomain code:UnityBundleCABErrorCantReadFile userInfo:nil];
         [NSFileManager.defaultManager removeItemAtPath:tmpPath error:nil];
-        return NO;
+        return nil;
     }
-
     @try {
-        [fh writeData:out];          // small: header + blocksInfo, already fully in memory
-        [fh writeData:archive.data]; // large: written straight from the caller's existing buffer, no extra copy made here
-        [fh closeFile];
+        [fh writeData:out]; // small: header + blocksInfo, already fully in memory
     } @catch (NSException *exc) {
         [fh closeFile];
         [NSFileManager.defaultManager removeItemAtPath:tmpPath error:nil];
         if (error) *error = [NSError errorWithDomain:UnityBundleCABErrorDomain code:UnityBundleCABErrorCantReadFile userInfo:@{NSLocalizedDescriptionKey: exc.reason ?: @"write failed"}];
-        return NO;
+        return nil;
     }
+    if (outTmpPath) *outTmpPath = tmpPath;
+    return fh;
+}
 
-    // Atomic swap - matches NSDataWritingAtomic's guarantee that a
-    // reader never sees a partially-written file at `path`.
+static BOOL ubc_finish_atomic_swap(NSFileHandle *fh, NSString *tmpPath, NSString *path, NSError **error) {
+    [fh closeFile];
     NSError *replaceErr = nil;
     NSURL *resultingURL = nil;
     if (![NSFileManager.defaultManager replaceItemAtURL:[NSURL fileURLWithPath:path]
@@ -609,6 +576,77 @@ static void ubc_append_cstring(NSMutableData *d, NSString *s) {
         return NO;
     }
     return YES;
+}
+
++ (BOOL)writeArchive:(UnityBundleArchive *)archive toPath:(NSString *)path error:(NSError **)error {
+    // Entry 5 fix (see that overview.md entry): this used to build a
+    // SECOND full-bundle-size `out` buffer via `[out appendData:archive.data]`.
+    // archive.data is already a full-bundle-size buffer by the time it
+    // gets here, so `out` now stays small (header+blocksInfo only) and
+    // archive.data is streamed straight to the temp file as its own
+    // NSFileHandle write - no extra copy made here.
+    NSString *tmpPath = nil;
+    NSFileHandle *fh = ubc_open_temp_and_write_prefix(path, archive.unityVersion, archive.unityRevision,
+                                                       archive.nodes, (int64_t)archive.data.length, &tmpPath, error);
+    if (!fh) return NO;
+    @try {
+        [fh writeData:archive.data]; // large: written straight from the caller's existing buffer, no extra copy made here
+    } @catch (NSException *exc) {
+        [fh closeFile];
+        [NSFileManager.defaultManager removeItemAtPath:tmpPath error:nil];
+        if (error) *error = [NSError errorWithDomain:UnityBundleCABErrorDomain code:UnityBundleCABErrorCantReadFile userInfo:@{NSLocalizedDescriptionKey: exc.reason ?: @"write failed"}];
+        return NO;
+    }
+    return ubc_finish_atomic_swap(fh, tmpPath, path, error);
+}
+
+// Same on-disk result as +writeArchive:toPath:error:, but never asks the
+// caller for one concatenated `archive.data` buffer at all. `nodes` must
+// already carry the FINAL offset/size each node will occupy (computable
+// from lengths alone, before any bytes are touched); `nodeDataAtIndex` is
+// called once per node, in order, and each NSData it returns is written
+// straight to the file handle and released before the next call - so at
+// most one node's bytes (plus whatever the caller's block itself is still
+// holding onto, e.g. a rebuilt CAB node) is ever resident at once, instead
+// of every node's bytes plus one more full-bundle copy of all of them
+// concatenated. This is the "let the disk do the work" option: unchanged
+// nodes can be handed back as a fresh small slice of an already
+// memory-mapped source archive right when they're needed, rather than
+// pre-copied into one giant buffer up front.
++ (BOOL)writeArchiveStreamingToPath:(NSString *)path
+                        unityVersion:(nullable NSString *)unityVersion
+                       unityRevision:(nullable NSString *)unityRevision
+                               nodes:(NSArray<UnityBundleNode *> *)nodes
+                     nodeDataAtIndex:(NSData * _Nullable (^)(NSUInteger index))nodeDataAtIndex
+                               error:(NSError **)error {
+    int64_t totalDataLength = 0;
+    for (UnityBundleNode *node in nodes) totalDataLength += node.size;
+
+    NSString *tmpPath = nil;
+    NSFileHandle *fh = ubc_open_temp_and_write_prefix(path, unityVersion, unityRevision, nodes, totalDataLength, &tmpPath, error);
+    if (!fh) return NO;
+
+    for (NSUInteger i = 0; i < nodes.count; i++) {
+        @autoreleasepool {
+            NSData *bytes = nodeDataAtIndex(i);
+            if (!bytes) {
+                [fh closeFile];
+                [NSFileManager.defaultManager removeItemAtPath:tmpPath error:nil];
+                if (error) *error = [NSError errorWithDomain:UnityBundleCABErrorDomain code:UnityBundleCABErrorCantReadFile
+                                                      userInfo:@{NSLocalizedDescriptionKey: [NSString stringWithFormat:@"node %lu produced no data", (unsigned long)i]}];
+                return NO;
+            }
+            @try {
+                [fh writeData:bytes];
+            } @catch (NSException *exc) {
+                [fh closeFile];
+                [NSFileManager.defaultManager removeItemAtPath:tmpPath error:nil];
+                if (error) *error = [NSError errorWithDomain:UnityBundleCABErrorDomain code:UnityBundleCABErrorCantReadFile userInfo:@{NSLocalizedDescriptionKey: exc.reason ?: @"write failed"}];
+                return NO;
+            }
+        } // bytes released here, before the next node is even fetched
+    }
+    return ubc_finish_atomic_swap(fh, tmpPath, path, error);
 }
 
 @end

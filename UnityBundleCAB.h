@@ -122,7 +122,22 @@ typedef NS_ENUM(NSInteger, UnityBundleCABErrorCode) {
 // the original's compression.
 + (BOOL)writeArchive:(UnityBundleArchive *)archive toPath:(NSString *)path error:(NSError **)error;
 
-
+// Same on-disk result as +writeArchive:toPath:error:, but for a caller
+// that doesn't want (or can't afford) to hold one concatenated
+// full-bundle NSData in memory at all. `nodes` must already have its
+// final offset/size per entry (computable from lengths alone); this
+// calls `nodeDataAtIndex` once per node, in order, writes what it
+// returns straight to the destination file, and releases it before
+// asking for the next one - so peak memory is roughly "whatever the
+// caller's block itself needs to produce one node's bytes," not "every
+// node's bytes plus one more full-bundle-size copy of all of them
+// concatenated." See PlatformBundleRetarget.m for the intended caller.
++ (BOOL)writeArchiveStreamingToPath:(NSString *)path
+                        unityVersion:(nullable NSString *)unityVersion
+                       unityRevision:(nullable NSString *)unityRevision
+                               nodes:(NSArray<UnityBundleNode *> *)nodes
+                     nodeDataAtIndex:(NSData * _Nullable (^)(NSUInteger index))nodeDataAtIndex
+                               error:(NSError **)error;
 
 // The archive's own name (its first directory node's path), e.g.
 // @"CAB-3832197875c1bd4d48da9ab24c88e996". nil + error filled if this

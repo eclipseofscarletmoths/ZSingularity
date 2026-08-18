@@ -69,7 +69,7 @@
 // 6x6 - flagged there, not solved here).
 
 #import <Foundation/Foundation.h>
-#import "UnityBundleCAB.h" // for UnityBundleArchive
+#import "UnityBundleCAB.h" // for UnityBundleNode/UnityBundleArchive (used by the .m; UnityBundleNode also appears in this header's block typedef via UnityBundleCAB.h's own imports)
 
 NS_ASSUME_NONNULL_BEGIN
 
@@ -101,10 +101,18 @@ typedef NS_ENUM(NSInteger, PlatformBundleRetargetErrorCode) {
 // Reads the UnityFS archive at desktopBundlePath (a PC/desktop-built
 // bundle - see this header's top comment), rewrites its SerializedFile
 // header's m_TargetPlatform to targetPlatform, re-encodes every
-// Texture2D object's pixel payload via Texture2DPixelDecoder + 
-// RawPixelPacker, and returns the resulting archive ready for
-// +writeArchive:toPath:error: (UnityBundleCAB.h) - this function itself
-// does not write anything to disk.
+// Texture2D object's pixel payload via Texture2DPixelDecoder +
+// RawPixelPacker, and writes the resulting archive straight to outPath
+// via +writeArchiveStreamingToPath:...:error: (UnityBundleCAB.h).
+//
+// Writes directly to outPath rather than handing back a UnityBundleArchive
+// for the caller to serialize separately (an earlier version of this
+// function did that - see overview.md's memory-usage entry for why that
+// two-step shape meant a second full-bundle-size buffer was alive right
+// next to the one this function already has to build for the CAB node
+// it's patching). Everything this function reads from the source archive
+// that ISN'T the CAB node being patched is streamed straight through to
+// outPath a node at a time, never copied into one more combined buffer.
 //
 // targetPlatform: the raw m_TargetPlatform int32 value to write - this
 // project has not independently re-derived Unity's BuildTarget/
@@ -117,10 +125,11 @@ typedef NS_ENUM(NSInteger, PlatformBundleRetargetErrorCode) {
 // format isn't one this project decodes) is left completely untouched -
 // same "whole-object copy, PathID does the work" posture as
 // TextureAtlasTransplant.m, just against one file instead of two.
-+ (nullable UnityBundleArchive *)retargetedArchiveFromDesktopBundleAtPath:(NSString *)desktopBundlePath
-                                                            targetPlatform:(int32_t)targetPlatform
-                                                                    result:(PlatformBundleRetargetResult * _Nullable * _Nullable)outResult
-                                                                     error:(NSError **)error;
++ (BOOL)retargetDesktopBundleAtPath:(NSString *)desktopBundlePath
+                      targetPlatform:(int32_t)targetPlatform
+                              toPath:(NSString *)outPath
+                              result:(PlatformBundleRetargetResult * _Nullable * _Nullable)outResult
+                               error:(NSError **)error;
 
 @end
 

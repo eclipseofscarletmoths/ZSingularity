@@ -3630,7 +3630,7 @@ static void * const kGDModsPickerKindKey = (void *)&kGDModsPickerKindKey;
 // of a desktop bundle's own value (19) - not independently re-derived
 // from Unity's BuildTarget/RuntimePlatform enum, taken as given from a
 // real mobile-bundle sample, per PlatformBundleRetarget.h's own note on
-// +retargetedArchiveFromDesktopBundleAtPath:targetPlatform:result:error:.
+// +retargetDesktopBundleAtPath:targetPlatform:toPath:result:error:.
 static const int32_t kGDMobileBuildTargetPlatform = 9;
 
 - (void)gd_handlePickedModURLs:(NSArray<NSURL *> *)urls intoFolder:(nullable NSString *)folderName {
@@ -3694,20 +3694,6 @@ static const int32_t kGDMobileBuildTargetPlatform = 9;
         for (NSURL *bundleURL in bundleURLs) {
             NSString *name = bundleURL.lastPathComponent;
 
-            BOOL accessing = [bundleURL startAccessingSecurityScopedResource];
-            NSError *retargetErr = nil;
-            PlatformBundleRetargetResult *pbrResult = nil;
-            UnityBundleArchive *retargeted = [PlatformBundleRetarget retargetedArchiveFromDesktopBundleAtPath:bundleURL.path
-                                                                                                targetPlatform:kGDMobileBuildTargetPlatform
-                                                                                                        result:&pbrResult
-                                                                                                         error:&retargetErr];
-            if (accessing) [bundleURL stopAccessingSecurityScopedResource];
-
-            if (!retargeted) {
-                [lines addObject:[NSString stringWithFormat:@"%@: %@", name, retargetErr.localizedDescription ?: @"retarget failed"]];
-                continue;
-            }
-
             // Scratch copy, one per bundle in its own UUID'd subfolder so
             // same-named picks (always "__data" for a cache-sourced mod,
             // per BundleTransplant.h's own filename note) never collide -
@@ -3717,10 +3703,25 @@ static const int32_t kGDMobileBuildTargetPlatform = 9;
             [[NSFileManager defaultManager] createDirectoryAtPath:scratchDir withIntermediateDirectories:YES attributes:nil error:nil];
             NSString *scratchPath = [scratchDir stringByAppendingPathComponent:name];
 
-            NSError *writeErr = nil;
-            BOOL wrote = [UnityBundleCAB writeArchive:retargeted toPath:scratchPath error:&writeErr];
-            if (!wrote) {
-                [lines addObject:[NSString stringWithFormat:@"%@: %@", name, writeErr.localizedDescription ?: @"couldn't write retargeted archive"]];
+            // Retarget now writes straight to scratchPath itself (see
+            // overview.md's memory-usage entry) instead of handing back an
+            // in-memory UnityBundleArchive for a separate +writeArchive:
+            // call - that two-step shape used to mean the retargeted
+            // bundle's full bytes and a second freshly-serialized copy of
+            // the same bytes were briefly resident at once, on top of
+            // everything the per-object re-encode loop itself needed.
+            BOOL accessing = [bundleURL startAccessingSecurityScopedResource];
+            NSError *retargetErr = nil;
+            PlatformBundleRetargetResult *pbrResult = nil;
+            BOOL retargeted = [PlatformBundleRetarget retargetDesktopBundleAtPath:bundleURL.path
+                                                                     targetPlatform:kGDMobileBuildTargetPlatform
+                                                                             toPath:scratchPath
+                                                                             result:&pbrResult
+                                                                              error:&retargetErr];
+            if (accessing) [bundleURL stopAccessingSecurityScopedResource];
+
+            if (!retargeted) {
+                [lines addObject:[NSString stringWithFormat:@"%@: %@", name, retargetErr.localizedDescription ?: @"retarget failed"]];
                 [[NSFileManager defaultManager] removeItemAtPath:scratchDir error:nil];
                 continue;
             }
