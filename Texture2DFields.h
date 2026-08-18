@@ -72,6 +72,22 @@ typedef struct {
     BOOL hasMipsStripped;             // int, 2020.1+
     // (m_TextureFormat always present here)
     BOOL hasMipCountAsInt;            // 2017.3+: int m_MipCount. Pre-2017.3 used bool m_MipMap instead - NOT supported, this project has no pre-2017.3 sample and Limbus Company is not that old.
+    // (m_IsReadable - bool - and m_MipmapLimitGroupName - string,
+    //  Unity 6's "Mipmap Limit Groups" feature - always present here in
+    //  every real Unity 6000.3.12f1 sample this project has seen, in
+    //  that order, right after m_MipCount and before m_IsPreProcessed.
+    //  NOT gated behind a profile flag on purpose - unlike everything
+    //  else in this struct, these aren't version-conditional (they
+    //  either exist for this whole build or they don't - no sample has
+    //  ever shown them absent), so there is no "maybe absent" case to
+    //  model. m_MipmapLimitGroupName is a real per-OBJECT content field
+    //  (an artist-assignable label), not a build constant - it happens
+    //  to be empty on the overwhelming majority of textures, which is
+    //  exactly what let this go unnoticed for as long as it did: an
+    //  empty string's length prefix coincidentally cost the same 4
+    //  bytes older wrong profiles already landed on by chance. Any
+    //  texture with a real (non-empty) group name assigned breaks that
+    //  coincidence and needs this field actually parsed - see the .m.)
     BOOL hasIsPreProcessed;           // bool, long-standing
     BOOL hasIgnoreMipmapLimit;        // bool, present under this name or the older m_IgnoreMasterTextureLimit across the whole range this project targets
     BOOL hasStreamingMipmaps;         // bool, 2020.2+

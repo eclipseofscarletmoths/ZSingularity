@@ -204,6 +204,24 @@ const TAT2VersionProfile kTAT2ProfileDefault = {
     }
     T2F_NEED(4); NSUInteger mipCountOffset = pos; int32_t mipCount = t2f_read_i32_le(objectBytes, pos); pos += 4;
 
+    // m_IsReadable (bool) + m_MipmapLimitGroupName (string) - see
+    // Texture2DFields.h's struct comment on why these are unconditional
+    // rather than profile flags. m_IsReadable is fixed-size and doesn't
+    // shift anything on its own; m_MipmapLimitGroupName is a real
+    // length-prefixed string and DOES shift every field after it
+    // whenever an object actually has a non-empty group name assigned -
+    // this is the field that was missing entirely before, and is why
+    // some (not all) objects failed the streamDataPositionConfirmed
+    // check below despite a profile that worked for the majority.
+    T2F_NEED(1); pos += 1; // m_IsReadable
+    pos = t2f_align4(pos); // string length prefix below needs 4-byte alignment
+    T2F_NEED(4);
+    uint32_t mipmapLimitGroupNameLen = t2f_read_u32_le(objectBytes, pos);
+    pos += 4;
+    T2F_NEED(mipmapLimitGroupNameLen);
+    pos += mipmapLimitGroupNameLen;
+    pos = t2f_align4(pos);
+
     if (profile.hasIsPreProcessed)    { T2F_NEED(1); pos += 1; }
     if (profile.hasIgnoreMipmapLimit) { T2F_NEED(1); pos += 1; }
     if (profile.hasStreamingMipmaps)  { T2F_NEED(1); pos += 1; }
