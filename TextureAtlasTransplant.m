@@ -196,12 +196,15 @@ static TAT2VersionProfile tat_resolve_profile(UnityBundleArchive *moddedArchive,
 
     TAT2VersionProfile detected;
     TAT2VersionProfile resolved;
-    if ([Texture2DHeader detectVersionProfile:&detected fromObjectSamples:samples streamDataOffsetFieldPositions:samplePositions]) {
+    if ([versionKey isEqualToString:@"6000.3.12f1"]) {
+        resolved = kTAT2ProfileDefault;
+        ZLog(@"[TextureAtlasTransplant] unityVersion %@: using authoritative Unity 6000.3.12f1 Texture2D profile", versionKey);
+    } else if ([Texture2DHeader detectVersionProfile:&detected fromObjectSamples:samples streamDataOffsetFieldPositions:samplePositions]) {
         resolved = detected;
         ZLog(@"[TextureAtlasTransplant] unityVersion %@: detected TAT2VersionProfile from %lu Texture2D sample(s)", versionKey, (unsigned long)samples.count);
     } else {
         resolved = kTAT2ProfileDefault;
-        ZLog(@"[TextureAtlasTransplant] unityVersion %@: profile detection inconclusive (%lu sample(s) available) - falling back to kTAT2ProfileDefault; expect Texture2D header parse failures if this build's layout differs",
+        ZLog(@"[TextureAtlasTransplant] unityVersion %@: profile detection inconclusive (%lu sample(s) available) - falling back to kTAT2ProfileDefault",
              versionKey, (unsigned long)samples.count);
     }
 

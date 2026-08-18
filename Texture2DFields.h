@@ -18,28 +18,12 @@
 // plugs into once it exists. It also does not decide WHAT to write;
 // callers (TextureAtlasTransplant.m) own that decision.
 //
-// WHY A "VERSION PROFILE" INSTEAD OF ONE FIXED LAYOUT: Texture2D's
-// serialized field list has grown new bool/int fields across Unity
-// versions (m_IsAlphaChannelOptional in 2020.2, m_MipsStripped in
-// 2020.1, m_StreamingMipmaps/Priority in 2020.2, m_IgnoreMipmapLimit's
-// 2022.2 rename, m_PlatformBlob in 2020.1...) - same "genuinely complex,
-// deeply version/flag-conditional layout" problem
-// SerializedObjectTable.h already flagged for the Types array, and this
-// project has the same answer for it here as it did there: don't
-// silently trust one hardcoded guess. kTAT2ProfileDefault below is a
-// STARTING POINT (Unity 2021/2022 LTS field set, the likely range for a
-// game built in the last few years) - it has NOT been confirmed against
-// one of this project's own real Texture2D dumps the way
-// SerializedObjectTable's table-scan and TextureAtlasTransplant's
-// StreamingInfo pattern-match were. +parseHeaderInObjectBytes:... below
-// self-validates its landing spot (width/height in a plausible pixel
-// range, format in the known enum set, and - if the object streams -
-// the computed header-end lines up with where
-// tat_find_stream_data_offset_field independently found "archive:/...")
-// and refuses to return a result if any of that disagrees, rather than
-// returning field offsets that merely didn't crash. If it refuses on
-// real data, the fix is adjusting the profile's flags against one
-// actual object dump, not loosening the validation.
+// This tweak targets Limbus Company's Unity 6000.3.12f1 build. The
+// previous parser used a 2021/2022-era Texture2D profile. Unity 6's
+// Texture2D layout includes m_VTOnly and m_AlphaIsTransparency after
+// m_StreamingMipmapsPriority; together they add 4 bytes after alignment.
+// The parser below follows that exact field order and uses structural
+// validation against the object's own trailing StreamingInfo.
 
 #import <Foundation/Foundation.h>
 
@@ -72,10 +56,10 @@ typedef struct {
     BOOL hasMipsStripped;             // int, 2020.1+
     // (m_TextureFormat always present here)
     BOOL hasMipCountAsInt;            // 2017.3+: int m_MipCount. Pre-2017.3 used bool m_MipMap instead - NOT supported, this project has no pre-2017.3 sample and Limbus Company is not that old.
-    // (m_IsReadable - bool - and m_MipmapLimitGroupName - string,
-    //  Unity 6's "Mipmap Limit Groups" feature - always present here in
-    //  every real Unity 6000.3.12f1 sample this project has seen, in
-    //  that order, right after m_MipCount and before m_IsPreProcessed.
+    // Unity 6000.3.12f1 has m_IsReadable, m_IsPreProcessed,
+    // m_IgnoreMipmapLimit, then m_MipmapLimitGroupName before the
+    // streaming fields. m_MipmapLimitGroupName is a real per-object
+    // string field, so its length must be walked rather than assumed empty.
     //  NOT gated behind a profile flag on purpose - unlike everything
     //  else in this struct, these aren't version-conditional (they
     //  either exist for this whole build or they don't - no sample has
@@ -92,6 +76,10 @@ typedef struct {
     BOOL hasIgnoreMipmapLimit;        // bool, present under this name or the older m_IgnoreMasterTextureLimit across the whole range this project targets
     BOOL hasStreamingMipmaps;         // bool, 2020.2+
     BOOL hasStreamingMipmapsPriority; // int, 2020.2+ (only meaningful if hasStreamingMipmaps)
+    // Unity 6 (including 6000.3.12f1) serializes these two bools after
+    // m_StreamingMipmapsPriority and before m_ImageCount.
+    BOOL hasVTOnly;                   // bool, Unity 6 player Texture2D layout
+    BOOL hasAlphaIsTransparency;      // bool, Unity 6 player Texture2D layout
     // (m_ImageCount, m_TextureDimension, GLTextureSettings block,
     //  m_LightmapFormat, m_ColorSpace always present here, fixed size -
     //  see the .m for their sizes)
@@ -101,16 +89,11 @@ typedef struct {
     // via tat_find_stream_data_offset_field, not via this profile.
 } TAT2VersionProfile;
 
-// Unity 2021/2022 LTS field set - see top comment. NOT authoritative -
-// this is a last-resort fallback only, used when
-// +detectVersionProfile:fromObjectSamples: (below) can't settle on a
-// single candidate (e.g. too few sample objects available). Every
-// real build should go through detection first; this constant exists
-// so the pipeline still degrades to today's "loud per-object skip +
-// log" behavior instead of silently doing nothing when detection is
-// inconclusive. Kept under its original name (kTAT2ProfileDefault) so
-// existing call sites/comments referring to it don't need renaming;
-// think of it as "the guess," not "the default."
+// Authoritative profile for Limbus Company's Unity 6000.3.12f1 build.
+// The previous fallback was a Unity 2021/2022-era guess; in Unity 6,
+// m_VTOnly and m_AlphaIsTransparency are serialized after
+// m_StreamingMipmapsPriority. Omitting those fields produces the exact
+// +4-byte cursor drift observed at the image-data/StreamingInfo boundary.
 extern const TAT2VersionProfile kTAT2ProfileDefault;
 
 // Everything this module can locate/patch about one Texture2D object's
@@ -160,7 +143,7 @@ extern const TAT2VersionProfile kTAT2ProfileDefault;
 // comment ("WHY A VERSION PROFILE") for why the guess can't be
 // trusted across Unity versions.
 //
-// Of the 10 fields in TAT2VersionProfile, hasMipCountAsInt is fixed
+// Of the 12 fields in TAT2VersionProfile, hasMipCountAsInt, hasVTOnly, and hasAlphaIsTransparency are fixed
 // YES (pre-2017.3 isn't supported - see that field's own comment), so
 // there are at most 2^9 = 512 candidate profiles - cheap to try all
 // of them.

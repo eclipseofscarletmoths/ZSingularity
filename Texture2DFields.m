@@ -98,6 +98,8 @@ const TAT2VersionProfile kTAT2ProfileDefault = {
     .hasIgnoreMipmapLimit        = YES,
     .hasStreamingMipmaps         = YES,
     .hasStreamingMipmapsPriority = YES,
+    .hasVTOnly                   = YES,
+    .hasAlphaIsTransparency     = YES,
     .hasPlatformBlob             = YES,
 };
 
@@ -155,6 +157,9 @@ const TAT2VersionProfile kTAT2ProfileDefault = {
             .hasIgnoreMipmapLimit        = (mask & (1 << 5)) != 0,
             .hasStreamingMipmaps         = (mask & (1 << 6)) != 0,
             .hasStreamingMipmapsPriority = (mask & (1 << 7)) != 0,
+            // Unity 6000.3.12f1 fixed fields after StreamingMipmapsPriority.
+            .hasVTOnly                   = YES,
+            .hasAlphaIsTransparency     = YES,
             .hasPlatformBlob             = (mask & (1 << 8)) != 0,
         };
 
@@ -245,17 +250,26 @@ const TAT2VersionProfile kTAT2ProfileDefault = {
     }
     T2F_NEED(4); NSUInteger mipCountOffset = pos; int32_t mipCount = t2f_read_i32_le(objectBytes, pos); pos += 4;
 
-    // m_IsReadable (bool) + m_MipmapLimitGroupName (string) - see
-    // Texture2DFields.h's struct comment on why these are unconditional
-    // rather than profile flags. m_IsReadable is fixed-size and doesn't
-    // shift anything on its own; m_MipmapLimitGroupName is a real
-    // length-prefixed string and DOES shift every field after it
-    // whenever an object actually has a non-empty group name assigned -
-    // this is the field that was missing entirely before, and is why
-    // some (not all) objects failed the streamDataPositionConfirmed
-    // check below despite a profile that worked for the majority.
+    // Unity 6000.3.x serialized order:
+    //   m_IsReadable
+    //   m_IsPreProcessed
+    //   m_IgnoreMipmapLimit
+    //   m_MipmapLimitGroupName
+    //   m_StreamingMipmaps
+    //   m_StreamingMipmapsPriority
+    //   m_VTOnly
+    //   m_AlphaIsTransparency
+    //
+    // The previous parser treated m_MipmapLimitGroupName as if it
+    // preceded m_IsPreProcessed/m_IgnoreMipmapLimit and omitted the two
+    // Unity-6 bools after m_StreamingMipmapsPriority. The latter omission
+    // is a fixed 4-byte drift after alignment and matches the device
+    // log's repeated delta=+4 failures.
     T2F_NEED(1); pos += 1; // m_IsReadable
-    pos = t2f_align4(pos); // string length prefix below needs 4-byte alignment
+    if (profile.hasIsPreProcessed)    { T2F_NEED(1); pos += 1; }
+    if (profile.hasIgnoreMipmapLimit) { T2F_NEED(1); pos += 1; }
+    pos = t2f_align4(pos);
+
     T2F_NEED(4);
     uint32_t mipmapLimitGroupNameLen = t2f_read_u32_le(objectBytes, pos);
     pos += 4;
@@ -263,11 +277,13 @@ const TAT2VersionProfile kTAT2ProfileDefault = {
     pos += mipmapLimitGroupNameLen;
     pos = t2f_align4(pos);
 
-    if (profile.hasIsPreProcessed)    { T2F_NEED(1); pos += 1; }
-    if (profile.hasIgnoreMipmapLimit) { T2F_NEED(1); pos += 1; }
     if (profile.hasStreamingMipmaps)  { T2F_NEED(1); pos += 1; }
     pos = t2f_align4(pos);
     if (profile.hasStreamingMipmapsPriority) { T2F_NEED(4); pos += 4; }
+
+    if (profile.hasVTOnly)             { T2F_NEED(1); pos += 1; }
+    if (profile.hasAlphaIsTransparency){ T2F_NEED(1); pos += 1; }
+    pos = t2f_align4(pos);
 
     // m_ImageCount / m_TextureDimension / GLTextureSettings / m_LightmapFormat / m_ColorSpace -
     // fixed-size, not version-conditional in this project's target range - see kGLTextureSettingsSize's comment.

@@ -262,9 +262,12 @@ static uint32_t pbr_read_u32_le(NSData *data, NSUInteger pos) {
     }
 
     TAT2VersionProfile profile;
-    if (![Texture2DHeader detectVersionProfile:&profile fromObjectSamples:samples streamDataOffsetFieldPositions:samplePositions]) {
+    if ([archive.unityVersion isEqualToString:@"6000.3.12f1"]) {
         profile = kTAT2ProfileDefault;
-        ZLog(@"[PlatformBundleRetarget] %@: profile detection inconclusive (%lu Texture2D sample(s)) - falling back to kTAT2ProfileDefault; expect per-object parse failures below if this build's layout differs",
+        ZLog(@"[PlatformBundleRetarget] %@: using authoritative Unity 6000.3.12f1 Texture2D profile", cab);
+    } else if (![Texture2DHeader detectVersionProfile:&profile fromObjectSamples:samples streamDataOffsetFieldPositions:samplePositions]) {
+        profile = kTAT2ProfileDefault;
+        ZLog(@"[PlatformBundleRetarget] %@: profile detection inconclusive (%lu Texture2D sample(s)) - falling back to kTAT2ProfileDefault",
              cab, (unsigned long)samples.count);
     } else {
         ZLog(@"[PlatformBundleRetarget] %@: detected TAT2VersionProfile from %lu Texture2D sample(s)", cab, (unsigned long)samples.count);
