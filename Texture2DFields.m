@@ -45,6 +45,47 @@ static NSUInteger t2f_align4(NSUInteger pos) {
     return (pos + 3) & ~(NSUInteger)3;
 }
 
+// Diagnostic-only. Renders `[before..after)` around both `pos` (where the
+// walk actually landed) and `confirmedPos` (the independently-found
+// StreamingInfo position) as a hex/ASCII dump, with both positions marked
+// inline, so a streamDataPositionConfirmed failure can be root-caused from
+// a single log line instead of guessing at profile flags again. Added
+// specifically because the last ~10-15% of failures (see overview.md) show
+// a small, CONSTANT delta (pos always a few bytes short of confirmedPos) on
+// only a subset of objects in an otherwise-working profile - i.e. very
+// likely one content-conditional field (m_MipmapLimitGroupName being
+// non-empty for some objects, or a field this project's 9-flag profile
+// doesn't model at all yet), not a wrong profile outright. Bounded to a
+// small window and only called on the failure path, so this has no cost
+// on the success path and can't itself leak more than a few dozen bytes
+// per failing object into the log.
+static NSString *t2f_hexdump_around(NSData *data, NSUInteger pos, NSUInteger confirmedPos) {
+    NSUInteger lo = (pos > 16) ? pos - 16 : 0;
+    NSUInteger hiFromPos = pos + 16;
+    NSUInteger hiFromConfirmed = confirmedPos + 16;
+    NSUInteger hi = MAX(hiFromPos, hiFromConfirmed);
+    hi = MIN(hi, data.length);
+    if (lo >= hi) return @"(window out of range)";
+
+    const uint8_t *bytes = (const uint8_t *)data.bytes;
+    NSMutableString *out = [NSMutableString string];
+    for (NSUInteger i = lo; i < hi; i += 8) {
+        NSMutableString *hexPart = [NSMutableString string];
+        NSMutableString *asciiPart = [NSMutableString string];
+        for (NSUInteger j = i; j < MIN(i + 8, hi); j++) {
+            uint8_t b = bytes[j];
+            NSString *marker = @"";
+            if (j == pos) marker = (j == confirmedPos) ? @"[PC]" : @"[P]";
+            else if (j == confirmedPos) marker = @"[C]";
+            [hexPart appendFormat:@"%@%02x ", marker, b];
+            [asciiPart appendFormat:@"%c", (b >= 32 && b < 127) ? b : '.'];
+        }
+        NSString *paddedHex = hexPart.length < 56 ? [hexPart stringByPaddingToLength:56 withString:@" " startingAtIndex:0] : hexPart;
+        [out appendFormat:@"\n  +%lu  %@ %@", (unsigned long)i, paddedHex, asciiPart];
+    }
+    return out;
+}
+
 #pragma mark - version profile
 
 const TAT2VersionProfile kTAT2ProfileDefault = {
@@ -293,8 +334,20 @@ const TAT2VersionProfile kTAT2ProfileDefault = {
     if (streamDataOffsetFieldPos != NSNotFound) {
         streamConfirmed = (streamDataOffsetFieldPos == pos);
         if (!streamConfirmed) {
-            ZLog(@"[Texture2DFields] parsed header end (%lu) doesn't match independently-found StreamingInfo position (%lu) - profile is very likely wrong for this object",
-                 (unsigned long)pos, (unsigned long)streamDataOffsetFieldPos);
+            NSInteger delta = (NSInteger)streamDataOffsetFieldPos - (NSInteger)pos;
+            ZLog(@"[Texture2DFields] parsed header end (%lu) doesn't match independently-found StreamingInfo position (%lu), delta=%ld - profile is very likely wrong for this object",
+                 (unsigned long)pos, (unsigned long)streamDataOffsetFieldPos, (long)delta);
+            // DIAGNOSTIC (see t2f_hexdump_around's comment): only fires on
+            // the failure path, bounded to a small window. [P]/[C]/[PC]
+            // mark the walked position, the confirmed position, and both
+            // coinciding, respectively. Intended to be read by hand against
+            // the known layout (mipmapLimitGroupNameLen, m_IsPreProcessed,
+            // etc.) to identify which field the current profile is missing
+            // for THIS object but not the majority - not to auto-correct
+            // anything. Remove once the real field is identified and added
+            // to TAT2VersionProfile properly.
+            ZLog(@"[Texture2DFields] [DIAG] window around walked/confirmed positions (delta=%ld):%@",
+                 (long)delta, t2f_hexdump_around(objectBytes, pos, streamDataOffsetFieldPos));
             if (error) *error = [NSError errorWithDomain:Texture2DFieldsErrorDomain code:5 userInfo:@{NSLocalizedDescriptionKey: @"computed header end doesn't match tat_find_stream_data_offset_field's independently-found StreamingInfo position - wrong TAT2VersionProfile for this Unity version"}];
             return nil;
         }
