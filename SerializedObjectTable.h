@@ -137,6 +137,16 @@ typedef NS_ENUM(NSInteger, SerializedObjectTableErrorCode) {
 // index cannot do so for this file.
 @property (nonatomic, assign, readonly) BOOL typesResolved;
 
+// Exact byte offset of m_ObjectCount within the nodeData this table was
+// parsed from, or -1 if unknown. Only known (objectCountFieldOffsetKnown
+// == YES) when typesResolved is also YES - it's derived structurally from
+// wherever the Types-array walk (or its near-search correction) located
+// the object table, not searched for. -insertObjects:... uses this
+// directly instead of re-deriving the position via heuristic byte-value
+// search - see that method's doc below and overview.md Entry 7/8.
+@property (nonatomic, assign, readonly) int64_t objectCountFieldOffset;
+@property (nonatomic, assign, readonly) BOOL objectCountFieldOffsetKnown;
+
 // Locates and parses the object table inside `nodeData` (one
 // UnityBundleNode's slice of a decompressed UnityBundleArchive.data -
 // the CAB node, not its .resS companion). See this header's top comment
@@ -165,23 +175,32 @@ typedef NS_ENUM(NSInteger, SerializedObjectTableErrorCode) {
 
 // Adds brand-new entries to the object table - the capability
 // TextureAtlasTransplant.h's own header used to rule out ("never invent
-// new PathIDs") because it depends on a field this class's own top
-// comment already flagged as unverified: the int32 m_ObjectCount that,
-// per the public SerializedFile format, sits immediately before the
-// entries this table's +tableForSerializedFileNodeData:error: only ever
-// SCANNED for rather than reached by parsing the Types array that
-// precedes it. This method still doesn't parse that array. Instead it
-// finds m_ObjectCount the same way the table itself was found -
-// structurally, not by offset assumption: this table already knows its
-// own true entry count from the scan, so it searches the handful of
-// bytes immediately before the first entry for a 4-byte integer (tried
-// both little- and big-endian, since the table entries themselves are
-// LE but everything structural in the surrounding header is BE - see
-// the .m's top comment - and this project has no real dump pinning down
-// which convention the count field itself actually uses) that equals
-// that known count. Exactly one candidate in that window is treated as
-// confirmation; zero is SOTErrorCountFieldNotFound, more than one is
-// SOTErrorCountFieldAmbiguous - both refuse rather than guess.
+// new PathIDs") because it depends on knowing exactly where m_ObjectCount
+// (the int32 that, per the public SerializedFile format, sits immediately
+// before the object table's first entry) lives.
+//
+// UPDATED (overview.md Entry 8): now uses
+// SerializedObjectTable.objectCountFieldOffset - the exact position
+// +tableForSerializedFileNodeData:error: already derived structurally
+// while locating the table itself via the Types-array walk - whenever
+// it's known (typesResolved was YES for this table). This is a
+// format-derived fact, not a search: m_ObjectCount is always the 4 LE
+// bytes immediately before the table, full stop.
+//
+// Only when that structural offset is unavailable (typesResolved was NO -
+// this table was located via the blind byte-scan fallback, which has no
+// structural basis for where m_ObjectCount is) does this fall back to the
+// OLD heuristic: searching the handful of bytes immediately before the
+// first entry for a 4-byte integer (tried both little- and big-endian)
+// that equals this table's own known entry count. Exactly one candidate
+// in that window is treated as confirmation; zero is
+// SOTErrorCountFieldNotFound, more than one is SOTErrorCountFieldAmbiguous
+// - both refuse rather than guess. This heuristic is the fragility Entry 7
+// traced CAB-654's "new objects vanish together" symptom to (a coincidental
+// non-match, or a coincidental second match, becomes more likely on a
+// large, content-heavy bundle with more nearby candidate bytes) - it's
+// kept only as a fallback for the no-structural-offset case now, not the
+// primary mechanism.
 //
 // On a confirmed location, splices newObjects.count fresh 24-byte
 // entries in immediately after the last existing entry (so every

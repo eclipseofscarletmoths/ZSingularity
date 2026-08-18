@@ -344,6 +344,9 @@ static void sot_write_u64_be(NSMutableData *data, NSUInteger pos, uint64_t v) {
 static uint32_t sot_read_u32_be_public(NSData *data, NSUInteger pos) {
     return sot_read_u32_be((const uint8_t *)data.bytes + pos);
 }
+static uint32_t sot_read_u32_le_public(NSData *data, NSUInteger pos) {
+    return sot_read_u32_le((const uint8_t *)data.bytes + pos);
+}
 static uint64_t sot_read_u64_be_public(NSData *data, NSUInteger pos) {
     return sot_read_u64_be((const uint8_t *)data.bytes + pos);
 }
@@ -386,11 +389,15 @@ static BOOL sot_locate_count_field(NSData *nodeData, NSUInteger firstEntryOffset
     NSArray<SerializedObject *> *_objects;
     int64_t _dataOffset;
     BOOL _typesResolved;
+    int64_t _objectCountFieldOffset;      // see .h doc - exact byte offset of m_ObjectCount, or -1 if unknown
+    BOOL _objectCountFieldOffsetKnown;
 }
 
 - (int64_t)dataOffset { return _dataOffset; }
 - (NSArray<SerializedObject *> *)objects { return _objects; }
 - (BOOL)typesResolved { return _typesResolved; }
+- (int64_t)objectCountFieldOffset { return _objectCountFieldOffset; }
+- (BOOL)objectCountFieldOffsetKnown { return _objectCountFieldOffsetKnown; }
 
 // Bounded local search around `center` (the walk's landing position) for
 // an offset that decodes to EXACTLY `expectedCount` entries - tried in
@@ -525,6 +532,29 @@ static NSArray<SerializedObject *> *sot_decode_table_near(NSData *nodeData, cons
     table->_dataOffset = (int64_t)header.dataOffset;
     table->_objects = objects;
     table->_typesResolved = typesResolved;
+
+    // Capture m_ObjectCount's exact byte offset while we still have it for
+    // free, instead of making -insertObjects:... re-derive it later via
+    // heuristic byte-value search (see that method's rewritten doc/impl
+    // below, and overview.md Entry 7/8 for why that search is fragile on
+    // large bundles). By the public SerializedFile format, m_ObjectCount is
+    // a fixed 4-byte LE int32 that ALWAYS sits immediately before the first
+    // object table entry - no alignment gap - so `tableStart - 4` is exact
+    // whether tableStart came from the walk's own landing position or from
+    // sot_decode_table_near's nearby-drift correction (the correction only
+    // adjusts where the TABLE was found to start; the format invariant that
+    // m_ObjectCount is the 4 bytes immediately before it still holds at
+    // whichever position turned out to be correct). Only available when
+    // typesResolved is YES - the blind byte-scan fallback below has no
+    // structural basis for this and leaves it unknown.
+    if (typesResolved && tableStart >= 4) {
+        table->_objectCountFieldOffset = (int64_t)tableStart - 4;
+        table->_objectCountFieldOffsetKnown = YES;
+    } else {
+        table->_objectCountFieldOffset = -1;
+        table->_objectCountFieldOffsetKnown = NO;
+    }
+
     return table;
 }
 
@@ -573,13 +603,55 @@ static NSArray<SerializedObject *> *sot_decode_table_near(NSData *nodeData, cons
     NSUInteger firstEntryOffset = _objects.firstObject.tableOffset;
     NSUInteger tableEnd = lastExisting.tableOffset + 24; // insertion point - see .h
 
-    NSUInteger countFieldOffset;
-    BOOL countFieldBE;
-    if (!sot_locate_count_field(nodeData, firstEntryOffset, _objects.count, &countFieldOffset, &countFieldBE)) {
-        if (error) *error = [NSError errorWithDomain:SerializedObjectTableErrorDomain
-                                                  code:SOTErrorCountFieldNotFound
-                                              userInfo:@{NSLocalizedDescriptionKey: @"couldn't uniquely locate m_ObjectCount preceding the object table - see SerializedObjectTable.h's -insertObjects:... doc"}];
-        return NO;
+    NSUInteger countFieldOffset = 0;
+    BOOL countFieldBE = NO;
+    BOOL foundCountField = NO;
+
+    // PRIMARY: use the structurally-known m_ObjectCount offset captured
+    // when this table was parsed (tableForSerializedFileNodeData: - see its
+    // doc above). This is a format-derived FACT (m_ObjectCount always
+    // immediately precedes the object table, always read/written little-
+    // endian, same as every other field sot_walk_types_array reads), not a
+    // heuristic guess, so unlike sot_locate_count_field below it can't be
+    // fooled by an unrelated 4-byte value elsewhere in the header
+    // coincidentally matching the object count - which is exactly the
+    // failure mode overview.md's Entry 7 traced CAB-654's "new objects
+    // vanish together" symptom to (a large, content-heavy bundle has more
+    // candidate bytes nearby, making a coincidental collision - or a
+    // coincidental ZERO matches, if the real field's own bytes don't
+    // happen to also equal the count in the searched window - more likely
+    // than for a small bundle). Still sanity-checked against the table's
+    // own known live count before being trusted, so a stale/mismatched
+    // offset (table mutated by something else since this instance parsed
+    // it, unexpected format edge case, etc.) falls through to the
+    // heuristic fallback instead of writing to the wrong field blind.
+    if (_objectCountFieldOffsetKnown &&
+        _objectCountFieldOffset >= 0 &&
+        (NSUInteger)_objectCountFieldOffset + 4 <= nodeData.length) {
+        uint32_t liveVal = sot_read_u32_le_public(nodeData, (NSUInteger)_objectCountFieldOffset);
+        if (liveVal == (uint32_t)_objects.count) {
+            countFieldOffset = (NSUInteger)_objectCountFieldOffset;
+            countFieldBE = NO;
+            foundCountField = YES;
+        } else {
+            ZLog(@"[SerializedObjectTable] insertObjects: structural m_ObjectCount offset %lld didn't read back the expected live count (%lu, got %u) - falling back to heuristic search",
+                 _objectCountFieldOffset, (unsigned long)_objects.count, liveVal);
+        }
+    }
+
+    // FALLBACK: only reached when the structural offset wasn't available
+    // (typesResolved was NO for this table - the blind byte-scan path found
+    // the object table without ever parsing the Types array, so there's no
+    // structural basis for where m_ObjectCount lives) or it didn't check out
+    // live. Same heuristic byte-value search as before this session -
+    // unchanged, still refuses rather than guesses on ambiguity.
+    if (!foundCountField) {
+        if (!sot_locate_count_field(nodeData, firstEntryOffset, _objects.count, &countFieldOffset, &countFieldBE)) {
+            if (error) *error = [NSError errorWithDomain:SerializedObjectTableErrorDomain
+                                                      code:SOTErrorCountFieldNotFound
+                                                  userInfo:@{NSLocalizedDescriptionKey: @"couldn't locate m_ObjectCount preceding the object table (neither the structural offset from parsing nor the heuristic byte-search succeeded) - see SerializedObjectTable.h's -insertObjects:... doc"}];
+            return NO;
+        }
     }
 
     // Build the new entries block + compute each new payload's
