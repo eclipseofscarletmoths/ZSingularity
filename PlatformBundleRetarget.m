@@ -197,17 +197,68 @@ static uint32_t pbr_read_u32_le(NSData *data, NSUInteger pos) {
     // bug (overview.md's root-cause entry): there is no cross-file
     // "modded vs. target" agreement question here, only "does this
     // Unity build's own layout self-validate against its own objects."
+    //
+    // FIXED 2026-08-18 (see overview.md Entry 12): this used to take the
+    // first kSampleTarget Texture2D objects in table order, full stop -
+    // it never preferred objects where pbr_find_stream_data_offset_field
+    // actually succeeds, even though Texture2DFields.h's own doc comment
+    // on +detectVersionProfile:... says callers "should prefer at least
+    // 5-10 streamed objects" specifically because a non-streaming sample
+    // only exercises detectVersionProfile:'s WEAK width/height/format
+    // plausibility check, not the strong streamDataPositionConfirmed
+    // cross-check. If a bundle's first kSampleTarget objects in table
+    // order happen to be small non-streamed textures (common - small UI
+    // sprites often have their pixel data inline rather than externally
+    // streamed), detection was silently running on the weak check alone
+    // for all 10 samples, which - per +detectVersionProfile:'s own
+    // degeneracy warning - lets through far more than the usual ~45/512
+    // wrong-but-plausible candidates. This is exactly what real device
+    // logs showed: profile "detection" succeeding, then every
+    // large/streamed modded texture (evaluated later, once the wrong
+    // profile is already locked in) failing streamDataPositionConfirmed
+    // by a small constant delta - a missing/miscounted field the WRONG
+    // profile doesn't account for, not an offset-finder bug (both
+    // pbr_find_stream_data_offset_field here and
+    // tat_find_stream_data_offset_field in TextureAtlasTransplant.m
+    // already carry Entry 3's correct 16-byte StreamingInfo layout fix,
+    // confirmed again this session by hand-decoding several DIAG dumps -
+    // offset/size/pathLen all read as plausible values once you're past
+    // the independently-found position).
+    //
+    // Fix: two-pass collection. Prefer objects where
+    // pbr_find_stream_data_offset_field succeeds (so detection actually
+    // exercises the strong check) up to kSampleTarget; only top up with
+    // non-streaming objects if the bundle doesn't have enough streamed
+    // Texture2D objects to fill the target.
     NSMutableArray<NSData *> *samples = [NSMutableArray array];
     NSMutableArray<NSNumber *> *samplePositions = [NSMutableArray array];
+    NSMutableArray<NSData *> *fallbackSamples = [NSMutableArray array];
+    NSMutableArray<NSNumber *> *fallbackSamplePositions = [NSMutableArray array];
     static const NSUInteger kSampleTarget = 10;
     for (SerializedObject *obj in table.objects) {
         if (!obj.classIDResolved || obj.classID != kPBRClassIDTexture2D) continue;
         if (samples.count >= kSampleTarget) break;
         NSData *bytes = [cabData subdataWithRange:NSMakeRange((NSUInteger)(table.dataOffset + obj.byteStart), obj.byteSize)];
         NSUInteger streamPos = NSNotFound;
-        if (resSNode) pbr_find_stream_data_offset_field(bytes, &streamPos);
-        [samples addObject:bytes];
-        [samplePositions addObject:@(streamPos)];
+        BOOL streams = resSNode && pbr_find_stream_data_offset_field(bytes, &streamPos);
+        if (streams) {
+            [samples addObject:bytes];
+            [samplePositions addObject:@(streamPos)];
+        } else if (fallbackSamples.count < kSampleTarget) {
+            [fallbackSamples addObject:bytes];
+            [fallbackSamplePositions addObject:@(NSNotFound)];
+        }
+    }
+    NSUInteger streamedSampleCount = samples.count;
+    while (samples.count < kSampleTarget && fallbackSamples.count > 0) {
+        [samples addObject:fallbackSamples.firstObject];
+        [samplePositions addObject:fallbackSamplePositions.firstObject];
+        [fallbackSamples removeObjectAtIndex:0];
+        [fallbackSamplePositions removeObjectAtIndex:0];
+    }
+    if (streamedSampleCount == 0) {
+        ZLog(@"[PlatformBundleRetarget] %@: no streamed Texture2D samples found for detection (%lu non-streaming sample(s) used instead) - detection is running on width/height/format plausibility only, results are weaker than usual",
+             cab, (unsigned long)samples.count);
     }
 
     TAT2VersionProfile profile;
