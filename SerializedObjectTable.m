@@ -291,14 +291,16 @@ static BOOL sot_skip_serialized_type(NSData *nodeData, size_t *pos, BOOL enableT
 // responsible for confirming the landing position actually decodes as
 // a plausible table before trusting it - see sot_decode_table_at,
 // called right after this in -tableForSerializedFileNodeData:.
-static BOOL sot_walk_types_array(NSData *nodeData, const SOTHeader *header, size_t *outTableStart, NSDictionary<NSNumber *, NSNumber *> **outMap, int32_t *outObjectCount) {
+static BOOL sot_walk_types_array(NSData *nodeData, const SOTHeader *header, size_t *outTableStart, NSDictionary<NSNumber *, NSNumber *> **outMap, int32_t *outObjectCount, size_t *outTargetPlatformFieldOffset) {
     size_t pos = header->headerEnd;
 
     if (!sot_cur_cstring(nodeData, &pos)) return NO; // m_UnityVersion - version >= 7
 
+    size_t targetPlatformFieldOffset = pos;
     int32_t targetPlatform;
     if (!sot_cur_i32(nodeData, &pos, &targetPlatform)) return NO; // version >= 8
     (void)targetPlatform;
+    if (outTargetPlatformFieldOffset) *outTargetPlatformFieldOffset = targetPlatformFieldOffset;
 
     BOOL enableTypeTree;
     if (!sot_cur_bool(nodeData, &pos, &enableTypeTree)) return NO; // version >= 13
@@ -391,6 +393,8 @@ static BOOL sot_locate_count_field(NSData *nodeData, NSUInteger firstEntryOffset
     BOOL _typesResolved;
     int64_t _objectCountFieldOffset;      // see .h doc - exact byte offset of m_ObjectCount, or -1 if unknown
     BOOL _objectCountFieldOffsetKnown;
+    int64_t _targetPlatformFieldOffset;   // see .h doc - exact byte offset of m_TargetPlatform, or -1 if unknown
+    BOOL _targetPlatformFieldOffsetKnown;
 }
 
 - (int64_t)dataOffset { return _dataOffset; }
@@ -398,6 +402,8 @@ static BOOL sot_locate_count_field(NSData *nodeData, NSUInteger firstEntryOffset
 - (BOOL)typesResolved { return _typesResolved; }
 - (int64_t)objectCountFieldOffset { return _objectCountFieldOffset; }
 - (BOOL)objectCountFieldOffsetKnown { return _objectCountFieldOffsetKnown; }
+- (int64_t)targetPlatformFieldOffset { return _targetPlatformFieldOffset; }
+- (BOOL)targetPlatformFieldOffsetKnown { return _targetPlatformFieldOffsetKnown; }
 
 // Bounded local search around `center` (the walk's landing position) for
 // an offset that decodes to EXACTLY `expectedCount` entries - tried in
@@ -481,7 +487,8 @@ static NSArray<SerializedObject *> *sot_decode_table_near(NSData *nodeData, cons
     size_t walkTableStart;
     NSDictionary<NSNumber *, NSNumber *> *walkMap;
     int32_t walkObjectCount;
-    if (sot_walk_types_array(nodeData, &header, &walkTableStart, &walkMap, &walkObjectCount)) {
+    size_t walkTargetPlatformFieldOffset = 0;
+    if (sot_walk_types_array(nodeData, &header, &walkTableStart, &walkMap, &walkObjectCount, &walkTargetPlatformFieldOffset)) {
         NSArray<SerializedObject *> *walkObjects = sot_decode_table_at(nodeData, &header, walkTableStart, searchEnd);
         if (walkObjects && walkObjects.count == (NSUInteger)walkObjectCount) {
             objects = walkObjects;
@@ -553,6 +560,19 @@ static NSArray<SerializedObject *> *sot_decode_table_near(NSData *nodeData, cons
     } else {
         table->_objectCountFieldOffset = -1;
         table->_objectCountFieldOffsetKnown = NO;
+    }
+
+    // m_TargetPlatform's offset comes straight from the walk itself (the
+    // very first fixed-size field it reads, well before tableStart/the
+    // near-search drift correction can affect it) - valid whenever the
+    // walk succeeded at all, independent of which of the two typesResolved
+    // branches above actually supplied objects/typeMap.
+    if (typesResolved) {
+        table->_targetPlatformFieldOffset = (int64_t)walkTargetPlatformFieldOffset;
+        table->_targetPlatformFieldOffsetKnown = YES;
+    } else {
+        table->_targetPlatformFieldOffset = -1;
+        table->_targetPlatformFieldOffsetKnown = NO;
     }
 
     return table;

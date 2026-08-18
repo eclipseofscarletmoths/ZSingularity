@@ -187,8 +187,10 @@
 #import "ZSyslogController.h" // FPS120Controller + every non-UI engine script this file used to own directly - see that file's header
 #import "ZTweakLog.h"
 #import "BankTransplant.h"
-#import "BundleTransplant.h" // still used for +unityCacheSharedDirectory and legacy whole-file backup restore - see -gd_handlePickedModURLs:intoFolder: for why the whole-file swap call itself is gone
-#import "TextureAtlasTransplant.h" // object-level diff/transplant - see -gd_handlePickedModURLs:intoFolder:, this is now the only bundle-mod entry point
+#import "BundleTransplant.h" // +unityCacheSharedDirectory, legacy/current whole-file backup restore, AND (again) the actual swap - see -gd_handlePickedModURLs:intoFolder:: PlatformBundleRetarget hands its retargeted archive back to +transplantAndSwapModdedBundlesAtURLs: rather than reimplementing cache matching/backup itself
+#import "TextureAtlasTransplant.h" // object-level diff/transplant - kept only for +restoreAllBackedUpBundlesWithError:/+restoreBackedUpBundlesForCAB:error: below, so pre-existing atlas backups still restore; no longer the bundle-mod import path itself, see -gd_handlePickedModURLs:intoFolder:
+#import "PlatformBundleRetarget.h" // whole-bundle retarget - now the only bundle-mod entry point, see -gd_handlePickedModURLs:intoFolder:
+#import "UnityBundleCAB.h" // UnityBundleArchive + +writeArchive:toPath:error:, for staging PlatformBundleRetarget's output to a scratch file before handing it to BundleTransplant
 #import "ModAssetLibrary.h"
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h> // UTType-based UIDocumentPickerViewController init, for the Mods section's "Import Bank Mod"/"Import Bundle Mod(s)" buttons
 #import "GDEmbeddedFont.h" // kExcelsiorSansTTF / kExcelsiorSansTTFLength - see that file's header
@@ -3624,6 +3626,13 @@ static void * const kGDModsPickerKindKey = (void *)&kGDModsPickerKindKey;
 // matching folder to import into shouldn't be possible anymore (every
 // caller now supplies one - see kGDModsPickerKindKey), but folderName
 // is nullable here anyway as a defensive fallback.
+// The raw m_TargetPlatform int32 PlatformBundleRetarget writes in place
+// of a desktop bundle's own value (19) - not independently re-derived
+// from Unity's BuildTarget/RuntimePlatform enum, taken as given from a
+// real mobile-bundle sample, per PlatformBundleRetarget.h's own note on
+// +retargetedArchiveFromDesktopBundleAtPath:targetPlatform:result:error:.
+static const int32_t kGDMobileBuildTargetPlatform = 9;
+
 - (void)gd_handlePickedModURLs:(NSArray<NSURL *> *)urls intoFolder:(nullable NSString *)folderName {
     UIViewController *presenter = gd_key_window().rootViewController;
     UIAlertController *working = [UIAlertController alertControllerWithTitle:@"Swapping Files…"
@@ -3668,65 +3677,88 @@ static void * const kGDModsPickerKindKey = (void *)&kGDModsPickerKindKey;
             }
         }
 
-        // Object-level transplant (TextureAtlasTransplant), NOT the old
-        // whole-file swap (BundleTransplant transplantAndSwapModdedBundlesAtURLs)
-        // - a PC-built mod bundle is StandaloneWindows-target and carries
-        // DXT/DXT5Crunched/RGBA32 Texture2D bytes an iOS Metal texture
-        // can't bind at all, so dropping it in whole (what the old path
-        // did) never actually loaded on device. This instead diffs every
-        // shared Texture2D/TextAsset PathID against the matching cached
-        // bundle, decodes+re-encodes any differing Texture2D into the
-        // formats this project targets, and appends genuinely new
-        // PathIDs the mod introduces - see TextureAtlasTransplant.h.
-        // One call per picked bundle URL (its own API is per-modded-file,
-        // returning one result per matching cached bundle) rather than
-        // one call for the whole batch.
+        // Whole-bundle retarget (PlatformBundleRetarget), NOT the old
+        // object-level diff/transplant (TextureAtlasTransplant) - see
+        // PlatformBundleRetarget.h's top comment for the reasoning. A
+        // PC-built mod that ships as a whole desktop bundle doesn't need
+        // a second "target" file to diff against at all: rewrite
+        // m_TargetPlatform, re-encode every Texture2D's pixel payload to
+        // something this project's Metal path can bind, done. This
+        // stages that result to a scratch file, then hands it to
+        // BundleTransplant's existing CAB-matched swap+backup machinery
+        // (+transplantAndSwapModdedBundlesAtURLs:) rather than
+        // reimplementing cache matching here - same call TextureAtlasTransplant
+        // was originally written to replace, now used as the actual
+        // drop-in step per PlatformBundleRetarget.h's own framing.
+        // One retarget+swap per picked bundle URL.
         for (NSURL *bundleURL in bundleURLs) {
-            NSError *atlasErr = nil;
-            NSArray<TextureAtlasTransplantResult *> *results = [TextureAtlasTransplant transplantFromModdedBundleAtURL:bundleURL error:&atlasErr];
             NSString *name = bundleURL.lastPathComponent;
-            if (!results) {
-                [lines addObject:[NSString stringWithFormat:@"%@: %@", name, atlasErr.localizedDescription ?: @"bundle scan failed"]];
+
+            BOOL accessing = [bundleURL startAccessingSecurityScopedResource];
+            NSError *retargetErr = nil;
+            PlatformBundleRetargetResult *pbrResult = nil;
+            UnityBundleArchive *retargeted = [PlatformBundleRetarget retargetedArchiveFromDesktopBundleAtPath:bundleURL.path
+                                                                                                targetPlatform:kGDMobileBuildTargetPlatform
+                                                                                                        result:&pbrResult
+                                                                                                         error:&retargetErr];
+            if (accessing) [bundleURL stopAccessingSecurityScopedResource];
+
+            if (!retargeted) {
+                [lines addObject:[NSString stringWithFormat:@"%@: %@", name, retargetErr.localizedDescription ?: @"retarget failed"]];
                 continue;
             }
-            if (results.count == 0) {
+
+            // Scratch copy, one per bundle in its own UUID'd subfolder so
+            // same-named picks (always "__data" for a cache-sourced mod,
+            // per BundleTransplant.h's own filename note) never collide -
+            // BundleTransplant matches by CAB, not filename, but this
+            // still writes one real file per call.
+            NSString *scratchDir = [NSTemporaryDirectory() stringByAppendingPathComponent:[NSUUID UUID].UUIDString];
+            [[NSFileManager defaultManager] createDirectoryAtPath:scratchDir withIntermediateDirectories:YES attributes:nil error:nil];
+            NSString *scratchPath = [scratchDir stringByAppendingPathComponent:name];
+
+            NSError *writeErr = nil;
+            BOOL wrote = [UnityBundleCAB writeArchive:retargeted toPath:scratchPath error:&writeErr];
+            if (!wrote) {
+                [lines addObject:[NSString stringWithFormat:@"%@: %@", name, writeErr.localizedDescription ?: @"couldn't write retargeted archive"]];
+                [[NSFileManager defaultManager] removeItemAtPath:scratchDir error:nil];
+                continue;
+            }
+
+            NSError *swapErr = nil;
+            NSArray<BundleTransplantResult *> *swapResults = [BundleTransplant transplantAndSwapModdedBundlesAtURLs:@[[NSURL fileURLWithPath:scratchPath]]
+                                                                                                                error:&swapErr];
+            [[NSFileManager defaultManager] removeItemAtPath:scratchDir error:nil];
+
+            if (!swapResults) {
+                [lines addObject:[NSString stringWithFormat:@"%@: %@", name, swapErr.localizedDescription ?: @"bundle swap failed"]];
+                continue;
+            }
+            BundleTransplantResult *swapResult = swapResults.firstObject;
+            if (swapResult.error) {
+                [lines addObject:[NSString stringWithFormat:@"%@ (%@): %@", name, swapResult.cab ?: @"?", swapResult.error.localizedDescription]];
+                continue;
+            }
+
+            NSInteger swapped = swapResult.swappedCount;
+            totalSwapped += swapped;
+
+            if (swapped == 0) {
                 [lines addObject:[NSString stringWithFormat:@"%@: no match in cache", name]];
                 continue;
             }
-            for (TextureAtlasTransplantResult *r in results) {
-                if (r.error) {
-                    [lines addObject:[NSString stringWithFormat:@"%@ (%@): %@", name, r.cachedPath.lastPathComponent, r.error.localizedDescription]];
-                    continue;
-                }
-                NSInteger changed = r.objectsTransplanted + r.objectsAdded;
-                totalSwapped += changed;
-                // Computed once, used by both branches below - previously
-                // only the "differs" branch computed this, so a bundle
-                // where EVERY candidate object failed (e.g. all
-                // DXT5Crunched with inc/crn_decomp.h not vendored - see
-                // CrunchTextureDecoder.h) reported the same "no differing
-                // objects" line as a bundle that genuinely had zero diffs,
-                // hiding the real cause. See ZLog output (Verbose syslog)
-                // for the specific per-object reason either way.
-                NSInteger problems = r.texture2DFormatUnsupported + r.texture2DHeaderParseFailed
-                    + r.objectsAddedTexture2DFormatUnsupported + r.objectsAddedTexture2DHeaderParseFailed
-                    + r.objectsSkippedNotInTarget + r.objectsAddedPathIDCollision;
-                if (changed == 0) {
-                    if (problems > 0) {
-                        [lines addObject:[NSString stringWithFormat:@"%@: 0 transplanted, %ld skipped (%ld format unsupported, %ld header parse failed) - check Verbose log",
-                            name, (long)problems,
-                            (long)(r.texture2DFormatUnsupported + r.objectsAddedTexture2DFormatUnsupported),
-                            (long)(r.texture2DHeaderParseFailed + r.objectsAddedTexture2DHeaderParseFailed)]];
-                    } else {
-                        [lines addObject:[NSString stringWithFormat:@"%@: no differing objects", name]];
-                    }
-                    continue;
-                }
-                NSMutableString *line = [NSMutableString stringWithFormat:@"%@: %ld transplanted", name, (long)r.objectsTransplanted];
-                if (r.objectsAdded > 0) [line appendFormat:@", %ld added", (long)r.objectsAdded];
-                if (problems > 0) [line appendFormat:@", %ld skipped", (long)problems];
-                [lines addObject:line];
+
+            // problems computed once, same "don't hide a real cause behind
+            // a generic count" reasoning the old TextureAtlasTransplant
+            // reporting used - see ZLog (Verbose syslog) for per-object
+            // detail either way.
+            NSInteger problems = pbrResult.texture2DHeaderParseFailed + pbrResult.texture2DFormatUnsupported;
+            NSMutableString *line = [NSMutableString stringWithFormat:@"%@: %ld swapped, %ld texture%@ retargeted",
+                name, (long)swapped, (long)pbrResult.texture2DRetargeted, pbrResult.texture2DRetargeted == 1 ? @"" : @"s"];
+            if (problems > 0) {
+                [line appendFormat:@", %ld texture issue%@ - check Verbose log", (long)problems, problems == 1 ? @"" : @"s"];
             }
+            [lines addObject:line];
         }
 
         for (NSString *name in unrecognized) {

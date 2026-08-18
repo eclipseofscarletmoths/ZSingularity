@@ -185,6 +185,7 @@ jobs:
             SerializedObjectTable.m \
             TextureAtlasTransplant.m \
             CrunchTextureDecoder.o \
+            PlatformBundleRetarget.m \
             -lc++ \
             -o ZSingularity.dylib
 

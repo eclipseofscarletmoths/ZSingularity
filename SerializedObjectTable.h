@@ -147,6 +147,21 @@ typedef NS_ENUM(NSInteger, SerializedObjectTableErrorCode) {
 @property (nonatomic, assign, readonly) int64_t objectCountFieldOffset;
 @property (nonatomic, assign, readonly) BOOL objectCountFieldOffsetKnown;
 
+// Exact byte offset of m_TargetPlatform (an int32, LE) within the
+// nodeData this table was parsed from, or -1 if unknown. Same
+// derivation/availability rule as objectCountFieldOffset above: only
+// known (targetPlatformFieldOffsetKnown == YES) when typesResolved is
+// also YES, since sot_walk_types_array is the only code that ever
+// walks far enough to see this field - it reads m_UnityVersion then
+// m_TargetPlatform immediately after (see SerializedFile format:
+// version >= 8 always has this field), previously discarding the
+// value. Added for PlatformBundleRetarget.h, which needs to rewrite
+// this field in place (e.g. a PC-built bundle's platform ID -> iOS's)
+// without touching anything else in the header - see that file for
+// why. NOT used by anything in this file itself.
+@property (nonatomic, assign, readonly) int64_t targetPlatformFieldOffset;
+@property (nonatomic, assign, readonly) BOOL targetPlatformFieldOffsetKnown;
+
 // Locates and parses the object table inside `nodeData` (one
 // UnityBundleNode's slice of a decompressed UnityBundleArchive.data -
 // the CAB node, not its .resS companion). See this header's top comment
