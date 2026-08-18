@@ -1,8 +1,8 @@
 // PlatformBundleRetarget.m
 //
 // See PlatformBundleRetarget.h for the design. The per-object rebuild
-// below (steps: locate pixel bytes -> decode -> RawPixelPacker ->
-// patchWidth:height:...:inObjectBytes: -> append+repoint) is the SAME
+// below (steps: locate pixel bytes -> decode -> RGBA32 ->
+// patchWidth:height:...:inObjectBytes: -> disk-backed append+repoint) is the SAME
 // sequence TextureAtlasTransplant.m's tat_transplant_one already uses
 // for an existing shared PathID whose content changed size - this file
 // duplicates the handful of small helpers that logic depends on
@@ -17,9 +17,10 @@
 // existing streamed/inline shape because target is a real mobile bundle
 // something else already depends on being laid out a specific way; here
 // there is no such constraint - the object is being rebuilt from
-// scratch, RawPixelPacker's output is small (16-bit packed, single mip,
-// see that header), and always going inline means never touching the
-// .resS node or its own byte length at all. The tradeoff: any pixel
+// scratch, the RGBA32 output is one base mip, and always going inline
+// means never touching the .resS node or its own byte length at all.
+// Replacement objects are written to a disk-backed append stream instead
+// of growing cabData. The tradeoff: any pixel
 // bytes the retargeted object used to occupy in .resS are simply
 // orphaned (dead space, never read again, no cleanup attempted) rather
 // than reclaimed - same "append new, don't compact old" posture
@@ -31,22 +32,17 @@
 #import "SerializedObjectTable.h"
 #import "Texture2DFields.h"
 #import "Texture2DPixelDecoder.h"
-#import "RawPixelPacker.h"
 #import "ZTweakLog.h"
 
 NSString * const PlatformBundleRetargetErrorDomain = @"PlatformBundleRetargetErrorDomain";
 
 static const int32_t kPBRClassIDTexture2D = 28;
 
-// The two formats RawPixelPacker.h can ever produce - see that header.
-// A Texture2D already in one of these is almost certainly the output of
-// an earlier retarget pass over the same bundle; re-running the decoder
-// on it isn't supported (Texture2DPixelDecoder.h doesn't claim these as
-// decodable source formats - they were never a real Unity platform's
-// stock format, only this project's own output) and isn't needed either
-// way, so it's counted and left untouched rather than attempted.
-static BOOL pbr_format_is_already_packed(int32_t rawFormat) {
-    return rawFormat == TAT2PackedFormatRGB565 || rawFormat == TAT2PackedFormatARGB4444;
+// Formats the iOS/Metal target can consume directly. These must never enter
+// the desktop-texture decode/re-encode path: RGBA32 is already the exact
+// output representation we want, and ASTC 6x6 is the stock mobile format.
+static BOOL pbr_format_is_ios_supported(int32_t rawFormat) {
+    return rawFormat == TAT2TextureFormatRGBA32 || rawFormat == TAT2TextureFormatRGBAASTC6x6;
 }
 
 static NSError *PBRError(PlatformBundleRetargetErrorCode code, NSString *message) {
@@ -113,14 +109,15 @@ static uint32_t pbr_read_u32_le(NSData *data, NSUInteger pos) {
     NSString *_cab;
     NSInteger _texture2DCount;
     NSInteger _texture2DRetargeted;
-    NSInteger _texture2DAlreadyPacked;
+    NSInteger _texture2DAlreadySupported;
     NSInteger _texture2DHeaderParseFailed;
     NSInteger _texture2DFormatUnsupported;
 }
 - (NSString *)cab { return _cab; }
 - (NSInteger)texture2DCount { return _texture2DCount; }
 - (NSInteger)texture2DRetargeted { return _texture2DRetargeted; }
-- (NSInteger)texture2DAlreadyPacked { return _texture2DAlreadyPacked; }
+- (NSInteger)texture2DAlreadyPacked { return _texture2DAlreadySupported; }
+- (NSInteger)texture2DAlreadySupported { return _texture2DAlreadySupported; }
 - (NSInteger)texture2DHeaderParseFailed { return _texture2DHeaderParseFailed; }
 - (NSInteger)texture2DFormatUnsupported { return _texture2DFormatUnsupported; }
 @end
@@ -182,6 +179,26 @@ static uint32_t pbr_read_u32_le(NSData *data, NSUInteger pos) {
         if (error) *error = PBRError(PlatformBundleRetargetErrorTargetPlatformFieldUnknown, @"m_TargetPlatform's offset wasn't resolved for this bundle");
         return NO;
     }
+
+    // Converted Texture2D objects are no longer appended to cabData. That
+    // caused the resident CAB buffer to grow by the sum of every converted
+    // texture, while the original CAB bytes remained resident underneath.
+    // On a large desktop bundle that can turn a ~900 MB baseline into several
+    // GB and trip Jetsam. Keep only the original CAB in RAM and spill the
+    // replacement objects to a sequential disk file instead.
+    NSString *appendPath = [outPath stringByAppendingString:@".zsingularity-texture-append"];
+    [[NSFileManager defaultManager] removeItemAtPath:appendPath error:nil];
+    if (![[NSFileManager defaultManager] createFileAtPath:appendPath contents:nil attributes:nil]) {
+        if (error) *error = PBRError(PlatformBundleRetargetErrorArchiveWriteFailed, @"couldn't create Texture2D append file");
+        return NO;
+    }
+    NSFileHandle *appendFH = [NSFileHandle fileHandleForWritingAtPath:appendPath];
+    if (!appendFH) {
+        [[NSFileManager defaultManager] removeItemAtPath:appendPath error:nil];
+        if (error) *error = PBRError(PlatformBundleRetargetErrorArchiveWriteFailed, @"couldn't open Texture2D append file");
+        return NO;
+    }
+    int64_t appendedTextureBytes = 0;
 
     PlatformBundleRetargetResult *result = [PlatformBundleRetargetResult new];
     result->_cab = cab;
@@ -273,10 +290,10 @@ static uint32_t pbr_read_u32_le(NSData *data, NSUInteger pos) {
         ZLog(@"[PlatformBundleRetarget] %@: detected TAT2VersionProfile from %lu Texture2D sample(s)", cab, (unsigned long)samples.count);
     }
 
-    // Step 3: walk every Texture2D and rebuild it in place.
+    // Step 3: walk every Texture2D and build only the replacements.
     //
     // MEMORY FIX (this session, see overview.md): every iteration used to
-    // leave its Texture2DPixelDecoder/RawPixelPacker scratch buffers
+    // leave its Texture2DPixelDecoder scratch buffers
     // (roughly width*height*4 bytes each for the RGBA32 intermediate
     // alone) autoreleased but undrained until this whole function
     // returned - for "hundreds of images" in one bundle, all of those
@@ -306,26 +323,27 @@ static uint32_t pbr_read_u32_le(NSData *data, NSUInteger pos) {
             continue;
         }
 
-        if (pbr_format_is_already_packed(header.rawFormat)) {
-            result->_texture2DAlreadyPacked++;
+        if (pbr_format_is_ios_supported(header.rawFormat)) {
+            result->_texture2DAlreadySupported++;
+            ZLog(@"[PlatformBundleRetarget] pathID %lld: skipping Texture2D already in iOS-supported format %d (%dx%d)",
+                 (long long)obj.pathID, header.rawFormat, header.width, header.height);
             continue;
         }
 
-        NSData *pixelBytes = nil;
+        const uint8_t *pixelPtr = NULL;
+        NSUInteger pixelLength = 0;
         if (streams) {
             uint64_t off = pbr_read_u64_le(objBytesConst, streamFieldPos);
             uint32_t size = pbr_read_u32_le(objBytesConst, streamFieldPos + 8);
-            // Sliced straight out of archive.data (the decompressed
-            // source buffer) for just this one object's window, instead
-            // of out of a pre-copied whole-.resS buffer - see the
-            // resSNode comment above.
             if ((int64_t)off + size <= resSNode.size) {
-                pixelBytes = [archive.data subdataWithRange:NSMakeRange((NSUInteger)(resSNode.offset + (int64_t)off), size)];
+                pixelPtr = (const uint8_t *)archive.data.bytes + (NSUInteger)resSNode.offset + (NSUInteger)off;
+                pixelLength = size;
             }
         } else if (header.imageDataLength > 0) {
-            pixelBytes = [objBytesConst subdataWithRange:NSMakeRange(header.imageDataOffset, header.imageDataLength)];
+            pixelPtr = (const uint8_t *)objBytesConst.bytes + header.imageDataOffset;
+            pixelLength = header.imageDataLength;
         }
-        if (!pixelBytes) {
+        if (!pixelPtr || pixelLength == 0) {
             result->_texture2DFormatUnsupported++;
             ZLog(@"[PlatformBundleRetarget] pathID %lld: couldn't locate this object's own pixel bytes (streamed=%d) - skipping",
                  (long long)obj.pathID, streams);
@@ -333,8 +351,15 @@ static uint32_t pbr_read_u32_le(NSData *data, NSUInteger pos) {
         }
 
         NSError *decodeErr = nil;
+        // The decoder returns exactly the representation this pipeline wants
+        // on iOS: uncompressed RGBA32. Do not run a second RGBA32 -> 16-bit
+        // packing pass; that was an unnecessary extra full-image allocation
+        // and also moved the retargeted bundle away from the requested RGBA32
+        // format. Only unsupported desktop formats (DXT1/DXT5/Crunch, etc.)
+        // reach this point because RGBA32/ASTC were rejected above.
         NSData *rgba32 = [Texture2DPixelDecoder decodeToRGBA32FromRawFormat:header.rawFormat
-                                                                  sourceBytes:pixelBytes
+                                                                  sourceBytes:pixelPtr
+                                                                sourceLength:pixelLength
                                                                         width:header.width
                                                                        height:header.height
                                                                         error:&decodeErr];
@@ -342,13 +367,6 @@ static uint32_t pbr_read_u32_le(NSData *data, NSUInteger pos) {
             result->_texture2DFormatUnsupported++;
             ZLog(@"[PlatformBundleRetarget] pathID %lld: format %d not decodable (%@) - skipping, left as-is",
                  (long long)obj.pathID, header.rawFormat, decodeErr.localizedDescription);
-            continue;
-        }
-
-        TAT2PackedFormat packedFormat;
-        NSData *packed = [RawPixelPacker packRGBA32Pixels:rgba32 width:header.width height:header.height outFormat:&packedFormat];
-        if (!packed) {
-            ZLog(@"[PlatformBundleRetarget] pathID %lld: RawPixelPacker rejected %dx%d - skipping, left as-is", (long long)obj.pathID, header.width, header.height);
             continue;
         }
 
@@ -361,8 +379,8 @@ static uint32_t pbr_read_u32_le(NSData *data, NSUInteger pos) {
         // from one object instead of two.
         NSMutableData *rebuilt = [[objBytesConst subdataWithRange:NSMakeRange(0, header.imageDataLengthFieldOffset)] mutableCopy];
         [rebuilt increaseLengthBy:4]; // length-prefix placeholder, filled below
-        pbr_write_u32_le(rebuilt, header.imageDataLengthFieldOffset, (uint32_t)packed.length);
-        [rebuilt appendData:packed];
+        pbr_write_u32_le(rebuilt, header.imageDataLengthFieldOffset, (uint32_t)rgba32.length);
+        [rebuilt appendData:rgba32];
         NSUInteger pad = (4 - (rebuilt.length % 4)) % 4;
         static const uint8_t kZeros[4] = {0, 0, 0, 0};
         if (pad) [rebuilt appendBytes:kZeros length:pad];
@@ -376,20 +394,36 @@ static uint32_t pbr_read_u32_le(NSData *data, NSUInteger pos) {
 
         [header patchWidth:header.width
                      height:header.height
-          completeImageSize:(int32_t)packed.length
-                      format:(int32_t)packedFormat
+          completeImageSize:(int32_t)rgba32.length
+                      format:(int32_t)TAT2TextureFormatRGBA32
                     mipCount:1
                inObjectBytes:rebuilt];
 
-        int64_t newByteStart = (int64_t)cabData.length - table.dataOffset;
-        [cabData appendData:rebuilt];
+        // The replacement object lives immediately after the original CAB
+        // bytes in the disk-backed append stream. The object table can point
+        // there now; the final archive writer emits [cabData][appendFile]
+        // without ever materializing that concatenation in memory.
+        int64_t newByteStart = (int64_t)cabData.length + appendedTextureBytes - table.dataOffset;
         NSError *patchErr = nil;
         if (![table patchObject:obj newByteStart:newByteStart newByteSize:(uint32_t)rebuilt.length inNodeData:cabData error:&patchErr]) {
-            ZLog(@"[PlatformBundleRetarget] pathID %lld: table patch failed (%@) - object bytes were appended but not repointed, this object is now effectively lost from the table; treating as a hard failure",
+            ZLog(@"[PlatformBundleRetarget] pathID %lld: table patch failed (%@) - replacement object remains in append file but is not referenced",
                  (long long)obj.pathID, patchErr.localizedDescription);
             if (error) *error = patchErr;
+            [appendFH closeFile];
+            [[NSFileManager defaultManager] removeItemAtPath:appendPath error:nil];
             return NO;
         }
+        @try {
+            [appendFH writeData:rebuilt];
+        } @catch (NSException *exc) {
+            ZLog(@"[PlatformBundleRetarget] pathID %lld: failed writing replacement object to append file (%@)",
+                 (long long)obj.pathID, exc.reason);
+            if (error) *error = PBRError(PlatformBundleRetargetErrorArchiveWriteFailed, exc.reason ?: @"failed writing Texture2D replacement");
+            [appendFH closeFile];
+            [[NSFileManager defaultManager] removeItemAtPath:appendPath error:nil];
+            return NO;
+        }
+        appendedTextureBytes += (int64_t)rebuilt.length;
         result->_texture2DRetargeted++;
         } // @autoreleasepool
     }
@@ -408,13 +442,15 @@ static uint32_t pbr_read_u32_le(NSData *data, NSUInteger pos) {
     // written straight to disk, and released before the next node is
     // even requested. cabData (already resident, already grown) is
     // handed back as-is when its node comes up rather than copied again;
+    // converted Texture2D replacements live in appendPath and are streamed
+    // from disk in bounded 8 MB chunks.
     // every OTHER node is sliced fresh from archive.data on demand
     // rather than pre-copied - this is the "let the disk do the work"
     // option the earlier all-in-memory approach didn't have.
     NSMutableArray<UnityBundleNode *> *newNodes = [NSMutableArray array];
     int64_t runningOffset = 0;
     for (UnityBundleNode *node in archive.nodes) {
-        int64_t size = [node.path isEqualToString:cab] ? (int64_t)cabData.length : node.size;
+        int64_t size = [node.path isEqualToString:cab] ? ((int64_t)cabData.length + appendedTextureBytes) : node.size;
         UnityBundleNode *newNode = [UnityBundleNode new];
         newNode.path = node.path;
         newNode.offset = runningOffset;
@@ -423,26 +459,32 @@ static uint32_t pbr_read_u32_le(NSData *data, NSUInteger pos) {
         [newNodes addObject:newNode];
     }
 
+    [appendFH closeFile];
+
     NSError *writeErr = nil;
     BOOL wrote = [UnityBundleCAB writeArchiveStreamingToPath:outPath
                                                  unityVersion:archive.unityVersion
                                                 unityRevision:archive.unityRevision
                                                         nodes:newNodes
+                                                  cabNodePath:cab
+                                                  baseCABData:cabData
+                                               appendFilePath:(appendedTextureBytes > 0 ? appendPath : nil)
+                                                 appendLength:appendedTextureBytes
                                               nodeDataAtIndex:^NSData * _Nullable(NSUInteger idx) {
         UnityBundleNode *srcNode = archive.nodes[idx];
-        if ([srcNode.path isEqualToString:cab]) return cabData;
         return pbr_node_slice(archive, srcNode);
     }
                                                         error:&writeErr];
     cabData = nil; // no longer needed once the write loop above has consumed it
+    [[NSFileManager defaultManager] removeItemAtPath:appendPath error:nil];
     if (!wrote) {
         if (error) *error = PBRError(PlatformBundleRetargetErrorArchiveWriteFailed, writeErr.localizedDescription ?: @"couldn't write retargeted archive");
         return NO;
     }
 
-    ZLog(@"[PlatformBundleRetarget] %@: retargeted %ld/%ld Texture2D object(s) (%ld already packed, %ld header parse failed, %ld format unsupported), m_TargetPlatform -> %d",
+    ZLog(@"[PlatformBundleRetarget] %@: retargeted %ld/%ld Texture2D object(s) (%ld already iOS-supported, %ld header parse failed, %ld format unsupported), m_TargetPlatform -> %d",
          cab, (long)result->_texture2DRetargeted, (long)result->_texture2DCount,
-         (long)result->_texture2DAlreadyPacked, (long)result->_texture2DHeaderParseFailed, (long)result->_texture2DFormatUnsupported,
+         (long)result->_texture2DAlreadySupported, (long)result->_texture2DHeaderParseFailed, (long)result->_texture2DFormatUnsupported,
          targetPlatform);
 
     return YES;

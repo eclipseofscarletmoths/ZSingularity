@@ -80,6 +80,17 @@ typedef NS_ENUM(NSInteger, Texture2DPixelDecoderErrorCode) {
                                            height:(int32_t)height
                                             error:(NSError **)error;
 
+// Same decoder, but consumes a caller-owned byte span directly. This avoids
+// `subdataWithRange:` copies for large streamed/inline texture payloads; the
+// decoder only allocates its RGBA32 destination (plus any format-specific
+// scratch required by DXT5Crunched).
++ (nullable NSData *)decodeToRGBA32FromRawFormat:(int32_t)rawFormat
+                                      sourceBytes:(const void *)sourceBytes
+                                      sourceLength:(NSUInteger)sourceLength
+                                            width:(int32_t)width
+                                           height:(int32_t)height
+                                            error:(NSError **)error;
+
 @end
 
 NS_ASSUME_NONNULL_END

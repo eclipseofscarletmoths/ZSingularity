@@ -24,9 +24,9 @@
 // accepts DIRECTLY:
 //
 //   1. Rewrite the SerializedFile header's own m_TargetPlatform field.
-//   2. Re-encode every Texture2D's pixel payload + format/size/mipCount
-//      fields to something the mobile client can actually bind (this
-//      project's existing RawPixelPacker target - see that header).
+//   2. Re-encode only desktop-compressed Texture2D payloads to plain
+//      RGBA32 + updated size/format/mipCount fields. Texture2D objects
+//      already in RGBA32 or ASTC 6x6 are left completely untouched.
 //   3. Nothing else in the file changes - no object added, none
 //      removed, no PathID renumbered, object COUNT identical - so none
 //      of SerializedObjectTable's insert/count-field machinery is
@@ -61,12 +61,11 @@
 // bundle, drop in wholesale" or "a handful of changed PathIDs merged
 // into what's already there" determines which of these two files is the
 // right tool - this one is for the former, deliberately at the cost of
-// re-encoding EVERY Texture2D in the bundle (including any the mod
-// itself didn't touch), not just the changed ones, since the entire
-// point is never needing to know which PathIDs differ from stock at
-// all. See this file's .m for the size/memory tradeoff that follows
-// from that (RawPixelPacker's 16-bit output vs. mobile stock's ASTC
-// 6x6 - flagged there, not solved here).
+// inspecting EVERY Texture2D in the bundle (including any the mod itself
+// didn't touch), not just the changed ones, since the entire point is never
+// needing to know which PathIDs differ from stock at all. Already-iOS-
+// supported RGBA32/ASTC textures are nevertheless skipped before any pixel
+// allocation. Desktop-compressed replacements are converted to RGBA32.
 
 #import <Foundation/Foundation.h>
 #import "UnityBundleCAB.h" // for UnityBundleNode/UnityBundleArchive (used by the .m; UnityBundleNode also appears in this header's block typedef via UnityBundleCAB.h's own imports)
@@ -90,8 +89,9 @@ typedef NS_ENUM(NSInteger, PlatformBundleRetargetErrorCode) {
 @interface PlatformBundleRetargetResult : NSObject
 @property (nonatomic, copy, readonly) NSString *cab;
 @property (nonatomic, assign, readonly) NSInteger texture2DCount;             // every Texture2D object found in the bundle, regardless of outcome below
-@property (nonatomic, assign, readonly) NSInteger texture2DRetargeted;        // successfully decoded, re-packed, and patched in place
-@property (nonatomic, assign, readonly) NSInteger texture2DAlreadyPacked;     // rawFormat was already one of RawPixelPacker's own output formats (RGB565/ARGB4444) - almost certainly means this bundle was already retargeted by an earlier run; left untouched, not re-encoded a second time (re-decoding a 16-bit packed format isn't implemented - see Texture2DPixelDecoder.h's format coverage - so this is a deliberate skip, not a failure)
+@property (nonatomic, assign, readonly) NSInteger texture2DRetargeted;        // successfully decoded to RGBA32, rebuilt, and patched
+@property (nonatomic, assign, readonly) NSInteger texture2DAlreadyPacked;     // backward-compatible name; counts Texture2D objects already in an iOS-supported format (RGBA32 or ASTC 6x6) and therefore left untouched
+@property (nonatomic, assign, readonly) NSInteger texture2DAlreadySupported; // same counter with the accurate name
 @property (nonatomic, assign, readonly) NSInteger texture2DHeaderParseFailed; // resolved profile didn't fit this particular object - see Texture2DFields.h
 @property (nonatomic, assign, readonly) NSInteger texture2DFormatUnsupported; // Texture2DPixelDecoder doesn't decode this object's rawFormat (most notably DXT5Crunched without CrunchTextureDecoder's vendored dependency - see that header)
 @end
@@ -101,8 +101,9 @@ typedef NS_ENUM(NSInteger, PlatformBundleRetargetErrorCode) {
 // Reads the UnityFS archive at desktopBundlePath (a PC/desktop-built
 // bundle - see this header's top comment), rewrites its SerializedFile
 // header's m_TargetPlatform to targetPlatform, re-encodes every
-// Texture2D object's pixel payload via Texture2DPixelDecoder +
-// RawPixelPacker, and writes the resulting archive straight to outPath
+// Texture2D object's desktop-compressed pixel payload to RGBA32 and
+// writes the resulting archive straight to outPath. RGBA32 and ASTC 6x6
+// Texture2Ds are detected and skipped before their pixel payload is copied.
 // via +writeArchiveStreamingToPath:...:error: (UnityBundleCAB.h).
 //
 // Writes directly to outPath rather than handing back a UnityBundleArchive

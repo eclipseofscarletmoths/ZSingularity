@@ -649,4 +649,84 @@ static BOOL ubc_finish_atomic_swap(NSFileHandle *fh, NSString *tmpPath, NSString
     return ubc_finish_atomic_swap(fh, tmpPath, path, error);
 }
 
+
++ (BOOL)writeArchiveStreamingToPath:(NSString *)path
+                        unityVersion:(nullable NSString *)unityVersion
+                       unityRevision:(nullable NSString *)unityRevision
+                               nodes:(NSArray<UnityBundleNode *> *)nodes
+                         cabNodePath:(NSString *)cabNodePath
+                         baseCABData:(NSData *)baseCABData
+                      appendFilePath:(nullable NSString *)appendFilePath
+                        appendLength:(int64_t)appendLength
+                     nodeDataAtIndex:(NSData * _Nullable (^)(NSUInteger index))nodeDataAtIndex
+                               error:(NSError **)error {
+    int64_t totalDataLength = 0;
+    for (UnityBundleNode *node in nodes) totalDataLength += node.size;
+
+    int64_t expectedCABSize = (int64_t)baseCABData.length + appendLength;
+    for (UnityBundleNode *node in nodes) {
+        if ([node.path isEqualToString:cabNodePath] && node.size != expectedCABSize) {
+            if (error) *error = [NSError errorWithDomain:UnityBundleCABErrorDomain code:UnityBundleCABErrorCantReadFile userInfo:@{
+                NSLocalizedDescriptionKey: @"CAB node size does not match baseCABData + appendLength"
+            }];
+            return NO;
+        }
+    }
+
+    NSString *tmpPath = nil;
+    NSFileHandle *fh = ubc_open_temp_and_write_prefix(path, unityVersion, unityRevision, nodes, totalDataLength, &tmpPath, error);
+    if (!fh) return NO;
+
+    @try {
+        for (NSUInteger i = 0; i < nodes.count; i++) {
+            @autoreleasepool {
+                UnityBundleNode *node = nodes[i];
+                if ([node.path isEqualToString:cabNodePath]) {
+                    [fh writeData:baseCABData];
+
+                    if (appendLength > 0) {
+                        if (!appendFilePath.length) {
+                            [NSException raise:@"UnityBundleCABMissingAppendFile" format:@"appendLength is %lld but appendFilePath is nil", (long long)appendLength];
+                        }
+                        NSFileHandle *appendFH = [NSFileHandle fileHandleForReadingAtPath:appendFilePath];
+                        if (!appendFH) {
+                            [NSException raise:@"UnityBundleCABAppendOpenFailed" format:@"could not open append file %@", appendFilePath];
+                        }
+                        @try {
+                            const NSUInteger chunkSize = 8 * 1024 * 1024;
+                            int64_t remaining = appendLength;
+                            while (remaining > 0) {
+                                NSUInteger want = (NSUInteger)MIN((int64_t)chunkSize, remaining);
+                                NSData *chunk = [appendFH readDataOfLength:want];
+                                if (chunk.length != want) {
+                                    [NSException raise:@"UnityBundleCABAppendShortRead" format:@"append file ended early (%lu/%lu)", (unsigned long)chunk.length, (unsigned long)want];
+                                }
+                                [fh writeData:chunk];
+                                remaining -= (int64_t)chunk.length;
+                            }
+                        } @finally {
+                            [appendFH closeFile];
+                        }
+                    }
+                } else {
+                    NSData *bytes = nodeDataAtIndex(i);
+                    if (!bytes) {
+                        [NSException raise:@"UnityBundleCABNodeDataMissing" format:@"node %lu produced no data", (unsigned long)i];
+                    }
+                    [fh writeData:bytes];
+                }
+            }
+        }
+    } @catch (NSException *exc) {
+        [fh closeFile];
+        [NSFileManager.defaultManager removeItemAtPath:tmpPath error:nil];
+        if (error) *error = [NSError errorWithDomain:UnityBundleCABErrorDomain
+                                                  code:UnityBundleCABErrorCantReadFile
+                                              userInfo:@{NSLocalizedDescriptionKey: exc.reason ?: @"streaming bundle write failed"}];
+        return NO;
+    }
+
+    return ubc_finish_atomic_swap(fh, tmpPath, path, error);
+}
+
 @end

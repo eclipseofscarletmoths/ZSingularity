@@ -138,6 +138,20 @@ static NSUInteger t2pd_base_level_size(int32_t rawFormat, int32_t width, int32_t
                                             width:(int32_t)width
                                            height:(int32_t)height
                                             error:(NSError **)error {
+    return [self decodeToRGBA32FromRawFormat:rawFormat
+                                  sourceBytes:sourceBytes.bytes
+                                  sourceLength:sourceBytes.length
+                                        width:width
+                                       height:height
+                                        error:error];
+}
+
++ (nullable NSData *)decodeToRGBA32FromRawFormat:(int32_t)rawFormat
+                                      sourceBytes:(const void *)sourceBytes
+                                      sourceLength:(NSUInteger)sourceLength
+                                            width:(int32_t)width
+                                           height:(int32_t)height
+                                            error:(NSError **)error {
     if (width <= 0 || height <= 0) {
         if (error) *error = T2PDError(Texture2DPixelDecoderErrorInvalidDimensions, @"width/height must be positive");
         return nil;
@@ -151,7 +165,8 @@ static NSUInteger t2pd_base_level_size(int32_t rawFormat, int32_t width, int32_t
         // plain DXT5 - the BC1/BC3 block-decode loop below doesn't need
         // to know or care that its input passed through crunch first.
         NSError *crunchErr = nil;
-        NSData *rawDXT5 = [CrunchTextureDecoder decodeDXT5CrunchedToRawDXT5:sourceBytes width:width height:height error:&crunchErr];
+        NSData *crunchSource = [NSData dataWithBytesNoCopy:(void *)sourceBytes length:sourceLength freeWhenDone:NO];
+        NSData *rawDXT5 = [CrunchTextureDecoder decodeDXT5CrunchedToRawDXT5:crunchSource width:width height:height error:&crunchErr];
         if (!rawDXT5) {
             // Surface as this class's own Unsupported/Truncated codes
             // (not CrunchTextureDecoder's) so callers (TextureAtlasTransplant.m's
@@ -181,14 +196,14 @@ static NSUInteger t2pd_base_level_size(int32_t rawFormat, int32_t width, int32_t
     }
 
     NSUInteger neededBytes = t2pd_base_level_size(rawFormat, width, height);
-    if (sourceBytes.length < neededBytes) {
+    if (sourceLength < neededBytes) {
         if (error) *error = T2PDError(Texture2DPixelDecoderErrorTruncatedData,
             [NSString stringWithFormat:@"format %d at %dx%d needs %lu bytes for its base mip level, only got %lu",
-                rawFormat, width, height, (unsigned long)neededBytes, (unsigned long)sourceBytes.length]);
+                rawFormat, width, height, (unsigned long)neededBytes, (unsigned long)sourceLength]);
         return nil;
     }
 
-    const uint8_t *src = (const uint8_t *)sourceBytes.bytes;
+    const uint8_t *src = (const uint8_t *)sourceBytes;
     NSMutableData *out = [NSMutableData dataWithLength:(NSUInteger)width * (NSUInteger)height * 4];
     uint8_t *dst = (uint8_t *)out.mutableBytes;
 

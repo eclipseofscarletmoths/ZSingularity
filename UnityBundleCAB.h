@@ -139,6 +139,21 @@ typedef NS_ENUM(NSInteger, UnityBundleCABErrorCode) {
                      nodeDataAtIndex:(NSData * _Nullable (^)(NSUInteger index))nodeDataAtIndex
                                error:(NSError **)error;
 
+// Memory-efficient variant for a caller that has one mutable CAB node in memory
+// plus a disk-backed append stream containing newly-built objects. The CAB node
+// is emitted as [baseCABData][appendFile] without ever concatenating those two
+// buffers in RAM. appendFilePath may be nil when appendLength is zero.
++ (BOOL)writeArchiveStreamingToPath:(NSString *)path
+                        unityVersion:(nullable NSString *)unityVersion
+                       unityRevision:(nullable NSString *)unityRevision
+                               nodes:(NSArray<UnityBundleNode *> *)nodes
+                         cabNodePath:(NSString *)cabNodePath
+                         baseCABData:(NSData *)baseCABData
+                      appendFilePath:(nullable NSString *)appendFilePath
+                        appendLength:(int64_t)appendLength
+                     nodeDataAtIndex:(NSData * _Nullable (^)(NSUInteger index))nodeDataAtIndex
+                               error:(NSError **)error;
+
 // The archive's own name (its first directory node's path), e.g.
 // @"CAB-3832197875c1bd4d48da9ab24c88e996". nil + error filled if this
 // isn't a UnityFS archive this can parse - see the error codes above for
