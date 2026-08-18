@@ -1,13 +1,17 @@
 // Texture2DPixelDecoder.h
 //
-// The missing link between Texture2DFields.h (locates a Texture2D
-// object's header/pixel bytes) and RawPixelPacker.h (re-encodes RGBA32
-// into the cheap 16-bit formats this project targets - see that
-// header's top comment): this decodes a PC mod's SOURCE pixel bytes
-// (whatever m_TextureFormat it declares) into plain RGBA32 so
-// RawPixelPacker has something uniform to work from, regardless of
-// which of the handful of formats Limbus Company's PC mods actually
-// ship in.
+// REWORK NOTE (see Rework.txt): this decodes a source Texture2D's
+// pixel bytes (whatever m_TextureFormat it declares) into plain,
+// tightly-packed RGBA32 - the exact representation Rework.txt's Layer
+// C (pixel converter) wants for every format iOS doesn't accept
+// natively. RawPixelPacker.h, which used to sit downstream of this and
+// re-pack that RGBA32 into 16-bit formats, is deleted - Rework.txt is
+// explicit that converted output stays RGBA32, no further re-encode.
+// This file's job doesn't change either way: decode source bytes to
+// RGBA32, nothing more. Which module locates the object's header/pixel
+// bytes in the first place is being rebuilt from scratch (Layer B);
+// this decoder only needs sourceBytes/rawFormat/width/height, however
+// they were found.
 //
 // FORMAT COVERAGE - see this project's own texture2d_summary survey
 // (bundle_info.json: DXT1/DXT5/RGBA32/RGB24/DXT5Crunched, in that
@@ -66,7 +70,7 @@ typedef NS_ENUM(NSInteger, Texture2DPixelDecoderErrorCode) {
 //
 // If sourceBytes holds more than one mip level concatenated
 // (mipCount > 1 - this project always re-encodes to a single base
-// level, see RawPixelPacker.h's own top comment on why), only the
+// level, per Rework.txt's patch policy), only the
 // leading bytes for the base level are read; anything past that
 // (smaller mips) is ignored, not an error.
 //

@@ -187,10 +187,19 @@
 #import "ZSyslogController.h" // FPS120Controller + every non-UI engine script this file used to own directly - see that file's header
 #import "ZTweakLog.h"
 #import "BankTransplant.h"
-#import "BundleTransplant.h" // +unityCacheSharedDirectory, legacy/current whole-file backup restore, AND (again) the actual swap - see -gd_handlePickedModURLs:intoFolder:: PlatformBundleRetarget hands its retargeted archive back to +transplantAndSwapModdedBundlesAtURLs: rather than reimplementing cache matching/backup itself
-#import "TextureAtlasTransplant.h" // object-level diff/transplant - kept only for +restoreAllBackedUpBundlesWithError:/+restoreBackedUpBundlesForCAB:error: below, so pre-existing atlas backups still restore; no longer the bundle-mod import path itself, see -gd_handlePickedModURLs:intoFolder:
-#import "PlatformBundleRetarget.h" // whole-bundle retarget - now the only bundle-mod entry point, see -gd_handlePickedModURLs:intoFolder:
-#import "UnityBundleCAB.h" // UnityBundleArchive + +writeArchive:toPath:error:, for staging PlatformBundleRetarget's output to a scratch file before handing it to BundleTransplant
+#import "BundleTransplant.h" // +unityCacheSharedDirectory, legacy/current whole-file backup restore, the bank swap, AND (since the Rework.txt pipeline landed) the final swap-into-cache step for a retargeted bundle - see -gd_retargetValidateAndSwapBundleAtURL:swappedCount: below
+#import "TextureAtlasTransplant.h" // restore-only now - kept for +restoreAllBackedUpBundlesWithError:/+restoreBackedUpBundlesForCAB:error: below, so pre-existing atlas backups still restore
+// PlatformBundleRetarget.h (the previous whole-bundle Texture2D
+// retarget/import path) is deleted - see Texture2DFields.h's own note.
+// Its replacement, per Rework.txt's four-layer architecture, is fully
+// wired as of this entry: BundleTexture2DRetargeter (Layer D) produces
+// a retargeted bundle, BundleTexture2DRetargetValidator confirms it
+// before it's trusted, and -gd_retargetValidateAndSwapBundleAtURL:
+// swappedCount: below (bundle-kind picks' branch of
+// -gd_handlePickedModURLs:intoFolder:) is the entry point that ties
+// them together. Bank-kind mod imports (BankTransplant) are unaffected.
+#import "BundleTexture2DRetargeter.h"      // Layer D - also re-exports Texture2DConverter.h's ZSTexture2DConversionDecision/etc.
+#import "BundleTexture2DRetargetValidator.h" // Rework.txt's "Validation strategy" - run before a retargeted bundle is trusted
 #import "ModAssetLibrary.h"
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h> // UTType-based UIDocumentPickerViewController init, for the Mods section's "Import Bank Mod"/"Import Bundle Mod(s)" buttons
 #import "GDEmbeddedFont.h" // kExcelsiorSansTTF / kExcelsiorSansTTFLength - see that file's header
@@ -3613,25 +3622,171 @@ static void * const kGDModsPickerKindKey = (void *)&kGDModsPickerKindKey;
     [self gd_handlePickedModURLs:urls intoFolder:folderName];
 }
 
+// Bundle-kind mod entry point - the "last mile" Rework.txt's four-layer
+// architecture and ReworkLog.md's Entries 1-4 were all building toward:
+// takes ONE picked desktop-target bundle, runs it through the full
+// retarget pipeline, and (only if every stage agrees the result is
+// trustworthy) swaps it into the game's own bundle cache. Concretely,
+// in order:
+//
+//   1. BundleTexture2DRetargeter (Layer D) reads the picked bundle and
+//      writes a retargeted copy to a scratch path: m_TargetPlatform
+//      19 -> 9, every DXT1/DXT5/DXT5Crunched/RGB24 Texture2D decoded to
+//      RGBA32 and streamed into a new disk-backed .resS node, RGBA32/
+//      ASTC 4x4/ASTC 6x6 objects left untouched. A nil summary here
+//      means a WHOLE-BUNDLE-level failure (see
+//      BundleTexture2DRetargeterErrorCode) - nothing was written, so
+//      there's nothing to validate or swap; this method stops here.
+//   2. BundleTexture2DRetargetValidator re-reads BOTH the original and
+//      the just-written bundle from scratch (independent of whatever
+//      step 1 believes it did) and cross-checks m_TargetPlatform,
+//      object count, every PathID, and - for every object step 1
+//      actually converted - that it now reparses as format 4/mip 1/the
+//      expected size with a resolvable StreamingInfo. `report.passed
+//      == NO` means real bytes were written but this pipeline doesn't
+//      trust them; this method stops here too, WITHOUT swapping,
+//      exactly per Rework.txt's "Only then produce the final UnityFS
+//      bundle" / "before actually trusting/using its output" framing.
+//   3. Only on `report.passed == YES`: hands the retargeted bundle (at
+//      its scratch path, not the original picked URL - the ORIGINAL is
+//      still StandaloneWindows64-targeted and would never CAB-match
+//      anything meaningful for THIS purpose even though it importantly
+//      still matches the cached __data by CAB for BundleTransplant's
+//      own matching logic, since retargeting never renames the primary
+//      CAB node) to +[BundleTransplant transplantAndSwapModdedBundlesAtURLs:
+//      error:] - this project's existing swap-in-place machinery
+//      (backup + atomic replace of every matching cached __data, same
+//      mechanism the "Restore Bundles & Banks" button already knows how
+//      to undo). This is the ONLY step that touches the game's own
+//      cache; everything above only ever reads the picked file and
+//      writes to NSTemporaryDirectory.
+//
+// The scratch retargeted bundle is removed unconditionally before this
+// method returns (success or failure, at whichever step it stopped) -
+// see the three cleanup points below. Nothing this method does persists
+// past its own call except (on full success) the swapped cache file(s)
+// themselves, which is exactly the same footprint a bank-kind swap
+// leaves.
+//
+// Returns one human-readable line describing the outcome - this
+// project's established "report per item" posture, same shape
+// -gd_handlePickedModURLs:intoFolder: already builds for bank-kind
+// picks a few lines below. `swappedCountOut`, if non-NULL, is set to
+// how many cached __data files were actually replaced (0 for anything
+// short of a fully successful swap) so the caller's totalSwapped
+// tally/haptic feedback treats a bundle swap exactly like a bank swap.
+- (NSString *)gd_retargetValidateAndSwapBundleAtURL:(NSURL *)moddedURL swappedCount:(NSInteger *)swappedCountOut {
+    NSString *name = moddedURL.lastPathComponent;
+    if (swappedCountOut) *swappedCountOut = 0;
+
+    // moddedURL is whatever the document picker handed back - possibly
+    // security-scoped (Files/iCloud), same as every other picker-sourced
+    // URL this file already handles (see -gd_kindForFileAtURL:,
+    // BankTransplant/BundleTransplant's own URL-handling notes). Held
+    // for exactly as long as this method needs to READ the picked file -
+    // released right after BundleTexture2DRetargeter is done with it,
+    // since nothing past that point touches moddedURL again (validation
+    // reads it too, so the scope covers both calls).
+    BOOL accessing = [moddedURL startAccessingSecurityScopedResource];
+
+    // Scratch destination for the retargeted bundle. Deliberately
+    // NSTemporaryDirectory, never anywhere ModAssetLibrary/
+    // BundleTransplant look on their own (+modLibraryRootDirectory,
+    // +unityCacheSharedDirectory, either backup directory) - this file
+    // only ever exists to hand ONE path to BundleTransplant below, then
+    // gets removed.
+    NSString *scratchPath = [NSTemporaryDirectory() stringByAppendingPathComponent:
+        [NSString stringWithFormat:@"%@.zsingularity-retargeted", [NSUUID UUID].UUIDString]];
+
+    NSError *retargetErr = nil;
+    ZSTexture2DRetargetSummary *summary = [BundleTexture2DRetargeter retargetBundleAtPath:moddedURL.path
+                                                                                     toPath:scratchPath
+                                                                                      error:&retargetErr];
+    if (!summary) {
+        if (accessing) [moddedURL stopAccessingSecurityScopedResource];
+        return [NSString stringWithFormat:@"%@: retarget failed - %@", name, retargetErr.localizedDescription ?: @"unknown error"];
+    }
+
+    ZLog(@"[BundleTexture2DRetargeter] %@: %ld converted, %ld unchanged, %ld failed (m_TargetPlatform %d -> %d)",
+         name, (long)summary.convertedCount, (long)summary.unchangedCount, (long)summary.failedCount,
+         summary.originalTargetPlatform, summary.newTargetPlatform);
+
+    NSError *validateErr = nil;
+    ZSTexture2DRetargetValidationReport *report =
+        [BundleTexture2DRetargetValidator validateRetargetedBundleAtPath:scratchPath
+                                                      originalBundleAtPath:moddedURL.path
+                                                                   summary:summary
+                                                                     error:&validateErr];
+
+    // Done reading the picked file itself either way past this point -
+    // both the retarget and the validation pass's "original bundle"
+    // side are the only two things that read moddedURL.
+    if (accessing) [moddedURL stopAccessingSecurityScopedResource];
+
+    if (!report) {
+        [NSFileManager.defaultManager removeItemAtPath:scratchPath error:nil];
+        return [NSString stringWithFormat:@"%@: validation couldn't run - %@", name, validateErr.localizedDescription ?: @"unknown error"];
+    }
+
+    if (!report.passed) {
+        [NSFileManager.defaultManager removeItemAtPath:scratchPath error:nil];
+        ZSTexture2DRetargetValidationIssue *firstIssue = report.issues.firstObject;
+        NSString *more = report.issues.count > 1 ? [NSString stringWithFormat:@" (+%ld more issue(s))", (long)(report.issues.count - 1)] : @"";
+        ZLog(@"[BundleTexture2DRetargetValidator] %@: FAILED validation - %ld issue(s), first: %@%@",
+             name, (long)report.issues.count, firstIssue.reason ?: @"(no detail)", more);
+        return [NSString stringWithFormat:@"%@: retargeted but failed validation, not swapped - %@%@",
+                name, firstIssue.reason ?: @"unspecified", more];
+    }
+
+    ZLog(@"[BundleTexture2DRetargetValidator] %@: validation passed (%ld converted verified, %ld unchanged verified)",
+         name, (long)report.verifiedConvertedCount, (long)report.verifiedUnchangedCount);
+
+    // Only a validated bundle ever reaches BundleTransplant - the one
+    // step that actually writes into the game's own cache. Matching is
+    // by the retargeted bundle's own primary CAB node name, which
+    // BundleTexture2DRetargeter never renames (see its header's storage
+    // decision - only a brand-new *.resS node is added), so this still
+    // matches whatever cached __data the ORIGINAL desktop bundle would
+    // have matched.
+    NSError *swapErr = nil;
+    NSArray<BundleTransplantResult *> *results =
+        [BundleTransplant transplantAndSwapModdedBundlesAtURLs:@[[NSURL fileURLWithPath:scratchPath]] error:&swapErr];
+
+    [NSFileManager.defaultManager removeItemAtPath:scratchPath error:nil];
+
+    if (!results) {
+        return [NSString stringWithFormat:@"%@: retargeted+validated but swap failed - %@", name, swapErr.localizedDescription ?: @"unknown error"];
+    }
+
+    BundleTransplantResult *swapResult = results.firstObject;
+    if (swapResult.error) {
+        return [NSString stringWithFormat:@"%@: retargeted+validated but swap failed - %@", name, swapResult.error.localizedDescription ?: @"unknown error"];
+    }
+    if (swapResult.swappedCount == 0) {
+        return [NSString stringWithFormat:@"%@: retargeted+validated (CAB %@) but no match in the cache - nothing to swap", name, swapResult.cab ?: @"?"];
+    }
+
+    if (swappedCountOut) *swappedCountOut = swapResult.swappedCount;
+    return [NSString stringWithFormat:@"%@: retargeted, validated, swapped (%ld texture(s) converted, %ld unchanged)",
+            name, (long)summary.convertedCount, (long)summary.unchangedCount];
+}
+
 // Sniffs every picked file, splits into bank-kind/bundle-kind/
-// unrecognized, shows one generic working alert (re-encoding turned out
-// to not be worth calling out specially in the UI - both flows just
-// read as "swapping files" to the person waiting on it), does both
-// transplant calls on a background queue, then reports one combined
-// summary. Both transplant calls are genuinely independent (different
-// files, different directories) so there's no ordering requirement
-// between them. Once the swap side is done, the same URLs are also
-// handed to +[ModAssetLibrary importFileURLs:intoFolder:error:] so
+// unrecognized, shows one generic working alert, does the bank swap
+// and (per -gd_retargetValidateAndSwapBundleAtURL:swappedCount: above)
+// the bundle retarget+validate+swap on a background queue, then reports
+// one combined summary. Once the swap side is done, the same URLs are
+// also handed to +[ModAssetLibrary importFileURLs:intoFolder:error:] so
 // they're tracked in the Mods Library accordion - a swap with no
 // matching folder to import into shouldn't be possible anymore (every
 // caller now supplies one - see kGDModsPickerKindKey), but folderName
 // is nullable here anyway as a defensive fallback.
-// The raw m_TargetPlatform int32 PlatformBundleRetarget writes in place
-// of a desktop bundle's own value (19) - not independently re-derived
-// from Unity's BuildTarget/RuntimePlatform enum, taken as given from a
-// real mobile-bundle sample, per PlatformBundleRetarget.h's own note on
-// +retargetDesktopBundleAtPath:targetPlatform:toPath:result:error:.
-static const int32_t kGDMobileBuildTargetPlatform = 9;
+//
+// Bundle-kind picks (whole-bundle Texture2D retarget) are tracked in
+// the library by their ORIGINAL picked (desktop-target) bytes, same as
+// every other kind - the retargeted copy only ever exists as a scratch
+// file for the duration of one swap (see the method above) and is never
+// itself persisted anywhere.
 
 - (void)gd_handlePickedModURLs:(NSArray<NSURL *> *)urls intoFolder:(nullable NSString *)folderName {
     UIViewController *presenter = gd_key_window().rootViewController;
@@ -3677,89 +3832,16 @@ static const int32_t kGDMobileBuildTargetPlatform = 9;
             }
         }
 
-        // Whole-bundle retarget (PlatformBundleRetarget), NOT the old
-        // object-level diff/transplant (TextureAtlasTransplant) - see
-        // PlatformBundleRetarget.h's top comment for the reasoning. A
-        // PC-built mod that ships as a whole desktop bundle doesn't need
-        // a second "target" file to diff against at all: rewrite
-        // m_TargetPlatform, re-encode every Texture2D's pixel payload to
-        // something this project's Metal path can bind, done. This
-        // stages that result to a scratch file, then hands it to
-        // BundleTransplant's existing CAB-matched swap+backup machinery
-        // (+transplantAndSwapModdedBundlesAtURLs:) rather than
-        // reimplementing cache matching here - same call TextureAtlasTransplant
-        // was originally written to replace, now used as the actual
-        // drop-in step per PlatformBundleRetarget.h's own framing.
-        // One retarget+swap per picked bundle URL.
+        // Bundle-kind picks (whole-bundle Texture2D retarget) - see
+        // -gd_retargetValidateAndSwapBundleAtURL:swappedCount: above for
+        // the full retarget -> validate -> swap sequence. One line per
+        // file either way, same "report per item" posture the bank loop
+        // above already uses.
         for (NSURL *bundleURL in bundleURLs) {
-            NSString *name = bundleURL.lastPathComponent;
-
-            // Scratch copy, one per bundle in its own UUID'd subfolder so
-            // same-named picks (always "__data" for a cache-sourced mod,
-            // per BundleTransplant.h's own filename note) never collide -
-            // BundleTransplant matches by CAB, not filename, but this
-            // still writes one real file per call.
-            NSString *scratchDir = [NSTemporaryDirectory() stringByAppendingPathComponent:[NSUUID UUID].UUIDString];
-            [[NSFileManager defaultManager] createDirectoryAtPath:scratchDir withIntermediateDirectories:YES attributes:nil error:nil];
-            NSString *scratchPath = [scratchDir stringByAppendingPathComponent:name];
-
-            // Retarget now writes straight to scratchPath itself (see
-            // overview.md's memory-usage entry) instead of handing back an
-            // in-memory UnityBundleArchive for a separate +writeArchive:
-            // call - that two-step shape used to mean the retargeted
-            // bundle's full bytes and a second freshly-serialized copy of
-            // the same bytes were briefly resident at once, on top of
-            // everything the per-object re-encode loop itself needed.
-            BOOL accessing = [bundleURL startAccessingSecurityScopedResource];
-            NSError *retargetErr = nil;
-            PlatformBundleRetargetResult *pbrResult = nil;
-            BOOL retargeted = [PlatformBundleRetarget retargetDesktopBundleAtPath:bundleURL.path
-                                                                     targetPlatform:kGDMobileBuildTargetPlatform
-                                                                             toPath:scratchPath
-                                                                             result:&pbrResult
-                                                                              error:&retargetErr];
-            if (accessing) [bundleURL stopAccessingSecurityScopedResource];
-
-            if (!retargeted) {
-                [lines addObject:[NSString stringWithFormat:@"%@: %@", name, retargetErr.localizedDescription ?: @"retarget failed"]];
-                [[NSFileManager defaultManager] removeItemAtPath:scratchDir error:nil];
-                continue;
-            }
-
-            NSError *swapErr = nil;
-            NSArray<BundleTransplantResult *> *swapResults = [BundleTransplant transplantAndSwapModdedBundlesAtURLs:@[[NSURL fileURLWithPath:scratchPath]]
-                                                                                                                error:&swapErr];
-            [[NSFileManager defaultManager] removeItemAtPath:scratchDir error:nil];
-
-            if (!swapResults) {
-                [lines addObject:[NSString stringWithFormat:@"%@: %@", name, swapErr.localizedDescription ?: @"bundle swap failed"]];
-                continue;
-            }
-            BundleTransplantResult *swapResult = swapResults.firstObject;
-            if (swapResult.error) {
-                [lines addObject:[NSString stringWithFormat:@"%@ (%@): %@", name, swapResult.cab ?: @"?", swapResult.error.localizedDescription]];
-                continue;
-            }
-
-            NSInteger swapped = swapResult.swappedCount;
-            totalSwapped += swapped;
-
-            if (swapped == 0) {
-                [lines addObject:[NSString stringWithFormat:@"%@: no match in cache", name]];
-                continue;
-            }
-
-            // problems computed once, same "don't hide a real cause behind
-            // a generic count" reasoning the old TextureAtlasTransplant
-            // reporting used - see ZLog (Verbose syslog) for per-object
-            // detail either way.
-            NSInteger problems = pbrResult.texture2DHeaderParseFailed + pbrResult.texture2DFormatUnsupported;
-            NSMutableString *line = [NSMutableString stringWithFormat:@"%@: %ld swapped, %ld texture%@ retargeted",
-                name, (long)swapped, (long)pbrResult.texture2DRetargeted, pbrResult.texture2DRetargeted == 1 ? @"" : @"s"];
-            if (problems > 0) {
-                [line appendFormat:@", %ld texture issue%@ - check Verbose log", (long)problems, problems == 1 ? @"" : @"s"];
-            }
+            NSInteger swappedCount = 0;
+            NSString *line = [self gd_retargetValidateAndSwapBundleAtURL:bundleURL swappedCount:&swappedCount];
             [lines addObject:line];
+            totalSwapped += swappedCount;
         }
 
         for (NSString *name in unrecognized) {

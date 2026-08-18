@@ -155,9 +155,9 @@ typedef NS_ENUM(NSInteger, SerializedObjectTableErrorCode) {
 // walks far enough to see this field - it reads m_UnityVersion then
 // m_TargetPlatform immediately after (see SerializedFile format:
 // version >= 8 always has this field), previously discarding the
-// value. Added for PlatformBundleRetarget.h, which needs to rewrite
-// this field in place (e.g. a PC-built bundle's platform ID -> iOS's)
-// without touching anything else in the header - see that file for
+// value. Added to let a caller rewrite this field in place (e.g. a
+// desktop bundle's platform ID -> iOS's, 19 -> 9) without touching
+// anything else in the header - see Rework.txt (project root) for
 // why. NOT used by anything in this file itself.
 @property (nonatomic, assign, readonly) int64_t targetPlatformFieldOffset;
 @property (nonatomic, assign, readonly) BOOL targetPlatformFieldOffsetKnown;

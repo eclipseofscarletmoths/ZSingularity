@@ -131,7 +131,9 @@ typedef NS_ENUM(NSInteger, UnityBundleCABErrorCode) {
 // asking for the next one - so peak memory is roughly "whatever the
 // caller's block itself needs to produce one node's bytes," not "every
 // node's bytes plus one more full-bundle-size copy of all of them
-// concatenated." See PlatformBundleRetarget.m for the intended caller.
+// concatenated." See Rework.txt (project root, Layer D) for the
+// intended caller - the disk-backed bundle writer this streaming API
+// exists for hasn't been rebuilt yet.
 + (BOOL)writeArchiveStreamingToPath:(NSString *)path
                         unityVersion:(nullable NSString *)unityVersion
                        unityRevision:(nullable NSString *)unityRevision

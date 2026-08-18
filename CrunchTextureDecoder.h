@@ -40,14 +40,14 @@
 // declarations and the implementation).
 //
 // WHY THIS ONLY EVER TARGETS THE BASE MIP LEVEL: same reasoning as
-// RawPixelPacker.h/Texture2DPixelDecoder.h - this project always
-// re-encodes to a single base level regardless of what modded shipped,
-// so only crnd_unpack_level's level_index 0 is ever unpacked here.
+// Texture2DPixelDecoder.h - this project always re-encodes to a
+// single base level regardless of what the source shipped, so only
+// crnd_unpack_level's level_index 0 is ever unpacked here.
 //
 // NOT YET CONFIRMED AGAINST A REAL DXT5Crunched SAMPLE END TO END (no
-// compiler/test harness available while writing this) - same "refuses
-// rather than guesses, but flag what hasn't been proven yet" posture as
-// kTAT2ProfileDefault in Texture2DFields.h. The row_pitch/dst_size math
+// compiler/test harness available while writing this) - refuses
+// rather than guesses, but flag what hasn't been proven yet. The
+// row_pitch/dst_size math
 // below (blocksWide/blocksHigh * 16 bytes/DXT5-block) is the same
 // formula t2pd_base_level_size already uses for plain DXT5, so a wrong
 // WIDTH/HEIGHT here fails the same way (crnd_unpack_level returning

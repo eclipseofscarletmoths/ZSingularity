@@ -132,13 +132,44 @@ jobs:
       # -fobjc-arc is required: FPS120LinkWatcher.h and the other
       # files use ARC-style `strong`/`assign` property attributes.
       #
-      # Texture2DFields.m / Texture2DPixelDecoder.m / RawPixelPacker.m /
-      # SerializedObjectTable.m / TextureAtlasTransplant.m are the
-      # object-level texture-transplant pipeline (see
-      # TextureAtlasTransplant.h) - added alongside CrunchTextureDecoder.o
-      # below now that GraphicsDebugOverlay.m's mod-import flow actually
-      # calls into TextureAtlasTransplant instead of BundleTransplant's
-      # old whole-file swap for bundles.
+      # Texture2DPixelDecoder.m / SerializedObjectTable.m are shared
+      # building blocks the Texture2D retarget pipeline below depends on
+      # (pixel block decoding, SerializedFile object-table parsing).
+      # TextureAtlasTransplant.m is compiled for its own restore-only API
+      # now (+restoreAllBackedUpBundlesWithError:/+restoreBackedUpBundlesForCAB:error:,
+      # see TextureAtlasTransplant.h) - its old object-level diff/transplant
+      # pipeline was already dead code before the Rework.txt rewrite and
+      # has been removed along with it; GraphicsDebugOverlay.m's bundle-kind
+      # mod-import flow goes through BundleTexture2DRetargeter/-Validator
+      # + BundleTransplant's whole-file cache swap instead (see below).
+      #
+      # Texture2DFields.m, RawPixelPacker.m, and PlatformBundleRetarget.m
+      # no longer exist (see Rework.txt / Texture2DFields.h's own note) -
+      # dropped from this invocation along with the profile-guessing
+      # pipeline they implemented. Texture2DFields.h now only declares
+      # TAT2TextureFormat (a header-only enum, nothing to compile).
+      # Texture2DSchema.m / BundleTexture2DEnumerator.m are their
+      # replacement's first two layers (Layer A/B - see Rework.txt's
+      # "New architecture"): a fixed structural Texture2D parser and the
+      # bundle-level glue that enumerates every Texture2D object through
+      # it. Texture2DConverter.m is Layer C's wiring (the conversion
+      # decision table + the per-object decode driver that calls
+      # Texture2DPixelDecoder.m/CrunchTextureDecoder.o, both of which
+      # already compiled above, once per enumerated Texture2D object).
+      # BundleTexture2DRetargeter.m is Layer D's first piece (see
+      # Rework.txt's "Bundle writer redesign" / ReworkLog.md Entry 3):
+      # the disk-backed writer that patches m_TargetPlatform and every
+      # converted Texture2D's object bytes, stages RGBA32 payloads into
+      # a brand-new .resS-shaped node, and writes the resulting UnityFS
+      # bundle out via UnityBundleCAB's existing streaming writer.
+      # BundleTexture2DRetargetValidator.m (ReworkLog.md Entry 4) is
+      # Rework.txt's post-write reparse/verification pass: re-enumerates
+      # both the original and just-written bundles from scratch and
+      # cross-checks the rebuilt one against the retargeter's own summary
+      # before a caller is meant to trust it. GraphicsDebugOverlay.m's
+      # bundle-kind mod-import branch (ReworkLog.md Entry 5) now calls
+      # both of the above, then BundleTransplant, in sequence - see
+      # -gd_retargetValidateAndSwapBundleAtURL:swappedCount: there.
       #
       # Adjust -miphoneos-version-min if your deployment target
       # differs - 15.0 covers all ProMotion (120Hz-capable) devices.
@@ -179,13 +210,15 @@ jobs:
             LZ4BlockDecoder.m \
             PatchManifestNetwork.m \
             ModAssetLibrary.m \
-            Texture2DFields.m \
             Texture2DPixelDecoder.m \
-            RawPixelPacker.m \
             SerializedObjectTable.m \
             TextureAtlasTransplant.m \
+            Texture2DSchema.m \
+            BundleTexture2DEnumerator.m \
+            Texture2DConverter.m \
+            BundleTexture2DRetargeter.m \
+            BundleTexture2DRetargetValidator.m \
             CrunchTextureDecoder.o \
-            PlatformBundleRetarget.m \
             -lc++ \
             -o ZSingularity.dylib
 
