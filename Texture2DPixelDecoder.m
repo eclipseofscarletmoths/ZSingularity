@@ -13,11 +13,10 @@
 
 NSString * const Texture2DPixelDecoderErrorDomain = @"Texture2DPixelDecoderErrorDomain";
 
-// Not in TAT2TextureFormat (that enum only lists the ones
-// Texture2DFields.h's own validation cares about) - RGB24 shows up in
+// RGB24 is a first-class Texture2D format in this pipeline. It shows up in
 // this project's own bundle_info.json texture2d_summary survey, so it
 // gets a local constant here rather than pulling in an unrelated name.
-static const int32_t kTAT2FormatRGB24 = 3;
+
 
 static NSError *T2PDError(Texture2DPixelDecoderErrorCode code, NSString *message) {
     return [NSError errorWithDomain:Texture2DPixelDecoderErrorDomain code:code userInfo:@{NSLocalizedDescriptionKey: message}];
@@ -124,7 +123,7 @@ static NSUInteger t2pd_base_level_size(int32_t rawFormat, int32_t width, int32_t
     NSUInteger blocksHigh = (NSUInteger)((height + 3) / 4);
     switch (rawFormat) {
         case TAT2TextureFormatRGBA32: return (NSUInteger)width * (NSUInteger)height * 4;
-        case kTAT2FormatRGB24:        return (NSUInteger)width * (NSUInteger)height * 3;
+        case TAT2TextureFormatRGB24:        return (NSUInteger)width * (NSUInteger)height * 3;
         case TAT2TextureFormatDXT1:   return blocksWide * blocksHigh * 8;
         case TAT2TextureFormatDXT5:   return blocksWide * blocksHigh * 16;
         default: return 0;
@@ -185,7 +184,7 @@ static NSUInteger t2pd_base_level_size(int32_t rawFormat, int32_t width, int32_t
         return [self decodeToRGBA32FromRawFormat:TAT2TextureFormatDXT5 sourceBytes:rawDXT5 width:width height:height error:error];
     }
 
-    if (rawFormat != TAT2TextureFormatRGBA32 && rawFormat != kTAT2FormatRGB24 &&
+    if (rawFormat != TAT2TextureFormatRGBA32 && rawFormat != TAT2TextureFormatRGB24 &&
         rawFormat != TAT2TextureFormatDXT1 && rawFormat != TAT2TextureFormatDXT5) {
         // RGBA ASTC 6x6 (50) and anything else unlisted - see this
         // class's header top comment on why those are refused rather
@@ -212,7 +211,7 @@ static NSUInteger t2pd_base_level_size(int32_t rawFormat, int32_t width, int32_t
         return out;
     }
 
-    if (rawFormat == kTAT2FormatRGB24) {
+    if (rawFormat == TAT2TextureFormatRGB24) {
         for (NSUInteger i = 0; i < (NSUInteger)width * (NSUInteger)height; i++) {
             dst[i * 4 + 0] = src[i * 3 + 0];
             dst[i * 4 + 1] = src[i * 3 + 1];

@@ -12,8 +12,8 @@
 // FORMAT COVERAGE - see this project's own texture2d_summary survey
 // (bundle_info.json: DXT1/DXT5/RGBA32/RGB24/DXT5Crunched, in that
 // rough frequency order for a typical mod bundle):
-//   - RGBA32, RGB24: no decode needed beyond a straight copy /
-//     alpha=255 fill - included here for uniformity so every caller
+//   - RGBA32, RGB24: RGBA32 is copied directly; RGB24 is expanded with
+//     alpha=255 - included here for uniformity so every caller
 //     goes through one function regardless of source format.
 //   - DXT1 (BC1), DXT5 (BC3): decoded in full below. Both are the
 //     standard, openly-documented S3TC/BC block layout (this is a

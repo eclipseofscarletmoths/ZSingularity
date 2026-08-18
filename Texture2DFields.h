@@ -32,11 +32,12 @@ NS_ASSUME_NONNULL_BEGIN
 extern NSString * const Texture2DFieldsErrorDomain;
 
 // Known m_TextureFormat values this project cares about - see the
-// project's own notes (PC mods: RGBA32/DXT1/DXT5/DXT5Crunched; iOS
-// stock: RGBA ASTC 6x6 only). Anything else encountered is still
+// project's own notes (PC mods: RGB24/RGBA32/DXT1/DXT5/DXT5Crunched;
+// iOS stock: RGBA ASTC 6x6 only). Anything else encountered is still
 // reported (rawFormat on Texture2DHeader is unfiltered) but
 // +decodeSupportedFormat: below only claims these four.
 typedef NS_ENUM(int32_t, TAT2TextureFormat) {
+    TAT2TextureFormatRGB24           = 3,
     TAT2TextureFormatRGBA32          = 4,
     TAT2TextureFormatDXT1            = 10,
     TAT2TextureFormatDXT5            = 12,

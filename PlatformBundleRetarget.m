@@ -41,6 +41,8 @@ static const int32_t kPBRClassIDTexture2D = 28;
 // Formats the iOS/Metal target can consume directly. These must never enter
 // the desktop-texture decode/re-encode path: RGBA32 is already the exact
 // output representation we want, and ASTC 6x6 is the stock mobile format.
+// RGB24 (format 3) is intentionally NOT included: iOS does not support it,
+// so it must be expanded to RGBA32 like DXT1/DXT5 sources.
 static BOOL pbr_format_is_ios_supported(int32_t rawFormat) {
     return rawFormat == TAT2TextureFormatRGBA32 || rawFormat == TAT2TextureFormatRGBAASTC6x6;
 }
@@ -356,7 +358,8 @@ static uint32_t pbr_read_u32_le(NSData *data, NSUInteger pos) {
         // packing pass; that was an unnecessary extra full-image allocation
         // and also moved the retargeted bundle away from the requested RGBA32
         // format. Only unsupported desktop formats (DXT1/DXT5/Crunch, etc.)
-        // reach this point because RGBA32/ASTC were rejected above.
+        // reach this point because only RGBA32/ASTC are rejected above; RGB24 is
+        // deliberately decoded and converted to RGBA32.
         NSData *rgba32 = [Texture2DPixelDecoder decodeToRGBA32FromRawFormat:header.rawFormat
                                                                   sourceBytes:pixelPtr
                                                                 sourceLength:pixelLength
