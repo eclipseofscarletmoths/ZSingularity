@@ -164,24 +164,21 @@ static NSError *btr_error(BundleTexture2DRetargeterErrorCode code, NSString *rea
         // retained past this scope, per Texture2DConverter.h's own
         // MEMORY POSTURE contract.
         NSData *rgba32 = result.rgba32Data;
-        @try {
-            [stagingFH writeData:rgba32];
-        } @catch (NSException *exc) {
-            r.error = btr_error(BundleTexture2DRetargeterErrorStagingFileFailed, exc.reason ?: @"staging write failed", nil);
-            failedCount++;
-            return;
-        }
-        int64_t thisStreamOffset = stagingWriteOffset;
-        stagingWriteOffset += (int64_t)rgba32.length;
 
-        // Build this object's rewritten tail: everything up to (not
-        // including) the image-data length field, verbatim; then a
-        // fresh zero length (dropping any old inline payload); then a
-        // brand-new StreamingInfo pointing at the staged bytes above.
-        // Field offsets before imageDataLengthFieldOffset - including
-        // formatOffset/completeImageSizeOffset/mipCountOffset - are
-        // patched in place within this SAME leading slice before it's
-        // used, since they're copied from the object's ORIGINAL bytes.
+        // Build this object's rewritten tail BEFORE touching either the
+        // staging file or mutableCAB - see this method's fix note below.
+        // Everything up to (not including) the image-data length field,
+        // verbatim; then a fresh zero length (dropping any old inline
+        // payload); then a brand-new StreamingInfo pointing at where
+        // this object's bytes WILL land in the staging file once
+        // actually written (thisStreamOffset == stagingWriteOffset as it
+        // stands right now - nothing has been appended to the staging
+        // file for this object yet). Field offsets before
+        // imageDataLengthFieldOffset - including formatOffset/
+        // completeImageSizeOffset/mipCountOffset - are patched in place
+        // within this SAME leading slice before it's used, since they're
+        // copied from the object's ORIGINAL bytes.
+        int64_t thisStreamOffset = stagingWriteOffset;
         NSUInteger objBase = obj.cabAbsoluteOffset;
         NSMutableData *tail = [[enumerator.cabNodeData subdataWithRange:
                                  NSMakeRange(objBase, info.imageDataLengthFieldOffset)] mutableCopy];
@@ -194,36 +191,43 @@ static NSError *btr_error(BundleTexture2DRetargeterErrorCode code, NSString *rea
         btr_write_u32_le(tail, (uint32_t)newStreamPathUTF8.length); // m_StreamData.pathLen
         [tail appendData:newStreamPathUTF8];
 
-        // Texture2DSchema.m requires the object to end 4-byte aligned
-        // (align4 after m_StreamData.path, even though it's the last
-        // field - see that file's header comment). newStreamPathValue's
-        // length is almost never itself a multiple of 4, so pad the tail
-        // out to the same boundary the reader will expect, or every
-        // converted object here fails to reparse post-retarget with
-        // "align4 after m_StreamData.path ran past object end".
-        NSUInteger unpadded = tail.length;
-        NSUInteger padded = (unpadded + 3) & ~(NSUInteger)3;
-        if (padded > unpadded) {
-            uint8_t zero[3] = {0, 0, 0};
-            [tail appendBytes:zero length:(padded - unpadded)];
-        }
+        // NOTE: this used to also refuse when `tail.length >
+        // info.objectLength` ("CAB NODE GROWTH IS SMALL"). That check
+        // was never a correctness requirement - the rewritten tail is
+        // ALWAYS relocated to freshly-appended space at the end of
+        // mutableCAB below, never written back into the object's
+        // original span, so there was nothing for that span to
+        // overflow. It was only meant as a canary for "this object
+        // barely shrank," but it fires unconditionally for every
+        // already-STREAMED texture: a streamed object's original span
+        // is already just its header + a short StreamingInfo path (no
+        // inline pixels to remove), and the new resS path
+        // (".zsingularity-rgba32.resS") is necessarily longer than
+        // whatever short path it originally streamed from - so the
+        // check rejected the majority of real conversions in a
+        // streamed-heavy bundle, not just a rare edge case. See
+        // Rework.txt/overview.md for the write-up. Removed.
 
-        if (tail.length > info.objectLength) {
-            // See this file's header "CAB NODE GROWTH IS SMALL" note -
-            // not expected against this project's real corpus, refused
-            // rather than risking a silent reflow bug if it ever does
-            // happen (e.g. an unusually tiny source texture where the
-            // new path string outweighs whatever inline bytes it had).
-            r.error = btr_error(BundleTexture2DRetargeterErrorObjectWouldGrow,
-                                 [NSString stringWithFormat:@"rewritten object (%lu bytes) would exceed its original span (%lu bytes) - left unchanged",
-                                  (unsigned long)tail.length, (unsigned long)info.objectLength], nil);
+        // From here on this object is committed: stage its RGBA32 bytes
+        // and grow mutableCAB first, then only mark it converted (and
+        // only leave the appended bytes in place) if patchObject: also
+        // succeeds - roll both back on failure so a failure here can
+        // never leave orphaned pixel data sitting in the staging file
+        // or the CAB node with nothing pointing at it (the bug this
+        // whole method used to have: the staging write happened before
+        // any of these checks, so a rejected object's bytes rode along
+        // into the final .resS anyway, unreferenced).
+        @try {
+            [stagingFH writeData:rgba32];
+        } @catch (NSException *exc) {
+            r.error = btr_error(BundleTexture2DRetargeterErrorStagingFileFailed, exc.reason ?: @"staging write failed", nil);
             failedCount++;
-            return;
+            return; // nothing written that stagingWriteOffset doesn't already account for - safe to just return
         }
+        stagingWriteOffset += (int64_t)rgba32.length;
 
         int64_t newByteStartAbs = (int64_t)mutableCAB.length;
         [mutableCAB appendData:tail];
-        totalTailBytesAppended += tail.length;
 
         int64_t newByteStartRelative = newByteStartAbs - enumerator.objectTable.dataOffset;
         NSError *patchErr = nil;
@@ -233,11 +237,30 @@ static NSError *btr_error(BundleTexture2DRetargeterErrorCode code, NSString *rea
                                                  inNodeData:mutableCAB
                                                       error:&patchErr];
         if (!patched) {
+            // Roll back both appends so this failed object leaves no
+            // trace in either the CAB node or the staging file.
+            mutableCAB.length = (NSUInteger)newByteStartAbs;
+            stagingWriteOffset = thisStreamOffset;
+            @try {
+                [stagingFH truncateFileAtOffset:(unsigned long long)thisStreamOffset];
+                [stagingFH seekToEndOfFile];
+            } @catch (NSException *exc) {
+                // Staging file truncation failing is itself a hard
+                // error - the file's on-disk length no longer matches
+                // stagingWriteOffset's bookkeeping, and continuing
+                // would risk exactly the orphaned-bytes bug this rewrite
+                // exists to close. Surface it rather than pressing on.
+                r.error = btr_error(BundleTexture2DRetargeterErrorStagingFileFailed,
+                                     exc.reason ?: @"staging file rollback failed after table patch failure", nil);
+                failedCount++;
+                return;
+            }
             r.error = btr_error(BundleTexture2DRetargeterErrorTableEntryPatchFailed, @"table entry patch failed", patchErr);
             failedCount++;
             return;
         }
 
+        totalTailBytesAppended += tail.length;
         r.patched = YES;
         convertedCount++;
     }];

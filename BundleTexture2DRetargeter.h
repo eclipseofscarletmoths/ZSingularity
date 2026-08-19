@@ -64,17 +64,26 @@
 // and unread by anything once the length field says 0, not physically
 // removed), and m_StreamData rewritten to the new node/offset/size/
 // path - which is a different byte LENGTH than whatever StreamingInfo
-// (empty, or pointing at a different node) the object had before. That
-// last part is the only reason a converted object's overall byte range
-// changes size at all, and by design it can only ever SHRINK relative
-// to its original span (dropping a whole inline pixel payload, at most
-// gaining a few dozen bytes of new path string) for any object this
-// project's real corpus would produce - see the .m's
-// BundleTexture2DRetargeterErrorObjectWouldGrow for the fail-closed
-// guard on the one shape of object this reasoning doesn't cover (kept
-// as a hard refusal rather than a silent corruption risk, not because
-// it's expected to ever fire against a real Limbus Company bundle).
-// Rather than reflow the object to its OWN original position, each
+// (empty, or pointing at a different node) the object had before.
+//
+// An earlier version of this class refused to convert any object whose
+// rewritten tail came out longer than its ORIGINAL span
+// (BundleTexture2DRetargeterErrorObjectWouldGrow), on the theory that
+// growth past the original span was an unexpected shape this project's
+// corpus wouldn't produce. That reasoning didn't hold: a STREAMED
+// object's original span is already just its header + a short
+// StreamingInfo path (no inline pixel payload to drop), and the new
+// resS path this class synthesizes is necessarily longer than whatever
+// short path the object streamed from originally - so the rewritten
+// tail is reliably a few dozen bytes BIGGER than the original span for
+// every already-streamed texture, which is the common case in a
+// streamed-heavy bundle, not the rare one. The check was also never a
+// correctness requirement in the first place: see the next paragraph -
+// a converted object's tail is always relocated to freshly-appended
+// space, never written back into its own original span, so there was
+// nothing for that span to overflow. It's been removed; see
+// ReworkLog.md for the write-up. Rather than reflow the object to its
+// OWN original position, each
 // converted object's freshly-rewritten (smaller) bytes are appended at
 // the true end of the CAB node's own data - same pattern
 // -[SerializedObjectTable insertObjects:payloads:inNodeData:error:]
@@ -103,11 +112,18 @@
 // per-object append growth described above. The one thing that is NOT
 // held in RAM, per Rework.txt's explicit "let the disk do the work"
 // requirement and its ~600 MiB corpus estimate, is any converted
-// texture's RGBA32 payload: each one is written straight to a
-// disk-backed staging file the instant Texture2DConverter's handler
-// hands it over, consistent with that method's own MEMORY POSTURE
-// contract ("the handler must not retain result.rgba32Data past its
-// own invocation").
+// texture's RGBA32 payload: each one is written to a disk-backed
+// staging file within the same synchronous handler invocation
+// Texture2DConverter hands it to (never retained past that scope,
+// consistent with that method's own MEMORY POSTURE contract), and
+// only once this class has already built and validated the object's
+// rewritten tail - and is written straight back out (never rolled
+// back) unless the table-entry patch immediately following it fails,
+// in which case both the staging-file bytes and the CAB node append
+// for that one object are truncated back off before moving on. This
+// keeps a failed object's already-decoded pixels from ever riding
+// along into the final resS node unreferenced - see ReworkLog.md for
+// the bug this closes.
 
 #import <Foundation/Foundation.h>
 #import "Texture2DConverter.h"
@@ -122,7 +138,7 @@ typedef NS_ENUM(NSInteger, BundleTexture2DRetargeterErrorCode) {
     BundleTexture2DRetargeterErrorEnumerationFailed = 1,  // BundleTexture2DEnumerator itself failed - see the wrapped underlying error
     BundleTexture2DRetargeterErrorTargetPlatformUnknown,   // enumerator.targetPlatformKnown was NO - no structural basis to patch m_TargetPlatform, refused rather than guessed (see SerializedObjectTable.h)
     BundleTexture2DRetargeterErrorStagingFileFailed,        // couldn't create/open/write the disk-backed .resS staging file
-    BundleTexture2DRetargeterErrorObjectWouldGrow,          // see this header's "CAB NODE GROWTH IS SMALL" note - a converted object's rewritten bytes came out LARGER than its original span; refused rather than silently reflowing every later object in the node. Per-object, not fatal to the whole bundle - see -objectResults on the returned summary.
+    BundleTexture2DRetargeterErrorObjectWouldGrow,          // RETIRED - see this header's "CAB NODE GROWTH IS SMALL" note. Kept (unused) so this enum's later values don't renumber.
     BundleTexture2DRetargeterErrorTableEntryPatchFailed,    // -[SerializedObjectTable patchObject:...] itself returned NO for a converted object - see the wrapped underlying error. Per-object, not fatal.
     BundleTexture2DRetargeterErrorFinalWriteFailed,         // +[UnityBundleCAB writeArchiveStreamingToPath:...] failed producing the destination file - see the wrapped underlying error. Fatal to the whole call.
     BundleTexture2DRetargeterErrorHeaderFixupFailed,        // -[SerializedObjectTable growFileSizeBy:inNodeData:error:] failed after appending converted objects' tails - see the wrapped underlying error. Fatal to the whole call: leaving fileSize stale would make every relocated object's table entry fail a later re-parse's bounds check.

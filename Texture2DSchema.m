@@ -250,9 +250,9 @@ static BOOL zs_parse_texture2d(const uint8_t *base, NSUInteger len, ZSTexture2DI
         return NO;
     }
 
-    // m_StreamData - ALWAYS the final field, but still align4 after it
-    // (see this file's header comment / Texture2DSchemaErrorTrailingData
-    // below).
+    // m_StreamData - ALWAYS the final field. No align4 after this one;
+    // the schema simply ends here (see this file's header comment /
+    // Texture2DSchemaErrorTrailingData below).
     NSUInteger streamDataOffset = p;
     uint64_t streamOffset;
     uint32_t streamSize;
@@ -267,20 +267,6 @@ static BOOL zs_parse_texture2d(const uint8_t *base, NSUInteger len, ZSTexture2DI
     NSString *streamPath = nil;
     if (!t2s_read_lp_string(base, len, &p, &streamPath)) {
         if (error) *error = t2s_error(Texture2DSchemaErrorTruncated, @"m_StreamData.path ran past object end");
-        return NO;
-    }
-
-    // Even though m_StreamData.path is the object's last field, the
-    // object as a whole is still 4-byte aligned (same as every other
-    // string/byte-array field in this schema) - the object's total size
-    // is only guaranteed a multiple of 4 once this final padding is
-    // accounted for. Streamed textures almost always have a non-4-aligned
-    // path length (the "archive:/CAB-.../CAB-....resS" paths), which is
-    // exactly what was landing the cursor 1 byte short and tripping
-    // Texture2DSchemaErrorTrailingData below for those objects; inline
-    // (pathLen == 0) objects were unaffected since 0 is already aligned.
-    if (!t2s_align(len, &p)) {
-        if (error) *error = t2s_error(Texture2DSchemaErrorTruncated, @"align4 after m_StreamData.path ran past object end");
         return NO;
     }
 
