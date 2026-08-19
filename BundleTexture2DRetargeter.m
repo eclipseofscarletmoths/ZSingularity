@@ -194,6 +194,20 @@ static NSError *btr_error(BundleTexture2DRetargeterErrorCode code, NSString *rea
         btr_write_u32_le(tail, (uint32_t)newStreamPathUTF8.length); // m_StreamData.pathLen
         [tail appendData:newStreamPathUTF8];
 
+        // Texture2DSchema.m requires the object to end 4-byte aligned
+        // (align4 after m_StreamData.path, even though it's the last
+        // field - see that file's header comment). newStreamPathValue's
+        // length is almost never itself a multiple of 4, so pad the tail
+        // out to the same boundary the reader will expect, or every
+        // converted object here fails to reparse post-retarget with
+        // "align4 after m_StreamData.path ran past object end".
+        NSUInteger unpadded = tail.length;
+        NSUInteger padded = (unpadded + 3) & ~(NSUInteger)3;
+        if (padded > unpadded) {
+            uint8_t zero[3] = {0, 0, 0};
+            [tail appendBytes:zero length:(padded - unpadded)];
+        }
+
         if (tail.length > info.objectLength) {
             // See this file's header "CAB NODE GROWTH IS SMALL" note -
             // not expected against this project's real corpus, refused
