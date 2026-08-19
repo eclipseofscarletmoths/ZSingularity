@@ -387,6 +387,17 @@ static NSError *btr_error(BundleTexture2DRetargeterErrorCode code, NSString *rea
     for (UnityBundleNode *orig in enumerator.archive.nodes) {
         UnityBundleNode *n = [UnityBundleNode new];
         n.path = orig.path;
+        // Carry the ORIGINAL node's own flags forward unchanged - this
+        // rebuild never changes what kind of node something is (the CAB
+        // node is still a SerializedFile, the .resS node is still a raw
+        // resource file), only sizes/offsets. Previously this was
+        // dropped entirely and every node got hardcoded to 4
+        // (SerializedFile) by UnityBundleCAB's writer - wrong for the
+        // .resS node specifically, and the direct cause of the game's
+        // loader and UABEA both rejecting the output as corrupted. See
+        // UnityBundleCAB.h's doc on UnityBundleNode.flags and
+        // ReworkLog.md.
+        n.flags = orig.flags;
         if ([orig.path isEqualToString:cabName]) {
             n.size = (int64_t)mutableCAB.length;
         } else if ([orig.path isEqualToString:resSNodeName]) {
@@ -400,9 +411,14 @@ static NSError *btr_error(BundleTexture2DRetargeterErrorCode code, NSString *rea
         // This bundle had no .resS node at all before this pipeline ran
         // (every Texture2D was inline) - adding its first and only one
         // is fine; it's a SECOND node this pipeline must never add.
+        // flags = 0: a .resS node is raw resource bytes, never a
+        // SerializedFile - see UnityBundleCAB.h's doc on
+        // UnityBundleNode.flags. There's no "original" node to copy
+        // flags from here since this bundle never had one before.
         UnityBundleNode *resSNode = [UnityBundleNode new];
         resSNode.path = resSNodeName;
         resSNode.size = finalResSLength;
+        resSNode.flags = 0;
         [finalNodes addObject:resSNode];
     }
 

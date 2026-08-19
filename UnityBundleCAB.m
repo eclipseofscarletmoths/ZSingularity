@@ -320,9 +320,8 @@ static BOOL ubc_parse_blocks_info_full(NSData *blocksInfo,
         int64_t nOffset, nSize; uint32_t nFlags; NSString *path;
         if (!ubc_read_i64_be(&c, &nOffset) || !ubc_read_i64_be(&c, &nSize) ||
             !ubc_read_u32_be(&c, &nFlags) || !ubc_read_cstring(&c, &path)) goto malformed;
-        (void)nFlags;
         UnityBundleNode *node = [UnityBundleNode new];
-        node.path = path; node.offset = nOffset; node.size = nSize;
+        node.path = path; node.offset = nOffset; node.size = nSize; node.flags = nFlags;
         [outNodes addObject:node];
     }
     if (outNodes.count == 0) {
@@ -607,7 +606,11 @@ static NSFileHandle *ubc_open_temp_and_write_prefix(NSString *path, NSString *un
     for (UnityBundleNode *node in nodes) {
         ubc_append_i64_be(blocksInfo, node.offset);
         ubc_append_i64_be(blocksInfo, node.size);
-        ubc_append_u32_be(blocksInfo, 4); // node flags - 4 (kSerializedFile-ish) on every real sample seen; not verified beyond that
+        // Write back this node's OWN flags (0x04 = SerializedFile, 0x00 =
+        // raw resource/.resS/.resource) - see UnityBundleCAB.h's doc on
+        // UnityBundleNode.flags for why hardcoding 4 here was wrong for
+        // any bundle with more than one node.
+        ubc_append_u32_be(blocksInfo, node.flags);
         ubc_append_cstring(blocksInfo, node.path);
     }
 

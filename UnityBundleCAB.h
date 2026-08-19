@@ -83,6 +83,19 @@ typedef NS_ENUM(NSInteger, UnityBundleCABErrorCode) {
 @property (nonatomic, copy) NSString *path;   // e.g. @"CAB-...", or @"CAB-....resS"
 @property (nonatomic, assign) int64_t offset; // into the owning archive's .data
 @property (nonatomic, assign) int64_t size;
+// Directory-entry flags, as read from the archive's own blocks-info -
+// bit 0x04 is "this node is a SerializedFile" (Unity's loader, and
+// UABE/UABEA, parse a node with this bit set as a SerializedFile
+// header rather than raw bytes). A .resS/.resource node MUST NOT have
+// this bit set - it holds raw pixel/audio bytes, not a SerializedFile.
+// Previously this field was read and discarded ((void)nFlags in
+// UnityBundleCAB.m), and every write path hardcoded 4 for every node
+// regardless of type - harmless for a single-node (CAB-only) bundle,
+// which is all this project wrote until the Texture2D retarget
+// pipeline started producing bundles with a .resS node too, at which
+// point the mislabeled .resS node made the whole bundle unloadable/
+// "corrupted" (both in-game and in UABEA). See ReworkLog.md.
+@property (nonatomic, assign) uint32_t flags;
 @end
 
 // A UnityFS archive with every block actually decompressed, in node
