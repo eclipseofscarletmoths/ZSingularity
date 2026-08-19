@@ -250,9 +250,16 @@ static BOOL zs_parse_texture2d(const uint8_t *base, NSUInteger len, ZSTexture2DI
         return NO;
     }
 
-    // m_StreamData - ALWAYS the final field. No align4 after this one;
-    // the schema simply ends here (see this file's header comment /
-    // Texture2DSchemaErrorTrailingData below).
+    // m_StreamData - the final field, but its path string still gets the
+    // standard align4 every other string in this schema gets: a
+    // SerializedFile pads each object's data to a 4-byte boundary, and
+    // that padding lands right here since m_StreamData.path is the last
+    // thing in the object. (Previously assumed to need no trailing
+    // align - that was the direct cause of the 1-byte cursor shortfall
+    // that surfaced as Texture2DSchemaErrorTrailingData on nearly every
+    // streamed-data Texture2D: p landed one byte short of a 4-aligned
+    // len for any object whose pre-alignment cursor wasn't already a
+    // multiple of 4.)
     NSUInteger streamDataOffset = p;
     uint64_t streamOffset;
     uint32_t streamSize;
@@ -267,6 +274,10 @@ static BOOL zs_parse_texture2d(const uint8_t *base, NSUInteger len, ZSTexture2DI
     NSString *streamPath = nil;
     if (!t2s_read_lp_string(base, len, &p, &streamPath)) {
         if (error) *error = t2s_error(Texture2DSchemaErrorTruncated, @"m_StreamData.path ran past object end");
+        return NO;
+    }
+    if (!t2s_align(len, &p)) {
+        if (error) *error = t2s_error(Texture2DSchemaErrorTruncated, @"align4 after m_StreamData.path ran past object end");
         return NO;
     }
 
