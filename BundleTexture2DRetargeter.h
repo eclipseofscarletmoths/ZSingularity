@@ -15,44 +15,62 @@
 // converted Texture2D's format/completeImageSize/mipCount/StreamingInfo
 // patched, and a brand-new UnityFS file written out.
 //
+// SINGLE-.resS INVARIANT: a Unity bundle asset may contain at most ONE
+// .resS node - this is a hard format constraint, not a style choice.
+// An earlier version of this class ignored that and always created a
+// second, pipeline-owned node ("CAB-<hash>.zsingularity-rgba32.resS")
+// for every converted texture's RGBA32 bytes, alongside whatever
+// pre-existing .resS node the source bundle already had. That produced
+// a bundle with two .resS nodes, which the mobile client's own UnityFS
+// loader refuses to load at all - not a per-object failure, a
+// whole-bundle one. See ReworkLog.md for the write-up. This class now
+// always writes AT MOST one .resS node.
+//
 // STORAGE DECISION (Rework.txt: "Recommended storage decision: keep
 // converted textures streamed"): every converted texture's RGBA32
 // bytes - whether the SOURCE was inline or already streamed - go into
-// ONE new node this class creates, never into the bundle's existing
-// CAB node body and never by growing/touching any pre-existing .resS
-// node. Concretely, for the bundle's primary CAB node named
-// "CAB-<hash>", the new node is named "CAB-<hash>.zsingularity-rgba32.resS"
-// and each converted object's m_StreamData.path is rewritten to
-// "archive:/CAB-<hash>/CAB-<hash>.zsingularity-rgba32.resS" - the same
+// THE bundle's one .resS node: whichever one already exists (identified
+// the same way BundleTexture2DEnumerator.h's own
+// -sourcePixelBytesForObject:error: resolves it for reading - an
+// already-streamed object's own streamPath, trailing path component),
+// or, only if the bundle has no streamed textures at all yet, a
+// freshly-created one named "CAB-<hash>.resS" per Unity's own
+// convention. Each converted object's m_StreamData.path is rewritten to
+// "archive:/CAB-<hash>/<that node's name>" - the same
 // archive:/<cabName>/<resSNodeName> shape BundleTexture2DEnumerator.h
 // already documents Unity itself uses, and streamOffset is relative to
-// the START of that new node's own bytes, same convention that file's
+// the START of that node's own bytes, same convention that file's
 // -sourcePixelBytesForObject:error: already assumes for READING (see
 // its own "not yet cross-validated" caveat - still true here, this
 // class inherits the same open assumption for the bytes it WRITES).
-// Any pre-existing .resS node in the source bundle is left completely
-// untouched, byte-for-byte, and copied through - it's still exactly
-// what any object this pipeline did NOT convert (ASTC/RGBA32-native,
-// or one whose conversion failed and was left alone) still points at.
 //
-// WHY A NEW NODE INSTEAD OF GROWING/REUSING THE EXISTING ONE: appending
-// to (or replacing) an existing .resS node would mean that node's own
-// final size isn't known until every conversion has run, which would
-// force computing every OTHER node's final offset before any of them
-// could be written - i.e. exactly the whole-archive reflow Rework.txt's
-// "Bundle writer redesign" is trying to avoid. A brand-new,
-// pipeline-owned node sidesteps that: its size is just "however many
-// bytes got staged," nothing else in the archive needs to move because
-// of it, and +[UnityBundleCAB writeArchiveStreamingToPath:...
-// cabNodePath:baseCABData:appendFilePath:...] (already built, see that
-// method's own header comment - unused until this file) already knows
-// how to write exactly one such disk-backed composite node without
-// holding it in RAM. This class reuses that method as-is, with the
-// composite role assigned to the NEW resS node (not, despite the
-// method's parameter name, the actual "CAB"/SerializedFile node) -
-// see this file's .m for why that node doesn't need the same
-// treatment (its own growth, unlike a bundle's pixel data, is tiny -
-// see "CAB NODE GROWTH IS SMALL" below).
+// HOW THE EXISTING NODE IS REUSED WITHOUT A WHOLE-ARCHIVE REFLOW: the
+// node's final bytes are [the existing node's bytes, verbatim] +
+// [every converted texture's RGBA32 payload, appended] - never a
+// from-scratch rebuild. This matters because any OTHER Texture2D in the
+// bundle that's still streamed from this node (RGBA32/ASTC-native
+// objects that never needed conversion, or one whose conversion failed
+// and was left alone) keeps pointing at its original, untouched offset
+// - its StreamingInfo is never patched, so the bytes it points at have
+// to still be there. A converted object's OLD bytes inside that base
+// region become dead space once its own StreamingInfo is repointed past
+// the end of it (into the appended tail) - wasted, not wrong, the same
+// "append, never reflow" posture this file already uses for the CAB
+// node itself (see "CAB NODE GROWTH IS SMALL" below). Because the base
+// bytes are reused verbatim, the node's final size is knowable up front
+// (existing length + however many bytes get staged) without waiting for
+// every conversion to finish, so no other node's offset has to move
+// because of it either - same property the old two-node design was
+// after, without the second node.
+// +[UnityBundleCAB writeArchiveStreamingToPath:...
+// cabNodePath:baseCABData:appendFilePath:...] (see that method's own
+// header comment) already knows how to write exactly one such
+// [base][append] composite node without holding it in RAM - this class
+// reuses that method as-is, with the composite role assigned to the
+// resS node (not, despite the method's parameter name, the actual
+// "CAB"/SerializedFile node) - baseCABData is the existing node's bytes
+// (or empty, if none existed), appendFilePath is the disk-backed
+// staging file of newly-converted RGBA32 bytes.
 //
 // CAB NODE GROWTH IS SMALL: a converted object's own bytes inside the
 // CAB node do NOT grow by anything close to its pixel payload size -
@@ -169,8 +187,8 @@ typedef NS_ENUM(NSInteger, BundleTexture2DRetargeterErrorCode) {
 @property (nonatomic, assign) NSInteger failedCount;      // decision == Required or Unsupported but .error is set - left unchanged despite needing conversion
 @property (nonatomic, assign) int32_t originalTargetPlatform;  // m_TargetPlatform as read before patching (e.g. 19)
 @property (nonatomic, assign) int32_t newTargetPlatform;        // always 9 (iOS) on a non-nil summary
-@property (nonatomic, copy) NSString *resSNodeName;              // the new node's own name, e.g. "CAB-<hash>.zsingularity-rgba32.resS" - not currently needed by any caller, kept for logging
-@property (nonatomic, assign) int64_t resSNodeByteLength;        // total bytes staged into that new node
+@property (nonatomic, copy) NSString *resSNodeName;              // the bundle's one .resS node's name, e.g. "CAB-<hash>.resS" - reused if it already existed, otherwise newly created; not currently needed by any caller, kept for logging
+@property (nonatomic, assign) int64_t resSNodeByteLength;        // that node's FINAL total size (preserved pre-existing bytes + newly-staged converted bytes) - not just what this run appended
 @end
 
 @interface BundleTexture2DRetargeter : NSObject

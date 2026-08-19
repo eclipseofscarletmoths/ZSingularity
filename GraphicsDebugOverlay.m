@@ -3632,7 +3632,9 @@ static void * const kGDModsPickerKindKey = (void *)&kGDModsPickerKindKey;
 //   1. BundleTexture2DRetargeter (Layer D) reads the picked bundle and
 //      writes a retargeted copy to a scratch path: m_TargetPlatform
 //      19 -> 9, every DXT1/DXT5/DXT5Crunched/RGB24 Texture2D decoded to
-//      RGBA32 and streamed into a new disk-backed .resS node, RGBA32/
+//      RGBA32 and streamed into the bundle's one disk-backed .resS node
+//      (reused if it already had one, since a bundle can only have one -
+//      see BundleTexture2DRetargeter.h's SINGLE-.resS INVARIANT), RGBA32/
 //      ASTC 4x4/ASTC 6x6 objects left untouched. A nil summary here
 //      means a WHOLE-BUNDLE-level failure (see
 //      BundleTexture2DRetargeterErrorCode) - nothing was written, so
@@ -3745,7 +3747,7 @@ static void * const kGDModsPickerKindKey = (void *)&kGDModsPickerKindKey;
     // step that actually writes into the game's own cache. Matching is
     // by the retargeted bundle's own primary CAB node name, which
     // BundleTexture2DRetargeter never renames (see its header's storage
-    // decision - only a brand-new *.resS node is added), so this still
+    // decision - only its one .resS node's bytes change), so this still
     // matches whatever cached __data the ORIGINAL desktop bundle would
     // have matched.
     NSError *swapErr = nil;

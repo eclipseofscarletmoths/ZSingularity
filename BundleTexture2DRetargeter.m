@@ -108,13 +108,53 @@ static NSError *btr_error(BundleTexture2DRetargeterErrorCode code, NSString *rea
     }
 
     NSString *cabName = enumerator.archive.nodes.firstObject.path;
-    NSString *resSNodeName = [NSString stringWithFormat:@"%@.zsingularity-rgba32.resS", cabName];
+
+    // A Unity bundle may only contain ONE .resS node - see this file's
+    // header note ("SINGLE-.resS INVARIANT"). Reuse whichever one is
+    // already there, identified the same way BundleTexture2DEnumerator
+    // itself resolves it for READING (an already-streamed object's own
+    // streamPath, trailing path component) - not a name this class
+    // invents. Only if the bundle has no streamed textures at all yet
+    // (every Texture2D currently inline) is there no existing node to
+    // find, in which case this is the first and only .resS node this
+    // bundle will have, named per Unity's own convention.
+    NSString *existingResSNodeName = nil;
+    for (ZSTexture2DEnumeratedObject *obj in enumerator.texture2DObjects) {
+        NSString *candidate = obj.info.streamPath.lastPathComponent;
+        if (obj.info.hasStreamData && candidate.length > 0) {
+            existingResSNodeName = candidate;
+            break;
+        }
+    }
+    NSString *resSNodeName = existingResSNodeName ?: [NSString stringWithFormat:@"%@.resS", cabName];
     NSString *newStreamPathValue = [NSString stringWithFormat:@"archive:/%@/%@", cabName, resSNodeName];
     NSData *newStreamPathUTF8 = [newStreamPathValue dataUsingEncoding:NSUTF8StringEncoding];
 
+    UnityBundleNode *existingResSNode = nil;
+    for (UnityBundleNode *n in enumerator.archive.nodes) {
+        if ([n.path isEqualToString:resSNodeName]) { existingResSNode = n; break; }
+    }
+    // Every byte this bundle's OTHER (unconverted) streamed objects still
+    // point into - RGBA32/ASTC-native textures, or any that failed
+    // conversion and were left alone - has to survive this rewrite
+    // untouched, at its ORIGINAL offset, since their StreamingInfo isn't
+    // being patched. So the new node is built as [old bytes, verbatim]
+    // + [newly-converted RGBA32 payloads, appended] rather than a fresh
+    // buffer - the same "append, never reflow" posture this file already
+    // uses for the CAB node itself (see "CAB NODE GROWTH IS SMALL"
+    // above). A converted object's OLD (pre-conversion) bytes inside
+    // this base slice become dead space once its StreamingInfo is
+    // repointed past the end of it - wasted, not wrong, same as every
+    // other relocation in this file.
+    NSData *existingResSBytes = existingResSNode
+        ? [enumerator.archive.data subdataWithRange:NSMakeRange((NSUInteger)existingResSNode.offset, (NSUInteger)existingResSNode.size)]
+        : [NSData data];
+    int64_t existingResSLength = (int64_t)existingResSBytes.length;
+
     // Disk-backed staging file for every converted texture's RGBA32
-    // bytes - see this file's header note on why this is a brand-new
-    // node rather than growing an existing one.
+    // bytes - holds ONLY the newly-appended tail; existingResSBytes
+    // above (already memory-mapped, not copied here) supplies whatever
+    // precedes it in the final node. See this file's header note.
     NSString *stagingPath = [NSTemporaryDirectory() stringByAppendingPathComponent:
                               [NSString stringWithFormat:@"zsingularity-retarget-%@.resS.tmp", [[NSUUID UUID] UUIDString]]];
     if (![NSFileManager.defaultManager createFileAtPath:stagingPath contents:nil attributes:nil]) {
@@ -187,15 +227,16 @@ static NSError *btr_error(BundleTexture2DRetargeterErrorCode code, NSString *rea
         // Everything up to (not including) the image-data length field,
         // verbatim; then a fresh zero length (dropping any old inline
         // payload); then a brand-new StreamingInfo pointing at where
-        // this object's bytes WILL land in the staging file once
-        // actually written (thisStreamOffset == stagingWriteOffset as it
-        // stands right now - nothing has been appended to the staging
-        // file for this object yet). Field offsets before
+        // this object's bytes WILL land in the FINAL resS node once
+        // actually written - existingResSLength (the untouched base
+        // this node is built on) plus stagingWriteOffset (bytes already
+        // appended to the staging file ahead of this object; nothing
+        // has been appended for THIS object yet). Field offsets before
         // imageDataLengthFieldOffset - including formatOffset/
         // completeImageSizeOffset/mipCountOffset - are patched in place
         // within this SAME leading slice before it's used, since they're
         // copied from the object's ORIGINAL bytes.
-        int64_t thisStreamOffset = stagingWriteOffset;
+        int64_t thisStreamOffset = existingResSLength + stagingWriteOffset;
         NSUInteger objBase = obj.cabAbsoluteOffset;
         NSMutableData *tail = [[enumerator.cabNodeData subdataWithRange:
                                  NSMakeRange(objBase, info.imageDataLengthFieldOffset)] mutableCopy];
@@ -341,17 +382,29 @@ static NSError *btr_error(BundleTexture2DRetargeterErrorCode code, NSString *rea
         m;
     });
 
+    int64_t finalResSLength = existingResSLength + stagingWriteOffset;
     NSMutableArray<UnityBundleNode *> *finalNodes = [NSMutableArray array];
     for (UnityBundleNode *orig in enumerator.archive.nodes) {
         UnityBundleNode *n = [UnityBundleNode new];
         n.path = orig.path;
-        n.size = [orig.path isEqualToString:cabName] ? (int64_t)mutableCAB.length : orig.size;
+        if ([orig.path isEqualToString:cabName]) {
+            n.size = (int64_t)mutableCAB.length;
+        } else if ([orig.path isEqualToString:resSNodeName]) {
+            n.size = finalResSLength;
+        } else {
+            n.size = orig.size;
+        }
         [finalNodes addObject:n]; // .offset filled in below, once every node's final size is known
     }
-    UnityBundleNode *resSNode = [UnityBundleNode new];
-    resSNode.path = resSNodeName;
-    resSNode.size = stagingWriteOffset;
-    [finalNodes addObject:resSNode];
+    if (!existingResSNode) {
+        // This bundle had no .resS node at all before this pipeline ran
+        // (every Texture2D was inline) - adding its first and only one
+        // is fine; it's a SECOND node this pipeline must never add.
+        UnityBundleNode *resSNode = [UnityBundleNode new];
+        resSNode.path = resSNodeName;
+        resSNode.size = finalResSLength;
+        [finalNodes addObject:resSNode];
+    }
 
     int64_t running = 0;
     for (UnityBundleNode *n in finalNodes) {
@@ -365,7 +418,7 @@ static NSError *btr_error(BundleTexture2DRetargeterErrorCode code, NSString *rea
                                              unityRevision:enumerator.archive.unityRevision
                                                      nodes:finalNodes
                                                cabNodePath:resSNodeName
-                                               baseCABData:[NSData data]
+                                               baseCABData:existingResSBytes
                                             appendFilePath:stagingPath
                                               appendLength:stagingWriteOffset
                                            nodeDataAtIndex:^NSData * _Nullable(NSUInteger index) {
@@ -392,7 +445,7 @@ static NSError *btr_error(BundleTexture2DRetargeterErrorCode code, NSString *rea
     summary.originalTargetPlatform = originalTargetPlatform;
     summary.newTargetPlatform = 9;
     summary.resSNodeName = resSNodeName;
-    summary.resSNodeByteLength = stagingWriteOffset;
+    summary.resSNodeByteLength = finalResSLength; // whole node's final size - preserved base + newly-appended bytes, not just the appended part
     return summary;
 }
 
