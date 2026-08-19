@@ -44,11 +44,14 @@ static NSError *bte_error(BundleTexture2DEnumeratorErrorCode code, NSString *rea
     NSError *archiveError = nil;
     UnityBundleArchive *archive = [UnityBundleCAB decompressedArchiveAtPath:path error:&archiveError];
     if (!archive) {
+        ZLog(@"[BundleTexture2DEnumerator] enumeratorForBundleAtPath: %@: decompression failed - %@ (underlying: %@)",
+             path, archiveError.localizedDescription ?: @"(no detail)", archiveError.userInfo[NSUnderlyingErrorKey] ?: @"none");
         if (error) *error = bte_error(BundleTexture2DEnumeratorErrorArchiveFailed,
             [NSString stringWithFormat:@"couldn't decompress bundle at %@", path], archiveError);
         return nil;
     }
     if (archive.nodes.count == 0) {
+        ZLog(@"[BundleTexture2DEnumerator] enumeratorForBundleAtPath: %@: archive reported zero nodes", path);
         if (error) *error = bte_error(BundleTexture2DEnumeratorErrorNoPrimaryNode, @"archive reported zero nodes", nil);
         return nil;
     }
@@ -58,6 +61,8 @@ static NSError *bte_error(BundleTexture2DEnumeratorErrorCode code, NSString *rea
     UnityBundleNode *cabNode = archive.nodes[0];
     if (cabNode.offset < 0 || cabNode.size < 0 ||
         (uint64_t)cabNode.offset + (uint64_t)cabNode.size > archive.data.length) {
+        ZLog(@"[BundleTexture2DEnumerator] enumeratorForBundleAtPath: %@: primary node \"%@\" range [%lld, %lld) doesn't fit inside %lu-byte archive data",
+             path, cabNode.path, cabNode.offset, cabNode.offset + cabNode.size, (unsigned long)archive.data.length);
         if (error) *error = bte_error(BundleTexture2DEnumeratorErrorNoPrimaryNode,
             [NSString stringWithFormat:@"primary node \"%@\" range [%lld, %lld) doesn't fit inside %lu-byte archive data",
                 cabNode.path, cabNode.offset, cabNode.offset + cabNode.size, (unsigned long)archive.data.length], nil);
@@ -68,6 +73,8 @@ static NSError *bte_error(BundleTexture2DEnumeratorErrorCode code, NSString *rea
     NSError *tableError = nil;
     SerializedObjectTable *table = [SerializedObjectTable tableForSerializedFileNodeData:cabNodeData error:&tableError];
     if (!table) {
+        ZLog(@"[BundleTexture2DEnumerator] enumeratorForBundleAtPath: %@: object table parse failed in primary node \"%@\" - %@",
+             path, cabNode.path, tableError.localizedDescription ?: @"(no detail)");
         if (error) *error = bte_error(BundleTexture2DEnumeratorErrorObjectTableFailed,
             [NSString stringWithFormat:@"couldn't parse object table in primary node \"%@\"", cabNode.path], tableError);
         return nil;
@@ -77,6 +84,8 @@ static NSError *bte_error(BundleTexture2DEnumeratorErrorCode code, NSString *rea
         // else in this file's object table - see the error code's own
         // doc and SerializedObjectTable.h's note on the byte-scan
         // fallback. Refuse rather than guess by raw typeID.
+        ZLog(@"[BundleTexture2DEnumerator] enumeratorForBundleAtPath: %@: class IDs unresolved for \"%@\" - object table was located via byte-scan fallback, not the Types-array walk",
+             path, cabNode.path);
         if (error) *error = bte_error(BundleTexture2DEnumeratorErrorClassIDsUnresolved,
             [NSString stringWithFormat:@"class IDs unresolved for \"%@\" - object table was located via byte-scan fallback, not the Types-array walk", cabNode.path], nil);
         return nil;
