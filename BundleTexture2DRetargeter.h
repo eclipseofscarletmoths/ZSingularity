@@ -125,6 +125,7 @@ typedef NS_ENUM(NSInteger, BundleTexture2DRetargeterErrorCode) {
     BundleTexture2DRetargeterErrorObjectWouldGrow,          // see this header's "CAB NODE GROWTH IS SMALL" note - a converted object's rewritten bytes came out LARGER than its original span; refused rather than silently reflowing every later object in the node. Per-object, not fatal to the whole bundle - see -objectResults on the returned summary.
     BundleTexture2DRetargeterErrorTableEntryPatchFailed,    // -[SerializedObjectTable patchObject:...] itself returned NO for a converted object - see the wrapped underlying error. Per-object, not fatal.
     BundleTexture2DRetargeterErrorFinalWriteFailed,         // +[UnityBundleCAB writeArchiveStreamingToPath:...] failed producing the destination file - see the wrapped underlying error. Fatal to the whole call.
+    BundleTexture2DRetargeterErrorHeaderFixupFailed,        // -[SerializedObjectTable growFileSizeBy:inNodeData:error:] failed after appending converted objects' tails - see the wrapped underlying error. Fatal to the whole call: leaving fileSize stale would make every relocated object's table entry fail a later re-parse's bounds check.
 };
 
 // One Texture2D object's outcome, reported per-object for the same

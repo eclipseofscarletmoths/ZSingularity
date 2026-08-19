@@ -117,6 +117,13 @@ static NSError *btr_error(BundleTexture2DRetargeterErrorCode code, NSString *rea
     __block int64_t stagingWriteOffset = 0;
     NSMutableArray<ZSTexture2DRetargetObjectResult *> *objectResults = [NSMutableArray array];
     __block NSInteger convertedCount = 0, unchangedCount = 0, failedCount = 0;
+    // Total bytes appended to mutableCAB across every converted object's
+    // relocated tail this loop - -[SerializedObjectTable patchObject:...]
+    // only rewrites one entry's byteStart/byteSize, it has no visibility
+    // into how much the buffer grew overall, so that bookkeeping has to
+    // happen here and get applied once after the loop (see the
+    // growFileSizeBy: call below and SerializedObjectTable.h's doc on it).
+    __block uint64_t totalTailBytesAppended = 0;
 
     // Objects the enumerator itself couldn't parse - reported as
     // unchanged (nothing this class could have converted), not
@@ -200,6 +207,7 @@ static NSError *btr_error(BundleTexture2DRetargeterErrorCode code, NSString *rea
 
         int64_t newByteStartAbs = (int64_t)mutableCAB.length;
         [mutableCAB appendData:tail];
+        totalTailBytesAppended += tail.length;
 
         int64_t newByteStartRelative = newByteStartAbs - enumerator.objectTable.dataOffset;
         NSError *patchErr = nil;
@@ -230,6 +238,22 @@ static NSError *btr_error(BundleTexture2DRetargeterErrorCode code, NSString *rea
     // BundleTexture2DRetargeterErrorTargetPlatformUnknown guard above.
     int32_t originalTargetPlatform = enumerator.targetPlatform;
     btr_patch_i32_le(mutableCAB, (NSUInteger)enumerator.objectTable.targetPlatformFieldOffset, 9);
+
+    // Fix up the SerializedFile header's fileSize field to account for
+    // every converted object's tail appended above - see
+    // SerializedObjectTable.h's doc on growFileSizeBy: for why skipping
+    // this breaks every later re-parse of this node (root-caused in
+    // findings.md: the stale fileSize makes sot_decode_entry's bounds
+    // check reject every relocated object's table entry, which truncates
+    // the whole object-table walk at the first such entry instead of
+    // just that one). Must happen before UnityBundleCAB packages
+    // mutableCAB below.
+    NSError *fixupErr = nil;
+    if (![enumerator.objectTable growFileSizeBy:totalTailBytesAppended inNodeData:mutableCAB error:&fixupErr]) {
+        if (error) *error = btr_error(BundleTexture2DRetargeterErrorHeaderFixupFailed, @"fileSize header fixup failed after appending converted object tails", fixupErr);
+        [NSFileManager.defaultManager removeItemAtPath:stagingPath error:nil];
+        return nil;
+    }
 
     NSDictionary<NSString *, UnityBundleNode *> *origNodesByPath = ({
         NSMutableDictionary *m = [NSMutableDictionary dictionary];

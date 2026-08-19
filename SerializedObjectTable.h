@@ -188,6 +188,32 @@ typedef NS_ENUM(NSInteger, SerializedObjectTableErrorCode) {
           inNodeData:(NSMutableData *)nodeData
                error:(NSError **)error;
 
+// Grows the SerializedFile header's fileSize field (BE u64) by `delta`
+// bytes - call this once a caller has appended `delta` bytes of new
+// object payload data past the end of the node's existing bytes (e.g.
+// -patchObject:...'s caller relocating one or more objects' bytes to a
+// newly-appended tail; -patchObject:... itself only rewrites the 24-byte
+// table entry and has no idea how much the buffer grew overall).
+//
+// Without this, a later -tableForSerializedFileNodeData: re-parse of the
+// same nodeData reads the STALE (too-small) fileSize, and
+// sot_decode_entry's bounds check (byteStart+byteSize > fileSize-dataOffset)
+// rejects every entry whose byteStart now points into the appended
+// region - i.e. every object patchObject: relocated. Since the table
+// decoder stops at the first entry that fails to decode rather than
+// skipping it, this truncates the whole walk partway through instead of
+// just misreading the relocated entries.
+//
+// Does NOT touch metadataSize or dataOffset - unlike -insertObjects:...
+// (which inserts INTO the table and shifts everything structurally after
+// it, including where the data region starts), a pure append past the
+// existing data region moves neither the table nor the start of the data
+// region, only the file's own total length. nodeData must be the same
+// buffer this table was parsed from. Safe/no-op if delta is 0.
+- (BOOL)growFileSizeBy:(uint64_t)delta
+             inNodeData:(NSMutableData *)nodeData
+                  error:(NSError **)error;
+
 // Adds brand-new entries to the object table - the capability
 // TextureAtlasTransplant.h's own header used to rule out ("never invent
 // new PathIDs") because it depends on knowing exactly where m_ObjectCount

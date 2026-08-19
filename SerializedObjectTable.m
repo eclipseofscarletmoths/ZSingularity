@@ -603,6 +603,19 @@ static NSArray<SerializedObject *> *sot_decode_table_near(NSData *nodeData, cons
     return YES;
 }
 
+- (BOOL)growFileSizeBy:(uint64_t)delta
+             inNodeData:(NSMutableData *)nodeData
+                  error:(NSError **)error {
+    if (delta == 0) return YES; // nothing appended, nothing to fix up
+    if (kSOTFieldFileSize + 8 > nodeData.length) {
+        if (error) *error = [NSError errorWithDomain:SerializedObjectTableErrorDomain code:SOTErrorTooSmall userInfo:nil];
+        return NO;
+    }
+    uint64_t oldFileSize = sot_read_u64_be_public(nodeData, kSOTFieldFileSize);
+    sot_write_u64_be(nodeData, kSOTFieldFileSize, oldFileSize + delta);
+    return YES;
+}
+
 #pragma mark - insertion method (helpers above, outside this @implementation - see top note)
 
 - (BOOL)insertObjects:(NSArray<SerializedObject *> *)newObjects
