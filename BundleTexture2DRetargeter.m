@@ -157,6 +157,9 @@ static NSError *btr_error(BundleTexture2DRetargeterErrorCode code, NSString *rea
         if (result.error || !result.rgba32Data) {
             r.error = result.error ?: btr_error(BundleTexture2DRetargeterErrorTableEntryPatchFailed, @"conversion required but no data produced", nil);
             failedCount++;
+            ZLogVerbose(@"[BundleTexture2DRetargeter]   pathID %lld: FAILED before staging - %@ (%@)",
+                        obj.pathID, r.error.localizedDescription ?: @"(no detail)",
+                        r.error.userInfo[NSUnderlyingErrorKey] ?: @"no underlying error");
             return; // fail closed - object left exactly as it was, per Rework.txt's Layer C table
         }
 
@@ -222,6 +225,9 @@ static NSError *btr_error(BundleTexture2DRetargeterErrorCode code, NSString *rea
         } @catch (NSException *exc) {
             r.error = btr_error(BundleTexture2DRetargeterErrorStagingFileFailed, exc.reason ?: @"staging write failed", nil);
             failedCount++;
+            ZLogVerbose(@"[BundleTexture2DRetargeter]   pathID %lld: FAILED staging write (%lu RGBA32 bytes @ offset %lld) - %@ %@",
+                        obj.pathID, (unsigned long)rgba32.length, thisStreamOffset,
+                        exc.name, exc.reason ?: @"(no reason)");
             return; // nothing written that stagingWriteOffset doesn't already account for - safe to just return
         }
         stagingWriteOffset += (int64_t)rgba32.length;
@@ -253,10 +259,17 @@ static NSError *btr_error(BundleTexture2DRetargeterErrorCode code, NSString *rea
                 r.error = btr_error(BundleTexture2DRetargeterErrorStagingFileFailed,
                                      exc.reason ?: @"staging file rollback failed after table patch failure", nil);
                 failedCount++;
+                ZLogVerbose(@"[BundleTexture2DRetargeter]   pathID %lld: FAILED staging rollback after table patch failure - %@ %@ (original patch error: %@)",
+                            obj.pathID, exc.name, exc.reason ?: @"(no reason)",
+                            patchErr.localizedDescription ?: @"(no detail)");
                 return;
             }
             r.error = btr_error(BundleTexture2DRetargeterErrorTableEntryPatchFailed, @"table entry patch failed", patchErr);
             failedCount++;
+            ZLogVerbose(@"[BundleTexture2DRetargeter]   pathID %lld: FAILED table entry patch - tableOffset=%lu newByteStart=%lld(rel) %lld(abs) newByteSize=%lu mutableCAB.length=%lu dataOffset=%lld - %@",
+                        obj.pathID, (unsigned long)obj.tableEntry.tableOffset, newByteStartRelative, newByteStartAbs,
+                        (unsigned long)tail.length, (unsigned long)mutableCAB.length, enumerator.objectTable.dataOffset,
+                        patchErr.localizedDescription ?: @"(no detail)");
             return;
         }
 
@@ -270,6 +283,17 @@ static NSError *btr_error(BundleTexture2DRetargeterErrorCode code, NSString *rea
     if (failedCount > 0) {
         ZLog(@"[BundleTexture2DRetargeter] %ld/%lu Texture2D objects failed conversion and were left unchanged - see returned summary",
              (long)failedCount, (unsigned long)enumerator.texture2DObjects.count);
+        // Roll call of exactly which pathIDs failed and why - the
+        // per-object ZLogVerbose calls above this point already cover
+        // each failure as it happens, but this collects them in one
+        // place at the tail of the run so `failedCount > 0` on its own
+        // (i.e. even in a non-Verbose Syslog capture) is enough to know
+        // WHICH objects to go look at, not just how many.
+        for (ZSTexture2DRetargetObjectResult *r in objectResults) {
+            if (!r.error) continue;
+            ZLog(@"[BundleTexture2DRetargeter]   FAILED pathID %lld (%@): %@",
+                 r.pathID, r.name ?: @"?", r.error.localizedDescription ?: @"(no detail)");
+        }
     }
 
     // m_TargetPlatform: 19 (StandaloneWindows64) -> 9 (iOS), in place,

@@ -591,7 +591,13 @@ static NSArray<SerializedObject *> *sot_decode_table_near(NSData *nodeData, cons
           inNodeData:(NSMutableData *)nodeData
                error:(NSError **)error {
     if (object.tableOffset + 24 > nodeData.length) {
-        if (error) *error = [NSError errorWithDomain:SerializedObjectTableErrorDomain code:SOTErrorTooSmall userInfo:nil];
+        NSString *reason = [NSString stringWithFormat:
+            @"pathID %lld: tableOffset %lu + 24 > nodeData.length %lu",
+            object.pathID, (unsigned long)object.tableOffset, (unsigned long)nodeData.length];
+        if (error) *error = [NSError errorWithDomain:SerializedObjectTableErrorDomain
+                                                  code:SOTErrorTooSmall
+                                              userInfo:@{NSLocalizedDescriptionKey: reason}];
+        ZLogVerbose(@"[SerializedObjectTable]   patchObject pathID %lld: REFUSED - %@", object.pathID, reason);
         return NO;
     }
     uint8_t *p = (uint8_t *)nodeData.mutableBytes + object.tableOffset;
