@@ -38,7 +38,8 @@
 //   m_ColorSpace                 int32
 //   m_PlatformBlob               byte array (len-prefixed), align4
 //   image data                   byte array (len-prefixed), align4
-//   m_StreamData                 StreamingInfo - ALWAYS the final field:
+//   m_StreamData                 StreamingInfo - ALWAYS the final field,
+//                                 align4 (see note below):
 //                                   offset  uint64
 //                                   size    uint32
 //                                   pathLen uint32
@@ -51,12 +52,22 @@
 // why a bounded search around the expected value would be a strictly
 // worse parser even though it can appear to "fix" the same symptom.
 //
-// m_StreamData is required to be the object's last field: after parsing
-// its path, the cursor must land EXACTLY on the object's end. Any
-// leftover or missing bytes there means this schema doesn't match what
-// was actually parsed (wrong object range from the caller, or a build
-// this schema doesn't apply to) and the whole parse is rejected rather
-// than silently accepted - see Texture2DSchemaErrorTrailingData below.
+// Being the object's last field doesn't exempt m_StreamData.path from
+// alignment: the object as a whole is still 4-byte aligned, so the
+// cursor is aligned once more after the path bytes, same as after every
+// other string/byte-array field in this schema. Streamed textures'
+// "archive:/CAB-.../CAB-....resS" paths are almost never a multiple of
+// 4 bytes long, so skipping this align4 previously left the cursor 1
+// byte short for most streamed objects (inline objects, with pathLen
+// == 0, were unaffected).
+//
+// m_StreamData is required to be the object's last field: after that
+// final alignment, the cursor must land EXACTLY on the object's end.
+// Any leftover or missing bytes there means this schema doesn't match
+// what was actually parsed (wrong object range from the caller, or a
+// build this schema doesn't apply to) and the whole parse is rejected
+// rather than silently accepted - see Texture2DSchemaErrorTrailingData
+// below.
 //
 // WHAT THIS FILE DOES NOT DO: decode pixels (Texture2DPixelDecoder.h /
 // CrunchTextureDecoder.h - Layer C), read bytes out of a bundle/archive
