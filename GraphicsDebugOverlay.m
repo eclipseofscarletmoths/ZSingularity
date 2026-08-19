@@ -2155,6 +2155,49 @@ static NSString *gd_format_github_repo_link(NSString *owner, NSString *name) {
     return [NSString stringWithFormat:@"%@/%@", owner, name];
 }
 
+// Strips a redundant leading HTTP auth scheme ("Bearer " or "token ",
+// GitHub accepts either for a classic PAT) from whatever was typed or
+// pasted into the Personal Access Token field, case-insensitively.
+// +[BundleDoctorService bds_requestForPath:config:] always adds its own
+// "Bearer " prefix when it builds the Authorization header - a token
+// saved with one already on it (someone pasting a full curl -H
+// "Authorization: Bearer ghp_xxx" line, or just typing "Bearer" out of
+// habit, is an easy mistake) would otherwise round-trip into a literal
+// "Bearer Bearer ghp_xxx" header, which GitHub rejects as bad
+// credentials. Only ever strips ONE such prefix - if that leaves
+// something that still starts with "bearer "/"token " (someone pasted
+// the scheme twice themselves), that's left alone rather than guessed
+// at further.
+static NSString *gd_sanitize_personal_access_token(NSString *raw) {
+    NSString *s = [raw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    NSArray<NSString *> *schemePrefixes = @[@"bearer ", @"token "];
+    for (NSString *prefix in schemePrefixes) {
+        if (s.length > prefix.length && [[s substringToIndex:prefix.length].lowercaseString isEqualToString:prefix]) {
+            return [[s substringFromIndex:prefix.length]
+                stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        }
+    }
+    return s;
+}
+
+// Associated-object keys stashed on the UITextField itself by
+// gd_make_labeled_glass_field_row below - the field's real glass-wrapped
+// container, the row it originally lives in, and the exact constraints
+// that pin it there. -gd_floatAuthField:/-gd_restoreAuthField: use these
+// to lift the field out of the scrolling panel and back again while it's
+// being edited, without having to rebuild any of that geometry from
+// scratch. Only ever set on authRepoLinkField/authTokenField in
+// practice (the only two fields built via this row), but keyed
+// per-field rather than hardcoded so the mechanism isn't tied to those
+// two specifically.
+static void * const kGDAuthFieldContainerKey = (void *)&kGDAuthFieldContainerKey;   // the glass view (or bare field, pre-iOS-26) that visually IS the field
+static void * const kGDAuthFieldRowKey = (void *)&kGDAuthFieldRowKey;               // fieldContainer's original superview
+static void * const kGDAuthFieldRowConstraintsKey = (void *)&kGDAuthFieldRowConstraintsKey; // the constraints pinning fieldContainer inside that row - deactivated while floated, reactivated on restore
+// Set only while the field is actually floated (nil the rest of the
+// time) - the constraints pinning it above the keyboard, so
+// -gd_restoreAuthField: knows what to tear down.
+static void * const kGDAuthFieldFloatingConstraintsKey = (void *)&kGDAuthFieldFloatingConstraintsKey;
+
 // Stacked "label above / native-glass field below" row - the Auth
 // section's GitHub Repository Link and Personal Access Token fields
 // use this instead of gd_make_button_and_glass_field_row's button+
@@ -2204,13 +2247,24 @@ static GDRow *gd_make_labeled_glass_field_row(NSString *title, NSString *placeho
         [label.leadingAnchor constraintEqualToAnchor:row.leadingAnchor],
         [label.trailingAnchor constraintEqualToAnchor:row.trailingAnchor],
         [label.topAnchor constraintEqualToAnchor:row.topAnchor],
+    ]];
 
+    // Named/kept as their own array (rather than folded into the
+    // activateConstraints: call above) so -gd_floatAuthField: can
+    // deactivate exactly these later without touching the label's own
+    // constraints - see kGDAuthFieldRowConstraintsKey above.
+    NSArray<NSLayoutConstraint *> *fieldConstraints = @[
         [fieldContainer.leadingAnchor constraintEqualToAnchor:row.leadingAnchor],
         [fieldContainer.trailingAnchor constraintEqualToAnchor:row.trailingAnchor],
         [fieldContainer.topAnchor constraintEqualToAnchor:label.bottomAnchor constant:4],
         [fieldContainer.heightAnchor constraintEqualToConstant:28],
         [row.bottomAnchor constraintEqualToAnchor:fieldContainer.bottomAnchor],
-    ]];
+    ];
+    [NSLayoutConstraint activateConstraints:fieldConstraints];
+
+    objc_setAssociatedObject(field, kGDAuthFieldContainerKey, fieldContainer, OBJC_ASSOCIATION_RETAIN);
+    objc_setAssociatedObject(field, kGDAuthFieldRowKey, row, OBJC_ASSOCIATION_RETAIN);
+    objc_setAssociatedObject(field, kGDAuthFieldRowConstraintsKey, fieldConstraints, OBJC_ASSOCIATION_RETAIN);
 
     return row;
 }
@@ -2827,6 +2881,21 @@ static UIView *gd_make_title_block(void) {
 @property (nonatomic, assign) BOOL holdConfirmTriggered;
 @property (nonatomic, strong) CADisplayLink *holdConfirmDisplayLink;
 
+// Auth section GitHub repo link / PAT fields: floated above the
+// keyboard while being edited (see -gd_floatAuthField:/
+// -gd_restoreAuthField:), since the panel sits low enough on screen
+// that the system keyboard otherwise fully covers both fields. nil
+// whenever neither auth field is being edited. gd_lastKeyboardFrame is
+// updated on every -gd_keyboardWillChangeFrame: (in window coordinates)
+// so a field can be positioned correctly the moment it's floated,
+// without waiting on a fresh notification; authFieldFloatingBottomConstraint
+// is the one constraint that same notification handler nudges directly
+// (no fade) to track keyboard height changes - e.g. the predictive text
+// bar - while a field is already floated.
+@property (nonatomic, weak) UITextField *authFieldCurrentlyFloated;
+@property (nonatomic, weak) NSLayoutConstraint *authFieldFloatingBottomConstraint;
+@property (nonatomic, assign) CGRect gd_lastKeyboardFrame;
+
 // Same idea as the block above, but for wide pill/text buttons that
 // confirm a hold with a left-to-right fill sweeping across the whole
 // button - i.e. literally the Syslog button's own hold mechanism (see
@@ -2887,6 +2956,17 @@ static const NSTimeInterval kSaveDebounceInterval = 0.4;
     [[NSNotificationCenter defaultCenter] addObserver:self
                                               selector:@selector(deviceOrientationChanged)
                                                   name:UIDeviceOrientationDidChangeNotification
+                                                object:nil];
+
+    // Drives the Auth section's floating-field-above-the-keyboard
+    // behavior - see -gd_keyboardWillChangeFrame: and the
+    // authFieldCurrentlyFloated/gd_lastKeyboardFrame property comments
+    // above. WillChangeFrame (not WillShow/WillHide separately) covers
+    // show, hide, and in-place height changes (e.g. the predictive text
+    // bar toggling) through the one handler.
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                              selector:@selector(gd_keyboardWillChangeFrame:)
+                                                  name:UIKeyboardWillChangeFrameNotification
                                                 object:nil];
 
     // The very first successful gd_key_window() call, right after the
@@ -4299,6 +4379,255 @@ static const CGFloat kContentFadeHeight = 22;
     }
 }
 
+// Drives the 1.5s hold-to-confirm capsule reveal + red progress fill
+// wired up by gd_attach_hold_to_confirm/gd_attach_delete_capsule above,
+// for every destructive X icon in the Mods Library accordion. Same
+// minimumPressDuration:0 + CADisplayLink shape as
+// -handleSyslogButtonLongPress:/-gd_syslogHoldTick: - this only learns
+// began/ended, -gd_holdConfirmTick: owns the actual per-frame timing so
+// the capsule and fill can animate continuously instead of snapping
+// once the hold completes. gesture.view is the button itself, since
+// gd_attach_hold_to_confirm adds this recognizer directly to it.
+- (void)gd_handleHoldToConfirmGesture:(UILongPressGestureRecognizer *)gesture {
+    UIButton *button = (UIButton *)gesture.view;
+    if (![button isKindOfClass:[UIButton class]]) return;
+
+    switch (gesture.state) {
+        case UIGestureRecognizerStateBegan: {
+            self.holdConfirmActiveButton = button;
+            self.holdConfirmStartTime = CACurrentMediaTime();
+            self.holdConfirmTriggered = NO;
+
+            UIView *expansion = objc_getAssociatedObject(button, kGDHoldConfirmExpansionViewKey);
+            NSLayoutConstraint *widthConstraint = objc_getAssociatedObject(button, kGDHoldConfirmExpansionWidthKey);
+            UILabel *deleteLabel = objc_getAssociatedObject(button, kGDHoldConfirmDeleteLabelKey);
+            UIVisualEffectView *capsuleGlass = objc_getAssociatedObject(button, kGDHoldConfirmGlassViewKey);
+            UIView *glassHost = objc_getAssociatedObject(button, kGDHoldConfirmGlassHostKey);
+
+            widthConstraint.constant = kGDDeleteCapsuleExpandedWidth;
+            [UIView animateWithDuration:kGDDeleteCapsuleSnapDuration
+                                   delay:0
+                  usingSpringWithDamping:kGDDeleteCapsuleSpringDamping
+                   initialSpringVelocity:kGDDeleteCapsuleSpringVelocity
+                                 options:UIViewAnimationOptionAllowUserInteraction
+                              animations:^{
+                deleteLabel.alpha = 1;
+                if (capsuleGlass && glassHost) {
+                    capsuleGlass.alpha = 1;
+                    CGRect buttonFrameInHost = [button convertRect:button.bounds toView:glassHost];
+                    CGRect expansionFrameInHost = [expansion convertRect:expansion.bounds toView:glassHost];
+                    capsuleGlass.frame = CGRectUnion(buttonFrameInHost, expansionFrameInHost);
+                }
+                [button.superview layoutIfNeeded];
+            }
+                              completion:nil];
+
+            [self.holdConfirmDisplayLink invalidate];
+            self.holdConfirmDisplayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(gd_holdConfirmTick:)];
+            [self.holdConfirmDisplayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+            break;
+        }
+        case UIGestureRecognizerStateEnded:
+        case UIGestureRecognizerStateCancelled:
+        case UIGestureRecognizerStateFailed: {
+            [self.holdConfirmDisplayLink invalidate];
+            self.holdConfirmDisplayLink = nil;
+
+            if (!self.holdConfirmTriggered) {
+                // Released before the 1.5s mark - spring the capsule back
+                // down instead of leaving it stranded partway, and play
+                // the "you needed to hold this" error haptic.
+                [self gd_collapseHoldConfirmButton:button];
+
+                UINotificationFeedbackGenerator *haptic = [UINotificationFeedbackGenerator new];
+                [haptic notificationOccurred:UINotificationFeedbackTypeError];
+            }
+            self.holdConfirmActiveButton = nil;
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+- (void)gd_holdConfirmTick:(CADisplayLink *)link {
+    static const NSTimeInterval kGDHoldConfirmDuration = 1.5;
+
+    UIButton *button = self.holdConfirmActiveButton;
+    if (!button) {
+        [link invalidate];
+        return;
+    }
+
+    NSTimeInterval elapsed = CACurrentMediaTime() - self.holdConfirmStartTime;
+    CGFloat pct = (CGFloat)MIN(1.0, elapsed / kGDHoldConfirmDuration);
+
+    UIView *expansion = objc_getAssociatedObject(button, kGDHoldConfirmExpansionViewKey);
+    CALayer *expansionFill = objc_getAssociatedObject(button, kGDHoldConfirmExpansionFillKey);
+    CALayer *buttonFill = objc_getAssociatedObject(button, kGDHoldConfirmButtonFillKey);
+
+    CGFloat expansionWidth = expansion.bounds.size.width;
+    CGFloat buttonWidth = button.bounds.size.width;
+    CGFloat filledWidth = (expansionWidth + buttonWidth) * pct;
+
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES]; // no implicit animation - the per-tick updates ARE the animation
+    // Sweeps left-to-right across the WHOLE capsule: expansion is the
+    // leading/left segment so it fills first, the button's own fill picks
+    // up whatever's left once expansion is fully covered.
+    expansionFill.frame = CGRectMake(0, 0, MIN(filledWidth, expansionWidth), expansion.bounds.size.height);
+    buttonFill.frame = CGRectMake(0, 0, MAX(0, filledWidth - expansionWidth), buttonWidth);
+    [CATransaction commit];
+
+    if (pct >= 1.0 && !self.holdConfirmTriggered) {
+        self.holdConfirmTriggered = YES;
+        [link invalidate];
+        self.holdConfirmDisplayLink = nil;
+
+        UINotificationFeedbackGenerator *haptic = [UINotificationFeedbackGenerator new];
+        [haptic notificationOccurred:UINotificationFeedbackTypeSuccess];
+
+        void (^onConfirm)(void) = objc_getAssociatedObject(button, kGDHoldConfirmBlockKey);
+        if (onConfirm) onConfirm();
+    }
+}
+
+// Springs the capsule back down to zero width (same duration/damping as
+// the expand in -gd_handleHoldToConfirmGesture:) and fades the "Delete"
+// label/glass back out - used when a hold is released early.
+- (void)gd_collapseHoldConfirmButton:(UIButton *)button {
+    UIView *expansion = objc_getAssociatedObject(button, kGDHoldConfirmExpansionViewKey);
+    NSLayoutConstraint *widthConstraint = objc_getAssociatedObject(button, kGDHoldConfirmExpansionWidthKey);
+    UILabel *deleteLabel = objc_getAssociatedObject(button, kGDHoldConfirmDeleteLabelKey);
+    UIVisualEffectView *capsuleGlass = objc_getAssociatedObject(button, kGDHoldConfirmGlassViewKey);
+    CALayer *expansionFill = objc_getAssociatedObject(button, kGDHoldConfirmExpansionFillKey);
+    CALayer *buttonFill = objc_getAssociatedObject(button, kGDHoldConfirmButtonFillKey);
+
+    widthConstraint.constant = 0;
+    [UIView animateWithDuration:kGDDeleteCapsuleSnapDuration
+                           delay:0
+          usingSpringWithDamping:kGDDeleteCapsuleSpringDamping
+           initialSpringVelocity:kGDDeleteCapsuleSpringVelocity
+                         options:UIViewAnimationOptionAllowUserInteraction
+                      animations:^{
+        deleteLabel.alpha = 0;
+        capsuleGlass.alpha = 0;
+        [button.superview layoutIfNeeded];
+    }
+                      completion:nil];
+
+    [CATransaction begin];
+    [CATransaction setAnimationDuration:0.18];
+    expansionFill.frame = CGRectMake(0, 0, 0, expansion.bounds.size.height);
+    buttonFill.frame = CGRectMake(0, 0, 0, button.bounds.size.height);
+    [CATransaction commit];
+}
+
+// Wide-button counterpart to -gd_handleHoldToConfirmGesture: above - same
+// minimumPressDuration:0 + CADisplayLink shape, but drives a single
+// left-to-right fill layer across the whole button instead of a
+// capsule reveal. This is literally -handleSyslogButtonLongPress:'s own
+// mechanism, generalized via gd_attach_pill_hold_to_confirm - currently
+// only "Restore Bundles & Banks" uses it.
+- (void)gd_handlePillHoldToConfirmGesture:(UILongPressGestureRecognizer *)gesture {
+    UIButton *button = (UIButton *)gesture.view;
+    if (![button isKindOfClass:[UIButton class]]) return;
+
+    switch (gesture.state) {
+        case UIGestureRecognizerStateBegan: {
+            self.pillHoldConfirmActiveButton = button;
+            self.pillHoldConfirmStartTime = CACurrentMediaTime();
+            self.pillHoldConfirmTriggered = NO;
+
+            CALayer *fill = objc_getAssociatedObject(button, kGDPillHoldConfirmFillLayerKey);
+            if (!fill) {
+                fill = [CALayer layer];
+                fill.backgroundColor = [UIColor colorWithRed:1.0 green:0.08 blue:0.08 alpha:0.85].CGColor;
+                fill.anchorPoint = CGPointMake(0, 0);
+                fill.cornerRadius = button.bounds.size.height / 2.0;
+                fill.cornerCurve = kCACornerCurveContinuous;
+                [button.layer insertSublayer:fill atIndex:0];
+                objc_setAssociatedObject(button, kGDPillHoldConfirmFillLayerKey, fill, OBJC_ASSOCIATION_RETAIN);
+            }
+
+            [self.pillHoldConfirmDisplayLink invalidate];
+            self.pillHoldConfirmDisplayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(gd_pillHoldConfirmTick:)];
+            [self.pillHoldConfirmDisplayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+            break;
+        }
+        case UIGestureRecognizerStateEnded:
+        case UIGestureRecognizerStateCancelled:
+        case UIGestureRecognizerStateFailed: {
+            [self.pillHoldConfirmDisplayLink invalidate];
+            self.pillHoldConfirmDisplayLink = nil;
+
+            if (!self.pillHoldConfirmTriggered) {
+                [self gd_resetPillHoldConfirmFillForButton:button];
+
+                UINotificationFeedbackGenerator *haptic = [UINotificationFeedbackGenerator new];
+                [haptic notificationOccurred:UINotificationFeedbackTypeError];
+            }
+            self.pillHoldConfirmActiveButton = nil;
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+// Springs the pill's fill layer back down to zero width. Used both by an
+// early-released hold in -gd_handlePillHoldToConfirmGesture: above, and
+// by -gd_pillHoldConfirmTick: once a completed hold's onConfirm block has
+// run - without this second call site, a completed hold left the fill
+// stranded at 100% (full red) until the button was pressed again, since
+// nothing else ever wrote its frame back down.
+- (void)gd_resetPillHoldConfirmFillForButton:(UIButton *)button {
+    CALayer *fill = objc_getAssociatedObject(button, kGDPillHoldConfirmFillLayerKey);
+    [CATransaction begin];
+    [CATransaction setAnimationDuration:0.18];
+    fill.frame = CGRectMake(0, 0, 0, button.bounds.size.height);
+    fill.cornerRadius = button.bounds.size.height / 2.0;
+    [CATransaction commit];
+}
+
+- (void)gd_pillHoldConfirmTick:(CADisplayLink *)link {
+    static const NSTimeInterval kGDPillHoldConfirmDuration = 1.5;
+
+    UIButton *button = self.pillHoldConfirmActiveButton;
+    if (!button) {
+        [link invalidate];
+        return;
+    }
+
+    NSTimeInterval elapsed = CACurrentMediaTime() - self.pillHoldConfirmStartTime;
+    CGFloat pct = (CGFloat)MIN(1.0, elapsed / kGDPillHoldConfirmDuration);
+
+    CALayer *fill = objc_getAssociatedObject(button, kGDPillHoldConfirmFillLayerKey);
+    CGRect bounds = button.bounds;
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    fill.frame = CGRectMake(0, 0, bounds.size.width * pct, bounds.size.height);
+    fill.cornerRadius = bounds.size.height / 2.0;
+    [CATransaction commit];
+
+    if (pct >= 1.0 && !self.pillHoldConfirmTriggered) {
+        self.pillHoldConfirmTriggered = YES;
+        [link invalidate];
+        self.pillHoldConfirmDisplayLink = nil;
+
+        UINotificationFeedbackGenerator *haptic = [UINotificationFeedbackGenerator new];
+        [haptic notificationOccurred:UINotificationFeedbackTypeSuccess];
+
+        void (^onConfirm)(void) = objc_getAssociatedObject(button, kGDPillHoldConfirmBlockKey);
+        if (onConfirm) onConfirm();
+
+        // Done - the fill has done its job signaling "hold complete", it
+        // shouldn't stay red until the next press. See the method comment
+        // on -gd_resetPillHoldConfirmFillForButton: above.
+        [self gd_resetPillHoldConfirmFillForButton:button];
+    }
+}
+
 // Fires once an entry row's X has been held for the full 1.5s (see
 // gd_attach_hold_to_confirm) - best-effort restores that one file (see
 // -gd_restoreModEntryBestEffort:) and forgets it via
@@ -4797,8 +5126,13 @@ static const CGFloat kContentFadeHeight = 22;
         }
     }
 
-    NSString *tokenRaw = [self.authTokenField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    config.authToken = tokenRaw.length > 0 ? tokenRaw : nil;
+    // Strip a redundant "Bearer "/"token " scheme prefix before this
+    // ever reaches Keychain - see gd_sanitize_personal_access_token's own
+    // header comment for why a token saved with one already on it broke
+    // every doctor-bundle request with a bad-credentials response.
+    NSString *tokenSanitized = gd_sanitize_personal_access_token(self.authTokenField.text ?: @"");
+    config.authToken = tokenSanitized.length > 0 ? tokenSanitized : nil;
+    self.authTokenField.text = tokenSanitized;
 
     NSError *error = nil;
     if (![BundleDoctorSettings saveConfig:config error:&error]) {
@@ -4806,8 +5140,152 @@ static const CGFloat kContentFadeHeight = 22;
     }
 }
 
+// Tracks the keyboard's current frame (window coordinates) at all times
+// - -gd_floatAuthField: reads gd_lastKeyboardFrame rather than waiting
+// on a fresh notification, since switching first responder directly
+// between the two Auth fields (same keyboard type, so the frame doesn't
+// actually change) doesn't reliably re-post this notification. If a
+// field is already floated when this fires - a height change mid-edit,
+// e.g. the predictive text bar appearing, or a rotation - just nudge
+// its bottom constraint to the new position instead of a full fade
+// cycle; if the keyboard has gone away entirely while a field is still
+// marked floated (e.g. the person swiped it down without blurring,
+// which iPadOS allows), restore defensively rather than leaving it
+// stranded.
+- (void)gd_keyboardWillChangeFrame:(NSNotification *)note {
+    UIWindow *window = gd_key_window();
+    if (!window) return;
+
+    CGRect endFrame = [note.userInfo[UIKeyboardFrameEndUserInfoKey] CGRectValue];
+    CGRect endFrameInWindow = [window convertRect:endFrame fromView:nil];
+    self.gd_lastKeyboardFrame = endFrameInWindow;
+
+    BOOL keyboardVisible = CGRectGetMinY(endFrameInWindow) < CGRectGetMaxY(window.bounds);
+
+    if (self.authFieldCurrentlyFloated && keyboardVisible) {
+        NSTimeInterval duration = [note.userInfo[UIKeyboardAnimationDurationUserInfoKey] doubleValue];
+        if (duration <= 0) duration = 0.25;
+        CGFloat bottomInset = CGRectGetHeight(window.bounds) - CGRectGetMinY(endFrameInWindow);
+        self.authFieldFloatingBottomConstraint.constant = -(bottomInset + 8);
+        [UIView animateWithDuration:duration animations:^{
+            [window layoutIfNeeded];
+        }];
+    } else if (self.authFieldCurrentlyFloated && !keyboardVisible) {
+        [self gd_restoreAuthField:self.authFieldCurrentlyFloated];
+    }
+}
+
+// Lifts `field`'s real glass-wrapped container out of its row in the
+// scrolling panel and parents it directly in the key window, right-
+// aligned and pinned just above the keyboard - see
+// kGDAuthFieldContainerKey and friends above for how the container/row/
+// constraints were stashed at build time. The move itself is a simple
+// cross-fade per spec (fade out at the row position, reparent, fade in
+// at the floating position), not a slide/morph - see -gd_restoreAuthField:
+// for the reverse. No-op if `field` is already the floated one.
+- (void)gd_floatAuthField:(UITextField *)field {
+    if (!field || self.authFieldCurrentlyFloated == field) return;
+    if (self.authFieldCurrentlyFloated) {
+        // Shouldn't normally happen - -textFieldDidEndEditing: restores
+        // the previous field before this ever runs for a new one - but
+        // don't leave a stale floated field stranded if it does.
+        [self gd_restoreAuthField:self.authFieldCurrentlyFloated];
+    }
+
+    UIView *fieldContainer = objc_getAssociatedObject(field, kGDAuthFieldContainerKey);
+    NSArray<NSLayoutConstraint *> *rowConstraints = objc_getAssociatedObject(field, kGDAuthFieldRowConstraintsKey);
+    UIWindow *window = gd_key_window();
+    if (!fieldContainer || !rowConstraints || !window) return; // defensive - only ever set by gd_make_labeled_glass_field_row
+
+    CGFloat savedWidth = fieldContainer.bounds.size.width;
+    self.authFieldCurrentlyFloated = field;
+
+    [UIView animateWithDuration:0.15 animations:^{
+        fieldContainer.alpha = 0;
+    } completion:^(BOOL finished) {
+        [NSLayoutConstraint deactivateConstraints:rowConstraints];
+        [fieldContainer removeFromSuperview];
+
+        fieldContainer.translatesAutoresizingMaskIntoConstraints = NO;
+        [window addSubview:fieldContainer];
+        [window bringSubviewToFront:fieldContainer];
+
+        // gd_lastKeyboardFrame is normally already correct by the time
+        // this runs (see the header comment above) - the fallback below
+        // only matters if this is somehow reached before the keyboard's
+        // very first WillChangeFrame notification of the session.
+        CGFloat bottomInset = CGRectGetHeight(window.bounds) - CGRectGetMinY(self.gd_lastKeyboardFrame);
+        if (CGRectIsEmpty(self.gd_lastKeyboardFrame) || bottomInset < 8) {
+            bottomInset = window.safeAreaInsets.bottom + 291; // typical current-generation iPhone portrait keyboard height
+        }
+
+        NSLayoutConstraint *bottomConstraint =
+            [fieldContainer.bottomAnchor constraintEqualToAnchor:window.bottomAnchor constant:-(bottomInset + 8)];
+        NSArray<NSLayoutConstraint *> *floatConstraints = @[
+            [fieldContainer.trailingAnchor constraintEqualToAnchor:window.safeAreaLayoutGuide.trailingAnchor constant:-16],
+            bottomConstraint,
+            [fieldContainer.widthAnchor constraintEqualToConstant:savedWidth],
+            [fieldContainer.heightAnchor constraintEqualToConstant:28],
+        ];
+        [NSLayoutConstraint activateConstraints:floatConstraints];
+        objc_setAssociatedObject(field, kGDAuthFieldFloatingConstraintsKey, floatConstraints, OBJC_ASSOCIATION_RETAIN);
+        self.authFieldFloatingBottomConstraint = bottomConstraint;
+        [window layoutIfNeeded];
+
+        [UIView animateWithDuration:0.15 animations:^{
+            fieldContainer.alpha = 1;
+        }];
+    }];
+}
+
+// Reverse of -gd_floatAuthField: above - fades `field`'s container out
+// of its floating window-level position, reparents it back into its
+// original row using the exact constraints -gd_floatAuthField: deactivated
+// (not rebuilt from scratch), and fades it back in there. No-op if
+// `field` isn't the currently-floated one.
+- (void)gd_restoreAuthField:(UITextField *)field {
+    if (!field || self.authFieldCurrentlyFloated != field) return;
+
+    UIView *fieldContainer = objc_getAssociatedObject(field, kGDAuthFieldContainerKey);
+    UIView *originalRow = objc_getAssociatedObject(field, kGDAuthFieldRowKey);
+    NSArray<NSLayoutConstraint *> *rowConstraints = objc_getAssociatedObject(field, kGDAuthFieldRowConstraintsKey);
+    NSArray<NSLayoutConstraint *> *floatConstraints = objc_getAssociatedObject(field, kGDAuthFieldFloatingConstraintsKey);
+    if (!fieldContainer || !originalRow || !rowConstraints) {
+        self.authFieldCurrentlyFloated = nil;
+        self.authFieldFloatingBottomConstraint = nil;
+        return;
+    }
+
+    self.authFieldCurrentlyFloated = nil;
+    self.authFieldFloatingBottomConstraint = nil;
+
+    [UIView animateWithDuration:0.15 animations:^{
+        fieldContainer.alpha = 0;
+    } completion:^(BOOL finished) {
+        if (floatConstraints) [NSLayoutConstraint deactivateConstraints:floatConstraints];
+        [fieldContainer removeFromSuperview];
+        objc_setAssociatedObject(field, kGDAuthFieldFloatingConstraintsKey, nil, OBJC_ASSOCIATION_RETAIN);
+
+        fieldContainer.translatesAutoresizingMaskIntoConstraints = NO;
+        [originalRow addSubview:fieldContainer];
+        [NSLayoutConstraint activateConstraints:rowConstraints];
+        [originalRow layoutIfNeeded];
+
+        [UIView animateWithDuration:0.15 animations:^{
+            fieldContainer.alpha = 1;
+        }];
+    }];
+}
+
+- (void)textFieldDidBeginEditing:(UITextField *)textField {
+    if (textField == self.authRepoLinkField || textField == self.authTokenField) {
+        [self gd_floatAuthField:textField];
+    }
+}
+
 - (void)textFieldDidEndEditing:(UITextField *)textField {
     if (textField == self.authRepoLinkField || textField == self.authTokenField) {
+        [self gd_restoreAuthField:textField];
         [self gd_persistAuthFields];
     }
 }
