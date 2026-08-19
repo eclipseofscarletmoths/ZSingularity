@@ -114,6 +114,8 @@ static NSError *bte_error(BundleTexture2DEnumeratorErrorCode code, NSString *rea
                 [NSString stringWithFormat:@"pathID %lld byte range [%lld, %lld) doesn't fit inside %lu-byte CAB node data",
                     entry.pathID, absoluteStart64, absoluteStart64 + entry.byteSize, (unsigned long)cabLength], nil);
             [results addObject:obj];
+            ZLogVerbose(@"[BundleTexture2DEnumerator]   pathID %lld: FAILED - byte range out of bounds: %@",
+                        entry.pathID, obj.parseError.localizedDescription);
             continue;
         }
         NSUInteger absoluteStart = (NSUInteger)absoluteStart64;
@@ -127,6 +129,16 @@ static NSError *bte_error(BundleTexture2DEnumeratorErrorCode code, NSString *rea
         obj.info = info;
         obj.parseError = info ? nil : schemaError;
         [results addObject:obj];
+
+        if (info) {
+            ZLogVerbose(@"[BundleTexture2DEnumerator]   pathID %lld: parsed OK - %dx%d format=%d mipCount=%d %@",
+                        entry.pathID, info.width, info.height, info.textureFormat, info.mipCount,
+                        info.hasStreamData ? @"(streamed)" : @"(inline)");
+        } else {
+            ZLogVerbose(@"[BundleTexture2DEnumerator]   pathID %lld: FAILED to parse (%lu bytes) - [%ld] %@",
+                        entry.pathID, (unsigned long)entry.byteSize,
+                        (long)schemaError.code, schemaError.localizedDescription ?: @"(no detail)");
+        }
     }
 
     BundleTexture2DEnumerator *enumerator = [BundleTexture2DEnumerator new];
@@ -142,6 +154,25 @@ static NSError *bte_error(BundleTexture2DEnumeratorErrorCode code, NSString *rea
          (unsigned long)[results indexesOfObjectsPassingTest:^BOOL(ZSTexture2DEnumeratedObject *o, NSUInteger idx, BOOL *stop) { return o.info != nil; }].count,
          (unsigned long)[results indexesOfObjectsPassingTest:^BOOL(ZSTexture2DEnumeratedObject *o, NSUInteger idx, BOOL *stop) { return o.info == nil; }].count,
          targetPlatformKnown ? @(targetPlatform) : @"unknown");
+
+    if (kZSVerbosePipelineLogging) {
+        // Breakdown of WHY objects failed to schema-parse, grouped by
+        // Texture2DSchemaErrorCode - answers "which check is actually
+        // rejecting most of the failures" in one line instead of having
+        // to eyeball a couple hundred per-object lines above. Errors
+        // from a domain other than Texture2DSchemaErrorDomain (e.g. the
+        // out-of-bounds case above, still BundleTexture2DEnumeratorErrorDomain)
+        // are grouped under that domain's own name instead.
+        NSMutableDictionary<NSString *, NSNumber *> *breakdown = [NSMutableDictionary dictionary];
+        for (ZSTexture2DEnumeratedObject *o in results) {
+            if (o.info) continue;
+            NSString *key = [NSString stringWithFormat:@"%@:%ld", o.parseError.domain ?: @"(nil)", (long)o.parseError.code];
+            breakdown[key] = @(breakdown[key].integerValue + 1);
+        }
+        if (breakdown.count > 0) {
+            ZLogVerbose(@"[BundleTexture2DEnumerator] %@: failure breakdown by error code: %@", cabNode.path, breakdown);
+        }
+    }
 
     return enumerator;
 }

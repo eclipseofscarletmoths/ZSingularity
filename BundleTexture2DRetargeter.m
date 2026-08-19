@@ -135,6 +135,8 @@ static NSError *btr_error(BundleTexture2DRetargeterErrorCode code, NSString *rea
         r.enumeratorParseError = obj.parseError;
         [objectResults addObject:r];
         unchangedCount++;
+        ZLogVerbose(@"[BundleTexture2DRetargeter]   pathID %lld: left unchanged - never reached conversion (enumerator parse failure): %@",
+                    obj.pathID, obj.parseError.localizedDescription ?: @"(no detail)");
     }
 
     [Texture2DConverter convertObjectsInEnumerator:enumerator handler:^(ZSTexture2DConversionResult *result) {
@@ -249,6 +251,8 @@ static NSError *btr_error(BundleTexture2DRetargeterErrorCode code, NSString *rea
     // just that one). Must happen before UnityBundleCAB packages
     // mutableCAB below.
     NSError *fixupErr = nil;
+    ZLogVerbose(@"[BundleTexture2DRetargeter] fixing up fileSize header: %llu bytes appended across %ld converted object(s)",
+                totalTailBytesAppended, (long)convertedCount);
     if (![enumerator.objectTable growFileSizeBy:totalTailBytesAppended inNodeData:mutableCAB error:&fixupErr]) {
         if (error) *error = btr_error(BundleTexture2DRetargeterErrorHeaderFixupFailed, @"fileSize header fixup failed after appending converted object tails", fixupErr);
         [NSFileManager.defaultManager removeItemAtPath:stagingPath error:nil];

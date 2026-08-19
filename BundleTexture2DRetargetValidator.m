@@ -59,6 +59,7 @@ static NSError *btrv_error(BundleTexture2DRetargetValidatorErrorCode code, NSStr
         iss.name = name;
         iss.reason = reason;
         [issues addObject:iss];
+        ZLogVerbose(@"[BundleTexture2DRetargetValidator]   issue - pathID %lld%@: %@", pathID, name ? [NSString stringWithFormat:@" (%@)", name] : @"", reason);
     };
 
     // --- whole-bundle checks -------------------------------------------------
@@ -169,7 +170,11 @@ static NSError *btrv_error(BundleTexture2DRetargetValidatorErrorCode code, NSStr
                     ok = NO;
                 }
 
-                if (ok) verifiedConvertedCount++;
+                if (ok) {
+                    verifiedConvertedCount++;
+                    ZLogVerbose(@"[BundleTexture2DRetargetValidator]   pathID %lld: converted object verified OK (%dx%d RGBA32, %lu bytes)",
+                                r.pathID, info.width, info.height, (unsigned long)pixelBytes.length);
+                }
             } else {
                 // NotNeeded, or Required/Unsupported but left unchanged
                 // after a conversion failure - either way, this object's
@@ -178,6 +183,7 @@ static NSError *btrv_error(BundleTexture2DRetargetValidatorErrorCode code, NSStr
                 // pixel range still resolves (already confirmed by
                 // reaching this point without an earlier `continue`).
                 verifiedUnchangedCount++;
+                ZLogVerbose(@"[BundleTexture2DRetargetValidator]   pathID %lld: unchanged object verified OK (still reparses, pixel range still resolves)", r.pathID);
             }
         }
     }

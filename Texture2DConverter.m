@@ -49,6 +49,8 @@ static NSError *tc_error(Texture2DConverterErrorCode code, NSString *reason, NSE
 
 + (void)convertObjectsInEnumerator:(BundleTexture2DEnumerator *)enumerator
                             handler:(ZSTexture2DConversionHandler)handler {
+    NSUInteger notNeededCount = 0, requiredOKCount = 0, requiredFailedCount = 0, unsupportedCount = 0;
+
     for (ZSTexture2DEnumeratedObject *object in enumerator.texture2DObjects) {
         ZSTexture2DInfo *info = object.info;
         if (!info) {
@@ -60,16 +62,19 @@ static NSError *tc_error(Texture2DConverterErrorCode code, NSString *reason, NSE
         ZSTexture2DConversionDecision decision = [self conversionDecisionForRawFormat:info.textureFormat];
 
         if (decision == ZSTexture2DConversionNotNeeded) {
+            notNeededCount++;
             ZSTexture2DConversionResult *result = [ZSTexture2DConversionResult new];
             result.object = object;
             result.decision = decision;
             result.width = info.width;
             result.height = info.height;
+            ZLogVerbose(@"[Texture2DConverter]   pathID %lld: format=%d -> NotNeeded (already RGBA32/ASTC)", object.pathID, info.textureFormat);
             handler(result);
             continue;
         }
 
         if (decision == ZSTexture2DConversionUnsupported) {
+            unsupportedCount++;
             ZSTexture2DConversionResult *result = [ZSTexture2DConversionResult new];
             result.object = object;
             result.decision = decision;
@@ -78,6 +83,7 @@ static NSError *tc_error(Texture2DConverterErrorCode code, NSString *reason, NSE
             result.error = tc_error(Texture2DConverterErrorUnsupportedFormat,
                 [NSString stringWithFormat:@"pathID %lld: m_TextureFormat=%d has no Layer C conversion rule", object.pathID, info.textureFormat],
                 nil);
+            ZLogVerbose(@"[Texture2DConverter]   pathID %lld: format=%d -> Unsupported (no conversion rule - see this class's fail-closed guard)", object.pathID, info.textureFormat);
             handler(result);
             continue;
         }
@@ -100,6 +106,9 @@ static NSError *tc_error(Texture2DConverterErrorCode code, NSString *reason, NSE
                 result.error = tc_error(Texture2DConverterErrorSourceBytesUnavailable,
                     [NSString stringWithFormat:@"pathID %lld: couldn't resolve source pixel bytes", object.pathID],
                     sourceError);
+                requiredFailedCount++;
+                ZLogVerbose(@"[Texture2DConverter]   pathID %lld: format=%d -> Required, FAILED resolving source bytes: %@",
+                            object.pathID, info.textureFormat, sourceError.localizedDescription ?: @"(no detail)");
                 handler(result);
                 continue;
             }
@@ -114,6 +123,9 @@ static NSError *tc_error(Texture2DConverterErrorCode code, NSString *reason, NSE
                 result.error = tc_error(Texture2DConverterErrorDecodeFailed,
                     [NSString stringWithFormat:@"pathID %lld: decode from format %d failed", object.pathID, info.textureFormat],
                     decodeError);
+                requiredFailedCount++;
+                ZLogVerbose(@"[Texture2DConverter]   pathID %lld: format=%d -> Required, FAILED decode: %@",
+                            object.pathID, info.textureFormat, decodeError.localizedDescription ?: @"(no detail)");
                 handler(result);
                 continue;
             }
@@ -131,13 +143,26 @@ static NSError *tc_error(Texture2DConverterErrorCode code, NSString *reason, NSE
                     [NSString stringWithFormat:@"pathID %lld: decoded %lu bytes, expected %lu (%d x %d x 4)",
                         object.pathID, (unsigned long)rgba32.length, (unsigned long)expectedLength, info.width, info.height],
                     nil);
+                requiredFailedCount++;
+                ZLogVerbose(@"[Texture2DConverter]   pathID %lld: format=%d -> Required, FAILED byte count check (got %lu, expected %lu)",
+                            object.pathID, info.textureFormat, (unsigned long)rgba32.length, (unsigned long)expectedLength);
                 handler(result);
                 continue;
             }
 
             result.rgba32Data = rgba32;
+            requiredOKCount++;
+            ZLogVerbose(@"[Texture2DConverter]   pathID %lld: format=%d -> Required, decoded OK (%lu RGBA32 bytes)",
+                        object.pathID, info.textureFormat, (unsigned long)rgba32.length);
             handler(result);
         }
+    }
+
+    if (kZSVerbosePipelineLogging) {
+        ZLogVerbose(@"[Texture2DConverter] decision tally over %lu parsed Texture2D objects: NotNeeded=%lu Required(OK)=%lu Required(failed)=%lu Unsupported=%lu",
+                    (unsigned long)enumerator.texture2DObjects.count,
+                    (unsigned long)notNeededCount, (unsigned long)requiredOKCount,
+                    (unsigned long)requiredFailedCount, (unsigned long)unsupportedCount);
     }
 }
 

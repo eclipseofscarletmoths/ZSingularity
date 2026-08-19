@@ -598,6 +598,8 @@ static NSArray<SerializedObject *> *sot_decode_table_near(NSData *nodeData, cons
     uint64_t bs = (uint64_t)newByteStart;
     for (int i = 0; i < 8; i++) p[8 + i] = (uint8_t)(bs >> (8 * i)); // byteStart, little-endian
     for (int i = 0; i < 4; i++) p[16 + i] = (uint8_t)(newByteSize >> (8 * i)); // byteSize, little-endian
+    ZLogVerbose(@"[SerializedObjectTable]   patchObject pathID %lld: byteStart %lld -> %lld, byteSize %u -> %u",
+                object.pathID, object.byteStart, newByteStart, object.byteSize, newByteSize);
     object.byteStart = newByteStart;
     object.byteSize = newByteSize;
     return YES;
@@ -613,6 +615,8 @@ static NSArray<SerializedObject *> *sot_decode_table_near(NSData *nodeData, cons
     }
     uint64_t oldFileSize = sot_read_u64_be_public(nodeData, kSOTFieldFileSize);
     sot_write_u64_be(nodeData, kSOTFieldFileSize, oldFileSize + delta);
+    ZLogVerbose(@"[SerializedObjectTable] growFileSizeBy: fileSize %llu -> %llu (+%llu, node now %lu bytes)",
+                oldFileSize, oldFileSize + delta, delta, (unsigned long)nodeData.length);
     return YES;
 }
 
