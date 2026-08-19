@@ -46,6 +46,20 @@ static void btr_patch_i32_le(NSMutableData *d, NSUInteger offset, int32_t v) {
     uint32_t u = (uint32_t)v;
     p[0] = (uint8_t)u; p[1] = (uint8_t)(u >> 8); p[2] = (uint8_t)(u >> 16); p[3] = (uint8_t)(u >> 24);
 }
+// Mirrors Texture2DSchema.m's t2s_align/t2s_align4: a SerializedFile
+// pads each object's data to a 4-byte boundary, and since
+// m_StreamData.path is this schema's last field, that boundary lands
+// right at the end of the object - the reader enforces it (see
+// Texture2DSchema.m's "align4 after m_StreamData.path" check), so the
+// writer has to reproduce it or every rewritten object is 0-3 bytes
+// short of what the reader expects, i.e. the mirror image of the bug
+// the schema fix closed on the read side.
+static void btr_pad_align4(NSMutableData *d) {
+    NSUInteger rem = d.length % 4;
+    if (rem == 0) return;
+    uint8_t zeros[3] = {0, 0, 0};
+    [d appendBytes:zeros length:(4 - rem)];
+}
 
 static NSError *btr_error(BundleTexture2DRetargeterErrorCode code, NSString *reason, NSError *_Nullable underlying) {
     NSMutableDictionary *info = [NSMutableDictionary dictionary];
@@ -193,6 +207,7 @@ static NSError *btr_error(BundleTexture2DRetargeterErrorCode code, NSString *rea
         btr_write_u32_le(tail, (uint32_t)rgba32.length);     // m_StreamData.size
         btr_write_u32_le(tail, (uint32_t)newStreamPathUTF8.length); // m_StreamData.pathLen
         [tail appendData:newStreamPathUTF8];
+        btr_pad_align4(tail); // must land before tail.length is used as newByteSize below - see btr_pad_align4's comment
 
         // NOTE: this used to also refuse when `tail.length >
         // info.objectLength` ("CAB NODE GROWTH IS SMALL"). That check
