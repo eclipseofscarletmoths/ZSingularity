@@ -3536,6 +3536,127 @@ static NSString * const kGDModLibraryFolderName = @"Imported";
     [self gd_presentModsAlertWithTitle:@"Restore Originals" message:message];
 }
 
+#pragma mark Mods (pill hold-to-confirm)
+//
+// Implementation for gd_attach_pill_hold_to_confirm above. THE ACTUAL
+// CRASH: this method (and -gd_pillHoldConfirmTick: below) didn't exist
+// - gd_attach_pill_hold_to_confirm wired a UILongPressGestureRecognizer
+// straight to @selector(gd_handlePillHoldToConfirmGesture:) with no
+// implementation anywhere in this file, so the moment a person held
+// the Restore Originals button down, the gesture recognizer fired that
+// selector on self and -doesNotRecognizeSelector: took it from there.
+// (gd_handleHoldToConfirmGesture: - the small delete-icon counterpart -
+// has the same gap, but gd_attach_hold_to_confirm is never actually
+// called anywhere in this file's current layout, so that one's dormant
+// rather than crashing; left alone here since fixing an unreachable
+// method isn't part of this bug.)
+//
+// Mirrors -handleSyslogButtonLongPress:/-gd_syslogHoldTick: (see those
+// for the fuller explanation of the minimumPressDuration:0 + CADisplayLink
+// shape), generalized to take any button via the pillHoldConfirm*
+// properties and the kGDPillHoldConfirmBlockKey/-FillLayerKey associated
+// objects gd_attach_pill_hold_to_confirm already sets up - so this
+// stays reusable for whatever the next wide hold-to-confirm button ends
+// up being, not hardcoded to Restore Originals.
+
+static const NSTimeInterval kPillHoldConfirmDuration = 1.5; // matches gd_attach_pill_hold_to_confirm's own header comment
+
+- (void)gd_handlePillHoldToConfirmGesture:(UILongPressGestureRecognizer *)gesture {
+    UIButton *button = (UIButton *)gesture.view;
+    if (![button isKindOfClass:UIButton.class]) return;
+
+    switch (gesture.state) {
+        case UIGestureRecognizerStateBegan: {
+            self.pillHoldConfirmActiveButton = button;
+            self.pillHoldConfirmStartTime = CACurrentMediaTime();
+            self.pillHoldConfirmTriggered = NO;
+
+            CALayer *fill = objc_getAssociatedObject(button, kGDPillHoldConfirmFillLayerKey);
+            if (!fill) {
+                fill = [CALayer layer];
+                fill.backgroundColor = [UIColor colorWithRed:1.0 green:0.08 blue:0.08 alpha:0.85].CGColor;
+                fill.anchorPoint = CGPointMake(0, 0);
+                fill.cornerCurve = kCACornerCurveContinuous;
+                // Inserted as a sublayer (not addSubview:) so it sits
+                // behind whatever UIButtonConfiguration's native glass
+                // style is managing as the button's real subviews - same
+                // reasoning as syslogButtonFillLayer, see that property's
+                // own comment.
+                [button.layer insertSublayer:fill atIndex:0];
+                objc_setAssociatedObject(button, kGDPillHoldConfirmFillLayerKey, fill, OBJC_ASSOCIATION_RETAIN);
+            }
+            fill.cornerRadius = button.bounds.size.height / 2.0;
+            fill.frame = CGRectMake(0, 0, 0, button.bounds.size.height);
+
+            [self.pillHoldConfirmDisplayLink invalidate];
+            self.pillHoldConfirmDisplayLink = [CADisplayLink displayLinkWithTarget:self selector:@selector(gd_pillHoldConfirmTick:)];
+            [self.pillHoldConfirmDisplayLink addToRunLoop:[NSRunLoop mainRunLoop] forMode:NSRunLoopCommonModes];
+            break;
+        }
+        case UIGestureRecognizerStateEnded:
+        case UIGestureRecognizerStateCancelled:
+        case UIGestureRecognizerStateFailed: {
+            [self.pillHoldConfirmDisplayLink invalidate];
+            self.pillHoldConfirmDisplayLink = nil;
+
+            if (!self.pillHoldConfirmTriggered) {
+                CALayer *fill = objc_getAssociatedObject(button, kGDPillHoldConfirmFillLayerKey);
+                [CATransaction begin];
+                [CATransaction setAnimationDuration:0.18];
+                fill.frame = CGRectMake(0, 0, 0, button.bounds.size.height);
+                fill.cornerRadius = button.bounds.size.height / 2.0;
+                [CATransaction commit];
+
+                // Released before the hold completed - the "quick tap
+                // plays an error haptic instead of doing anything"
+                // contract gd_attach_pill_hold_to_confirm's own header
+                // promises.
+                UINotificationFeedbackGenerator *haptic = [UINotificationFeedbackGenerator new];
+                [haptic notificationOccurred:UINotificationFeedbackTypeError];
+            }
+            self.pillHoldConfirmActiveButton = nil;
+            break;
+        }
+        default:
+            break;
+    }
+}
+
+- (void)gd_pillHoldConfirmTick:(CADisplayLink *)link {
+    UIButton *button = self.pillHoldConfirmActiveButton;
+    if (!button) {
+        // Shouldn't happen (the gesture handler above nils this out
+        // before invalidating the link on every exit path), but bail
+        // rather than operate on a nil button if it ever does.
+        [link invalidate];
+        self.pillHoldConfirmDisplayLink = nil;
+        return;
+    }
+
+    NSTimeInterval elapsed = CACurrentMediaTime() - self.pillHoldConfirmStartTime;
+    CGFloat pct = (CGFloat)MIN(1.0, elapsed / kPillHoldConfirmDuration);
+
+    CALayer *fill = objc_getAssociatedObject(button, kGDPillHoldConfirmFillLayerKey);
+    CGRect bounds = button.bounds;
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES]; // no implicit animation - the per-tick updates ARE the animation
+    fill.frame = CGRectMake(0, 0, bounds.size.width * pct, bounds.size.height);
+    fill.cornerRadius = bounds.size.height / 2.0;
+    [CATransaction commit];
+
+    if (pct >= 1.0 && !self.pillHoldConfirmTriggered) {
+        self.pillHoldConfirmTriggered = YES;
+        [link invalidate];
+        self.pillHoldConfirmDisplayLink = nil;
+
+        // The confirmation block itself (e.g. -restoreOriginalsTapped)
+        // owns its own success/failure haptic and alert - this method's
+        // job ends at "the hold completed, run what was registered".
+        void (^onConfirm)(void) = objc_getAssociatedObject(button, kGDPillHoldConfirmBlockKey);
+        if (onConfirm) onConfirm();
+    }
+}
+
 #pragma mark Mods (Load Mods / doctor pipeline)
 //
 // send-and-intercept, client side: pick a modded DESKTOP bundle ->
