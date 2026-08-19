@@ -397,7 +397,18 @@ static NSError *btr_error(BundleTexture2DRetargeterErrorCode code, NSString *rea
         // loader and UABEA both rejecting the output as corrupted. See
         // UnityBundleCAB.h's doc on UnityBundleNode.flags and
         // ReworkLog.md.
-        n.flags = orig.flags;
+        //
+        // EXCEPTION: the .resS node is force-corrected to 0 rather than
+        // trusting orig.flags for it specifically. Below, a BRAND NEW
+        // .resS node already gets flags = 0 explicitly (no "orig" to
+        // copy from) - but a REUSED existing .resS node was still
+        // taking orig.flags at face value, which silently propagates a
+        // pre-existing bad flag (e.g. a source bundle that was already
+        // corrupted by an earlier, pre-fix run of this same pipeline)
+        // straight into the output instead of correcting it. A .resS
+        // node can never legitimately be a SerializedFile, so this is
+        // safe to force unconditionally rather than only checked.
+        n.flags = [orig.path isEqualToString:resSNodeName] ? 0 : orig.flags;
         if ([orig.path isEqualToString:cabName]) {
             n.size = (int64_t)mutableCAB.length;
         } else if ([orig.path isEqualToString:resSNodeName]) {
