@@ -60,6 +60,25 @@ static void btr_pad_align4(NSMutableData *d) {
     uint8_t zeros[3] = {0, 0, 0};
     [d appendBytes:zeros length:(4 - rem)];
 }
+// NOT the same alignment as btr_pad_align4 above, and not
+// interchangeable with it. btr_pad_align4 pads a single rewritten
+// object's own trailing field (m_StreamData.path) to 4 bytes, which is
+// a Texture2DSchema.m field-layout requirement, checked against this
+// exact object's own bytes. This pads mutableCAB itself, between one
+// object's end and the next object's start, to 8 bytes - the
+// SerializedFile object-table packing invariant every byteStart
+// actually satisfies (confirmed against AssetsTools.NET's
+// AssetsFile.Write(), which calls writer.Align8() between every object
+// it writes). Every object Unity itself wrote already sits at an
+// 8-aligned byteStart; this call is what keeps every object THIS CLASS
+// relocates on that same footing, since btr_pad_align4 alone (the
+// previous state of this file) only guarantees a multiple of 4.
+static void btr_pad_align8(NSMutableData *d) {
+    NSUInteger rem = d.length % 8;
+    if (rem == 0) return;
+    uint8_t zeros[7] = {0};
+    [d appendBytes:zeros length:(8 - rem)];
+}
 
 static NSError *btr_error(BundleTexture2DRetargeterErrorCode code, NSString *reason, NSError *_Nullable underlying) {
     NSMutableDictionary *info = [NSMutableDictionary dictionary];
@@ -288,6 +307,16 @@ static NSError *btr_error(BundleTexture2DRetargeterErrorCode code, NSString *rea
         }
         stagingWriteOffset += (int64_t)rgba32.length;
 
+        // Pad mutableCAB itself (not `tail`) up to the next 8-byte
+        // boundary BEFORE this object's relocated bytes are appended -
+        // see btr_pad_align8's comment above for why 8, not the 4
+        // btr_pad_align4 already enforced on `tail`'s own trailing
+        // field. preAppendLength is kept so a table-patch failure below
+        // can roll this padding back too, not just `tail`'s bytes.
+        NSUInteger preAppendLength = mutableCAB.length;
+        btr_pad_align8(mutableCAB);
+        uint64_t alignmentPadBytes = (uint64_t)(mutableCAB.length - preAppendLength);
+
         int64_t newByteStartAbs = (int64_t)mutableCAB.length;
         [mutableCAB appendData:tail];
 
@@ -300,8 +329,12 @@ static NSError *btr_error(BundleTexture2DRetargeterErrorCode code, NSString *rea
                                                       error:&patchErr];
         if (!patched) {
             // Roll back both appends so this failed object leaves no
-            // trace in either the CAB node or the staging file.
-            mutableCAB.length = (NSUInteger)newByteStartAbs;
+            // trace in either the CAB node or the staging file -
+            // including the 8-byte alignment padding just written
+            // ahead of `tail`, which is why this truncates back to
+            // preAppendLength (this object's actual starting point)
+            // rather than newByteStartAbs (which is AFTER that padding).
+            mutableCAB.length = preAppendLength;
             stagingWriteOffset = thisStreamOffset;
             @try {
                 [stagingFH truncateFileAtOffset:(unsigned long long)thisStreamOffset];
@@ -329,7 +362,15 @@ static NSError *btr_error(BundleTexture2DRetargeterErrorCode code, NSString *rea
             return;
         }
 
-        totalTailBytesAppended += tail.length;
+        // Includes the 8-byte alignment padding written ahead of
+        // `tail`, not just `tail` itself - growFileSizeBy: below needs
+        // the TOTAL growth of mutableCAB, and that padding is bytes
+        // that weren't there before this object was converted, same as
+        // `tail`'s own bytes. Omitting it is exactly the undercounted-
+        // fileSize failure mode this method's own comment (further
+        // down, at the growFileSizeBy: call) already warns about for a
+        // different cause.
+        totalTailBytesAppended += tail.length + alignmentPadBytes;
         r.patched = YES;
         convertedCount++;
     }];

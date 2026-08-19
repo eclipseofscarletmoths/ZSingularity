@@ -353,6 +353,21 @@ static uint64_t sot_read_u64_be_public(NSData *data, NSUInteger pos) {
     return sot_read_u64_be((const uint8_t *)data.bytes + pos);
 }
 
+// Number of zero bytes needed to bring `length` up to the next 8-byte
+// boundary (0 if already aligned) - the packing invariant a real
+// SerializedFile's own writer (and AssetsTools.NET's AssetsFile.Write(),
+// the reference this was checked against) enforces on every object
+// table entry's byteStart: unlike this codebase's other alignment
+// helpers (Texture2DSchema.m's t2s_align4, BundleTexture2DRetargeter.m's
+// btr_pad_align4), which pad a single object's own field layout to 4
+// bytes, this is the INTER-object gap, which is 8, not 4 - conflating
+// the two is exactly the bug this function exists to close. See
+// -insertObjects:payloads:... below for where it's applied.
+static uint64_t sot_align8_pad(uint64_t length) {
+    uint64_t rem = length % 8;
+    return (rem == 0) ? 0 : (8 - rem);
+}
+
 // Searches [firstEntryOffset - windowBack, firstEntryOffset) for a
 // 4-byte integer (tried both endiannesses) equal to expectedCount.
 // Returns the byte offset of the field and, via *outBE, which
@@ -706,9 +721,24 @@ static NSArray<SerializedObject *> *sot_decode_table_near(NSData *nodeData, cons
 
     NSMutableData *entryBlock = [NSMutableData dataWithLength:24 * newObjects.count];
     uint8_t *eb = (uint8_t *)entryBlock.mutableBytes;
+    // Zero-padding inserted ahead of each payload so every new object's
+    // byteStart lands on an 8-byte boundary (sot_align8_pad, above) -
+    // computed here against the same running offset used to derive
+    // byteStart, and replayed verbatim in the append pass below so the
+    // bytes actually written to `scratch` match what these table
+    // entries claim. Padding before the FIRST payload too, not just
+    // between them, since existingDataLength (the end of whatever
+    // object currently ends this node) isn't guaranteed to already be
+    // 8-aligned from here - safer to enforce it than assume it.
+    NSMutableArray<NSNumber *> *payloadPadding = [NSMutableArray arrayWithCapacity:newObjects.count];
     for (NSUInteger i = 0; i < newObjects.count; i++) {
         SerializedObject *obj = newObjects[i];
         NSData *payload = payloads[i];
+
+        uint64_t pad = sot_align8_pad(runningPayloadOffset);
+        runningPayloadOffset += pad;
+        [payloadPadding addObject:@(pad)];
+
         uint64_t byteStart = runningPayloadOffset;
         uint32_t byteSize = (uint32_t)payload.length;
         runningPayloadOffset += byteSize;
@@ -730,7 +760,16 @@ static NSArray<SerializedObject *> *sot_decode_table_near(NSData *nodeData, cons
     NSMutableData *scratch = [NSMutableData dataWithData:[nodeData subdataWithRange:NSMakeRange(0, tableEnd)]];
     [scratch appendData:entryBlock];
     [scratch appendData:[nodeData subdataWithRange:NSMakeRange(tableEnd, nodeData.length - tableEnd)]];
-    for (NSData *payload in payloads) [scratch appendData:payload];
+    // Same padding amounts computed above, in the same order - must
+    // stay in lockstep with payloadPadding or the byteStart values just
+    // written into entryBlock stop matching where these bytes actually
+    // land in `scratch`.
+    static const uint8_t kZeroPad8[7] = {0};
+    for (NSUInteger i = 0; i < payloads.count; i++) {
+        uint64_t pad = payloadPadding[i].unsignedLongLongValue;
+        if (pad > 0) [scratch appendBytes:kZeroPad8 length:(NSUInteger)pad];
+        [scratch appendData:payloads[i]];
+    }
 
     // Header field fixups - see this method's .h doc for why only
     // these three move (existing entries' byteStart values are
