@@ -1,13 +1,17 @@
 // ModAssetLibrary.m — see the header for the why/shape.
 
 #import "ModAssetLibrary.h"
-#import "UnityBundleCAB.h"
-#import "BundleTransplant.h"
 #import "BankTransplant.h"
 #import "ZTweakLog.h"
 
 NSString * const ModAssetLibraryErrorDomain = @"ModAssetLibraryErrorDomain";
 static NSString * const kMALManifestFileName = @"manifest.json";
+
+// First bytes of a UnityFS-container asset bundle. Not a real parse -
+// just enough of a sniff to tell "this is probably a Unity bundle" from
+// "this definitely isn't", now that UnityBundleCAB.h (the real parser)
+// is gone. See ModAssetLibrary.h's top comment.
+static NSString * const kMALUnityFSMagic = @"UnityFS";
 
 static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
     return [NSError errorWithDomain:ModAssetLibraryErrorDomain
@@ -20,11 +24,13 @@ static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
 - (NSDictionary<NSString *, id> *)mal_dictionaryRepresentation {
     NSMutableDictionary *d = [NSMutableDictionary dictionary];
     d[@"fileName"] = self.fileName;
-    if (self.cab) d[@"cab"] = self.cab;
+    d[@"kind"] = @(self.kind);
     d[@"path"] = self.path;
     d[@"byteSize"] = @(self.byteSize);
     d[@"dateAdded"] = self.dateAdded;
-    if (self.livePathDescription) d[@"livePathDescription"] = self.livePathDescription;
+    if (self.installedStockBundlePath) d[@"installedStockBundlePath"] = self.installedStockBundlePath;
+    d[@"doctored"] = @(self.doctored);
+    d[@"livePathDescription"] = self.livePathDescription;
     return d;
 }
 
@@ -32,11 +38,15 @@ static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
     if (![d[@"fileName"] isKindOfClass:NSString.class] || ![d[@"path"] isKindOfClass:NSString.class]) return nil;
     ModAssetLibraryEntry *e = [ModAssetLibraryEntry new];
     e.fileName = d[@"fileName"];
-    e.cab = [d[@"cab"] isKindOfClass:NSString.class] ? d[@"cab"] : nil;
+    e.kind = [d[@"kind"] isKindOfClass:NSNumber.class] ? [d[@"kind"] integerValue] : ModAssetLibraryEntryKindUnknown;
     e.path = d[@"path"];
     e.byteSize = [d[@"byteSize"] unsignedLongLongValue];
     e.dateAdded = [d[@"dateAdded"] isKindOfClass:NSString.class] ? d[@"dateAdded"] : @"";
-    e.livePathDescription = [d[@"livePathDescription"] isKindOfClass:NSString.class] ? d[@"livePathDescription"] : nil;
+    e.installedStockBundlePath = [d[@"installedStockBundlePath"] isKindOfClass:NSString.class] ? d[@"installedStockBundlePath"] : nil;
+    e.doctored = [d[@"doctored"] boolValue];
+    e.livePathDescription = [d[@"livePathDescription"] isKindOfClass:NSString.class]
+        ? d[@"livePathDescription"]
+        : [ModAssetLibrary mal_livePathDescriptionForKind:e.kind fileName:e.fileName installedStockBundlePath:e.installedStockBundlePath];
     return e;
 }
 
@@ -46,7 +56,8 @@ static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
 + (NSString *)mal_manifestPathForFolder:(NSString *)folderName;
 + (BOOL)mal_writeEntries:(NSArray<ModAssetLibraryEntry *> *)entries toFolder:(NSString *)folderName error:(NSError **)error;
 + (NSString *)mal_uniqueFileNameFor:(NSString *)desired inFolder:(NSString *)folderPath;
-+ (NSString *)mal_livePathDescriptionForCAB:(nullable NSString *)cab fileName:(NSString *)fileName;
++ (ModAssetLibraryEntryKind)mal_kindForFileAtPath:(NSString *)path;
++ (NSString *)mal_libraryRelativePath:(NSString *)path;
 @end
 
 @implementation ModAssetLibrary
@@ -121,6 +132,16 @@ static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
     return YES;
 }
 
++ (BOOL)ensureFolderNamed:(NSString *)name error:(NSError **)error {
+    NSError *createErr = nil;
+    if ([self createFolderNamed:name error:&createErr]) return YES;
+    if (createErr.domain == ModAssetLibraryErrorDomain && createErr.code == ModAssetLibraryErrorFolderAlreadyExists) {
+        return YES;
+    }
+    if (error) *error = createErr;
+    return NO;
+}
+
 + (nullable NSArray<ModAssetLibraryEntry *> *)entriesInFolder:(NSString *)folderName error:(NSError **)error {
     NSString *manifestPath = [self mal_manifestPathForFolder:folderName];
     NSFileManager *fm = NSFileManager.defaultManager;
@@ -170,7 +191,7 @@ static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
 // "name.ext" -> "name 2.ext", "name 2.ext" -> "name 3.ext", etc. -
 // collision-avoidance for two files with the same leaf name imported
 // into the same folder (either in one multi-select, or across two
-// separate Add Asset runs).
+// separate import calls).
 + (NSString *)mal_uniqueFileNameFor:(NSString *)desired inFolder:(NSString *)folderPath {
     NSFileManager *fm = NSFileManager.defaultManager;
     NSString *candidate = desired;
@@ -186,21 +207,37 @@ static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
     return candidate;
 }
 
+// See this header's top comment - a sniff, not a parse. ".bank" by
+// extension is trusted outright (same "not a registered UTI, go by
+// extension" convention -importModTapped already uses in
+// GraphicsDebugOverlay.m); anything else gets a 7-byte read to check for
+// the UnityFS magic. A read failure (unreadable/too-short file) just
+// falls through to Unknown rather than raising - this is bookkeeping,
+// not validation.
++ (ModAssetLibraryEntryKind)mal_kindForFileAtPath:(NSString *)path {
+    if ([path.pathExtension caseInsensitiveCompare:@"bank"] == NSOrderedSame) {
+        return ModAssetLibraryEntryKindBank;
+    }
+
+    NSFileHandle *handle = [NSFileHandle fileHandleForReadingAtPath:path];
+    if (!handle) return ModAssetLibraryEntryKindUnknown;
+    NSData *head = [handle readDataOfLength:kMALUnityFSMagic.length];
+    [handle closeFile];
+    if (head.length != kMALUnityFSMagic.length) return ModAssetLibraryEntryKindUnknown;
+
+    NSString *headString = [[NSString alloc] initWithData:head encoding:NSASCIIStringEncoding];
+    if ([headString isEqualToString:kMALUnityFSMagic]) return ModAssetLibraryEntryKindBundle;
+    return ModAssetLibraryEntryKindUnknown;
+}
+
 // Rewrites an on-disk path under this app's own Library directory into
 // one starting at "Library/..." instead of the full sandbox path
-// ("/var/mobile/Containers/Data/Application/<UUID>/Library/...").
-// Falls through to +mal_sandboxRelativePath: for everything else (most
-// bank paths - they live under the game's own bundle/Documents tree via
+// ("/var/mobile/Containers/Data/Application/<UUID>/Library/..."). Falls
+// through to +mal_sandboxRelativePath: for everything else (bank paths -
+// they live under the game's own Documents tree via
 // +[BankTransplant mobileFMODBuildsDirectory], not this tweak's Library
-// folder), which does the same rewrite rooted at the app's own
-// NSHomeDirectory() instead, so those come back as e.g.
-// "Documents/Assets/Sound/FMODBuilds/Mobile/music.bank" rather than the
-// full "/var/mobile/Containers/Data/Application/<UUID>/..." path.
-// (Previously this fell back to just path.lastPathComponent in that
-// case, which is why a bank's Info dropdown used to show only its
-// filename with no path at all - that was the bug, not a deliberate
-// simplification. Then it fell back to the untouched absolute path,
-// which is the /var/mobile/... the person is now asking to drop too.)
+// folder; likewise a bundle-kind entry's installedStockBundlePath, which
+// can point anywhere the person picked it from).
 + (NSString *)mal_libraryRelativePath:(NSString *)path {
     NSArray<NSString *> *paths = NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES);
     NSString *libraryDir = paths.firstObject;
@@ -216,12 +253,14 @@ static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
 // sandbox home (NSHomeDirectory()) rather than just its Library
 // subdirectory - this is what turns a bank's full
 // "/var/mobile/Containers/Data/Application/<UUID>/Documents/Assets/..."
-// path into "Documents/Assets/..." (the game's own NSDirectory tree),
+// path into "Documents/Assets/..." (the game's own directory tree),
 // since the tweak runs in-process and NSHomeDirectory() here already IS
 // the game's own sandbox home - no separate container lookup needed.
 // Returns `path` unchanged if it doesn't live under the sandbox home at
-// all (shouldn't normally happen for anything this tweak tracks, but
-// better than silently returning an empty string).
+// all - which for a bundle-kind entry's installedStockBundlePath is
+// expected whenever the person picked a stock bundle from outside this
+// app's own sandbox (e.g. a Files-app bookmark into a shared container),
+// not a bug to work around.
 + (NSString *)mal_sandboxRelativePath:(NSString *)path {
     NSString *home = NSHomeDirectory();
     if (home && [path hasPrefix:home]) {
@@ -232,25 +271,31 @@ static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
     return path;
 }
 
-+ (NSString *)mal_livePathDescriptionForCAB:(nullable NSString *)cab fileName:(NSString *)fileName {
-    if (cab) {
-        NSArray<NSString *> *matches = [BundleTransplant cachedDataPathsForCAB:cab];
-        if (matches.count == 0) return @"Not currently cached by the game";
-        NSMutableArray<NSString *> *relatives = [NSMutableArray arrayWithCapacity:matches.count];
-        for (NSString *path in matches) [relatives addObject:[self mal_libraryRelativePath:path]];
-        return [relatives componentsJoinedByString:@", "];
++ (NSString *)mal_livePathDescriptionForKind:(ModAssetLibraryEntryKind)kind
+                                     fileName:(NSString *)fileName
+                     installedStockBundlePath:(nullable NSString *)installedStockBundlePath {
+    switch (kind) {
+        case ModAssetLibraryEntryKindBank: {
+            NSString *bankDir = [BankTransplant mobileFMODBuildsDirectory];
+            NSString *path = bankDir ? [bankDir stringByAppendingPathComponent:fileName] : fileName;
+            return [self mal_libraryRelativePath:path];
+        }
+        case ModAssetLibraryEntryKindBundle: {
+            if (installedStockBundlePath.length == 0) return @"Not installed yet.";
+            return [self mal_libraryRelativePath:installedStockBundlePath];
+        }
+        case ModAssetLibraryEntryKindUnknown:
+        default:
+            return @"Unrecognized file type - no restore action available.";
     }
-    NSString *bankDir = [BankTransplant mobileFMODBuildsDirectory];
-    NSString *path = bankDir ? [bankDir stringByAppendingPathComponent:fileName] : fileName;
-    return [self mal_libraryRelativePath:path];
 }
 
 + (BOOL)importFileURLs:(NSArray<NSURL *> *)moddedURLs intoFolder:(NSString *)folderName error:(NSError **)error {
     NSString *root = [self modLibraryRootDirectory];
-    NSString *folderPath = [root stringByAppendingPathComponent:folderName];
+    NSString *folderPath = root ? [root stringByAppendingPathComponent:folderName] : nil;
     NSFileManager *fm = NSFileManager.defaultManager;
     BOOL isDir = NO;
-    if (!root || ![fm fileExistsAtPath:folderPath isDirectory:&isDir] || !isDir) {
+    if (!folderPath || ![fm fileExistsAtPath:folderPath isDirectory:&isDir] || !isDir) {
         if (error) *error = MALError(ModAssetLibraryErrorFolderNotFound,
             [NSString stringWithFormat:@"No folder named \"%@\" - create it first.", folderName]);
         return NO;
@@ -259,12 +304,6 @@ static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
     NSError *entriesErr = nil;
     NSMutableArray<ModAssetLibraryEntry *> *entries =
         [([self entriesInFolder:folderName error:&entriesErr] ?: @[]) mutableCopy];
-
-    NSDateFormatter *iso = [NSDateFormatter new];
-    iso.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
-    iso.dateFormat = @"yyyy-MM-dd'T'HH:mm:ss'Z'";
-    iso.timeZone = [NSTimeZone timeZoneForSecondsFromGMT:0];
-    NSString *now = [iso stringFromDate:[NSDate date]];
 
     NSInteger importedCount = 0;
     for (NSURL *url in moddedURLs) {
@@ -280,21 +319,7 @@ static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
             continue;
         }
 
-        NSDictionary<NSFileAttributeKey, id> *attrs = [fm attributesOfItemAtPath:destPath error:nil];
-        NSError *cabErr = nil;
-        NSString *cab = [UnityBundleCAB primaryCABForBundleAtPath:destPath error:&cabErr]; // nil is fine - not every tracked file is a Unity bundle
-
-        ModAssetLibraryEntry *entry = [ModAssetLibraryEntry new];
-        entry.fileName = destName;
-        entry.cab = cab;
-        entry.path = destPath;
-        entry.byteSize = attrs.fileSize;
-        entry.dateAdded = now;
-        // Resolved here, once, and never again - see ModAssetLibrary.h's
-        // own comment on livePathDescription for why recomputing this on
-        // every UI render (as the Info dropdown used to) doesn't scale.
-        entry.livePathDescription = [self mal_livePathDescriptionForCAB:cab fileName:destName];
-        [entries addObject:entry];
+        [entries addObject:[self mal_entryForNewlyCopiedFileAtPath:destPath fileName:destName doctored:NO]];
         importedCount++;
     }
 
@@ -304,6 +329,102 @@ static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
     }
 
     return [self mal_writeEntries:entries toFolder:folderName error:error];
+}
+
++ (nullable ModAssetLibraryEntry *)importLocalFileAtPath:(NSString *)localPath
+                                                intoFolder:(NSString *)folderName
+                                                 doctored:(BOOL)doctored
+                                                     error:(NSError **)error {
+    NSString *root = [self modLibraryRootDirectory];
+    NSString *folderPath = root ? [root stringByAppendingPathComponent:folderName] : nil;
+    NSFileManager *fm = NSFileManager.defaultManager;
+    BOOL isDir = NO;
+    if (!folderPath || ![fm fileExistsAtPath:folderPath isDirectory:&isDir] || !isDir) {
+        if (error) *error = MALError(ModAssetLibraryErrorFolderNotFound,
+            [NSString stringWithFormat:@"No folder named \"%@\" - create it first.", folderName]);
+        return nil;
+    }
+
+    NSString *destName = [self mal_uniqueFileNameFor:localPath.lastPathComponent inFolder:folderPath];
+    NSString *destPath = [folderPath stringByAppendingPathComponent:destName];
+
+    NSError *copyErr = nil;
+    if (![fm copyItemAtPath:localPath toPath:destPath error:&copyErr]) {
+        if (error) *error = copyErr ?: MALError(ModAssetLibraryErrorCopyFailed, @"Couldn't copy the file into the library.");
+        return nil;
+    }
+
+    ModAssetLibraryEntry *entry = [self mal_entryForNewlyCopiedFileAtPath:destPath fileName:destName doctored:doctored];
+
+    NSError *entriesErr = nil;
+    NSMutableArray<ModAssetLibraryEntry *> *entries =
+        [([self entriesInFolder:folderName error:&entriesErr] ?: @[]) mutableCopy];
+    [entries addObject:entry];
+
+    NSError *writeErr = nil;
+    if (![self mal_writeEntries:entries toFolder:folderName error:&writeErr]) {
+        if (error) *error = writeErr;
+        return nil;
+    }
+    return entry;
+}
+
++ (ModAssetLibraryEntry *)mal_entryForNewlyCopiedFileAtPath:(NSString *)destPath
+                                                     fileName:(NSString *)destName
+                                                     doctored:(BOOL)doctored {
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSDictionary<NSFileAttributeKey, id> *attrs = [fm attributesOfItemAtPath:destPath error:nil];
+    ModAssetLibraryEntryKind kind = [self mal_kindForFileAtPath:destPath];
+
+    NSDateFormatter *iso = [NSDateFormatter new];
+    iso.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+    iso.dateFormat = @"yyyy-MM-dd'T'HH:mm:ss'Z'";
+    iso.timeZone = [NSTimeZone timeZoneForSecondsFromGMT:0];
+
+    ModAssetLibraryEntry *entry = [ModAssetLibraryEntry new];
+    entry.fileName = destName;
+    entry.kind = kind;
+    entry.path = destPath;
+    entry.byteSize = attrs.fileSize;
+    entry.dateAdded = [iso stringFromDate:[NSDate date]];
+    entry.doctored = (kind == ModAssetLibraryEntryKindBundle) && doctored;
+    // Resolved here, once - see ModAssetLibrary.h's own comment on
+    // livePathDescription. No installedStockBundlePath yet for a
+    // freshly-imported bundle-kind entry, so this starts out as
+    // "Not installed yet." until a caller reports a real install via
+    // +recordInstalledStockBundlePath:forEntry:inFolder:error:.
+    entry.livePathDescription = [self mal_livePathDescriptionForKind:kind fileName:destName installedStockBundlePath:nil];
+    return entry;
+}
+
++ (BOOL)recordInstalledStockBundlePath:(NSString *)stockBundlePath
+                              forEntry:(ModAssetLibraryEntry *)entry
+                              inFolder:(NSString *)folderName
+                                 error:(NSError **)error {
+    NSError *entriesErr = nil;
+    NSArray<ModAssetLibraryEntry *> *current = [self entriesInFolder:folderName error:&entriesErr];
+    if (!current) {
+        if (error) *error = entriesErr;
+        return NO;
+    }
+
+    BOOL found = NO;
+    for (ModAssetLibraryEntry *e in current) {
+        if (![e.path isEqualToString:entry.path]) continue;
+        found = YES;
+        e.installedStockBundlePath = stockBundlePath;
+        e.doctored = YES; // only ever recorded after a successful BundleDoctorInstaller swap
+        e.livePathDescription = [self mal_livePathDescriptionForKind:e.kind fileName:e.fileName installedStockBundlePath:stockBundlePath];
+        break;
+    }
+
+    if (!found) {
+        if (error) *error = MALError(ModAssetLibraryErrorEntryNotFound,
+            [NSString stringWithFormat:@"No entry matching \"%@\" in \"%@\".", entry.fileName, folderName]);
+        return NO;
+    }
+
+    return [self mal_writeEntries:current toFolder:folderName error:error];
 }
 
 + (BOOL)removeEntry:(ModAssetLibraryEntry *)entry fromFolder:(NSString *)folderName error:(NSError **)error {

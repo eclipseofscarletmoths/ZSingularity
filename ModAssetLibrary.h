@@ -3,25 +3,45 @@
 // Bookkeeping only - this does NOT swap anything into the game itself.
 // It's a user-organized shelf of modded asset files (grouped into named
 // folders, e.g. one per mod pack) living under +modLibraryRootDirectory,
-// each folder backed by one manifest.json tracking what's in it. The
-// Mods panel's "Add Asset" flow copies picked files in here and records
-// them; the accordion list reads this back to render folders/entries.
+// each folder backed by one manifest.json tracking what's in it.
 //
-// Per-entry CAB (when the file parses as a Unity bundle - see
-// UnityBundleCAB.h) is what lets a single entry's "Reset" button target
-// BundleTransplant's existing per-CAB restore
-// (+restoreBackedUpBundlesForCAB:force:error:) rather than the
-// all-or-nothing +restoreAllBackedUpBundlesWithForce:error:. Files that
-// don't parse as a Unity bundle (e.g. an FMOD .bank picked in here by
-// mistake, or any other file) are still tracked with cab == nil - reset
-// isn't available for those from an entry row; BankTransplant.h's own
-// restore-everything button is the only lever for that file type.
+// REIMPLEMENTED against the current pipeline. The original version of
+// this class (see git history) resolved a bundle-kind entry's "where did
+// this go" field by reading its CAB out of the file itself
+// (UnityBundleCAB.h) and matching that against BundleTransplant's own
+// live-scanned cache of __data files. Both of those classes are gone -
+// see the README's "Visual (bundle/texture) mod support - removed"
+// section - along with the whole in-process retarget pipeline they
+// belonged to. There is no CAB parser and no cache scanner left in this
+// project to lean on.
 //
-// This intentionally does not try to read a Unity bundle's size against
-// the live cache the way BundleTransplant does at swap time - byteSize
-// here is just this ON-DISK LIBRARY COPY's own size, recorded once at
-// import time, for display and as one of the "uniquely identifiable"
-// fields requested. It is not re-validated against anything.
+// So this version tracks less, on purpose:
+//   - `kind` is a cheap sniff (file extension + a "UnityFS" magic check
+//     on the first few bytes - see +mal_kindForFileAtPath: in the .m) as
+//     opposed to a real parse. It only has to be good enough to route an
+//     entry to the right restore action; it doesn't need to know
+//     anything about the bundle's internal structure.
+//   - `installedStockBundlePath` replaces the old CAB-matched
+//     `livePathDescription` for bundle-kind entries. It's not resolved
+//     automatically - it's RECORDED, once, by
+//     +recordInstalledStockBundlePath:forEntry:inFolder:error: after a
+//     caller (GraphicsDebugOverlay's Load Mods flow) has actually run an
+//     entry through BundleDoctorService + BundleDoctorInstaller and
+//     knows for a fact which on-disk stock bundle it just overwrote.
+//     There's no live cache to scan for a match anymore, so this class
+//     no longer tries to guess - same shift BundleDoctorInstaller.h's
+//     own header already made (explicit stockBundleURL parameter,
+//     picked by the person, rather than a scanned guess).
+//   - Bank-kind entries keep the same deterministic resolution as
+//     before: +[BankTransplant mobileFMODBuildsDirectory]/<fileName> is
+//     always where a bank-kind entry would install to, since that
+//     directory is fixed and BankTransplant itself is unchanged.
+//
+// livePathDescription is still computed once and cached on the entry
+// (same reasoning as before - a person glancing at "where did this go"
+// doesn't need it recomputed on every render), but it's now cheap enough
+// (no bundle cache scan) that "once, at import/record time" is a
+// convenience rather than a hard requirement.
 
 #import <Foundation/Foundation.h>
 
@@ -33,41 +53,49 @@ typedef NS_ENUM(NSInteger, ModAssetLibraryErrorCode) {
     ModAssetLibraryErrorInvalidFolderName = 1, // empty, or not representable as a single path component
     ModAssetLibraryErrorFolderAlreadyExists,
     ModAssetLibraryErrorFolderNotFound,
+    ModAssetLibraryErrorEntryNotFound,
     ModAssetLibraryErrorCopyFailed,
     ModAssetLibraryErrorManifestReadFailed,
     ModAssetLibraryErrorManifestWriteFailed,
     ModAssetLibraryErrorDeleteFailed,
 };
 
+// What a tracked file looks like, as far as this class can tell without
+// parsing it. Unknown just means "not a .bank and doesn't start with the
+// UnityFS magic" - it's still tracked, just with no restore action of
+// its own (same as the old cab == nil case).
+typedef NS_ENUM(NSInteger, ModAssetLibraryEntryKind) {
+    ModAssetLibraryEntryKindUnknown = 0,
+    ModAssetLibraryEntryKindBank,
+    ModAssetLibraryEntryKindBundle,
+};
+
 // One tracked file inside one folder. See this header's own top comment
 // for what each field means and where it comes from.
 @interface ModAssetLibraryEntry : NSObject
 @property (nonatomic, copy) NSString *fileName;
-@property (nonatomic, copy, nullable) NSString *cab;     // nil if this isn't a parseable Unity bundle
+@property (nonatomic, assign) ModAssetLibraryEntryKind kind;
 @property (nonatomic, copy) NSString *path;               // full on-disk path, under the owning folder
 @property (nonatomic, assign) unsigned long long byteSize;
 @property (nonatomic, copy) NSString *dateAdded;           // ISO 8601, UTC
 
-// Human-readable description of where this file lives (or would live)
-// WITHIN THE GAME's own files - i.e. wherever it was/would be swapped
-// into. For a bundle this means resolving every cached __data whose own
-// CAB matches this entry's (there can be more than one - see
-// BundleTransplant.h's own MATCHING note); for a bank it's the one
-// deterministic +[BankTransplant mobileFMODBuildsDirectory]/<fileName>.
-//
-// Resolved exactly ONCE, at import time
-// (+importFileURLs:intoFolder:error:), and never recomputed after -
-// resolving a bundle's match means reading every cached __data's CAB
-// header (see UnityBundleCAB.h), which does not scale to "once per UI
-// render": recomputing it every time an entry's Info dropdown opened
-// used to mean rescanning the entire Unity bundle cache on every tap,
-// which is exactly the hang this field exists to avoid. The tradeoff is
-// staleness - if the game's cache changes shape after import (a fresh
-// login re-caches something under a new hash, say), this won't reflect
-// that until the entry is re-imported. Given what this field is FOR
-// (a human glancing at "where did this go"), that's the right side of
-// the tradeoff to be on.
-@property (nonatomic, copy, nullable) NSString *livePathDescription;
+// Bundle-kind only. The stock bundle path this entry was last installed
+// to via BundleDoctorInstaller, or nil if it never has been. See this
+// header's top comment - this is RECORDED by a caller after a real
+// install, never guessed at.
+@property (nonatomic, copy, nullable) NSString *installedStockBundlePath;
+
+// Bundle-kind only. Whether this library copy is itself already the
+// doctored (re-platformed/re-encoded) output of BundleDoctorService, as
+// opposed to the original modded desktop bundle still awaiting a trip
+// through it. Purely informational - this class doesn't act on it.
+@property (nonatomic, assign) BOOL doctored;
+
+// Human-readable "where this lives (or would live) within the game's
+// own files" - see this header's top comment for how this differs per
+// kind. Never nil; falls back to a plain "Not installed yet." for
+// bundle-kind entries with no installedStockBundlePath.
+@property (nonatomic, copy) NSString *livePathDescription;
 @end
 
 @interface ModAssetLibrary : NSObject
@@ -88,6 +116,13 @@ typedef NS_ENUM(NSInteger, ModAssetLibraryErrorCode) {
 // silently sanitizing into something the person didn't type.
 + (BOOL)createFolderNamed:(NSString *)name error:(NSError **)error;
 
+// Same as +createFolderNamed:error:, except an already-existing folder
+// with this name is treated as success (its existing manifest is left
+// untouched) rather than ModAssetLibraryErrorFolderAlreadyExists. For
+// callers (like GraphicsDebugOverlay's bank/bundle flows) that just want
+// "make sure this folder exists" without caring whether it already did.
++ (BOOL)ensureFolderNamed:(NSString *)name error:(NSError **)error;
+
 // Reads folderName's manifest.json back into entries, oldest-added
 // first. Returns nil (not an empty array) with error filled if the
 // folder itself doesn't exist.
@@ -95,12 +130,12 @@ typedef NS_ENUM(NSInteger, ModAssetLibraryErrorCode) {
 
 // Copies each URL into folderName (renaming on collision by appending
 // " 2", " 3", ... before the extension - never silently overwrites an
-// existing tracked file), attempts a CAB read on each (best-effort -
-// UnityBundleCAB failure just means cab stays nil, not a hard failure
-// for the whole import), and appends one entry per file to that
-// folder's manifest.json. moddedURLs are handled the same
-// security-scoped-resource way BankTransplant/BundleTransplant already
-// do for picker URLs.
+// existing tracked file), sniffs each one's `kind` (best-effort - see
+// this header's top comment; a sniff failure just means kind stays
+// Unknown, not a hard failure for the whole import), and appends one
+// entry per file to that folder's manifest.json. moddedURLs are handled
+// the same security-scoped-resource way BankTransplant/
+// BundleDoctorService already do for picker URLs.
 //
 // Partial success is possible (some files copy, one doesn't) - this
 // still returns YES if at least one file made it in, with the failures
@@ -109,19 +144,44 @@ typedef NS_ENUM(NSInteger, ModAssetLibraryErrorCode) {
 // manifest couldn't be written back at all.
 + (BOOL)importFileURLs:(NSArray<NSURL *> *)moddedURLs intoFolder:(NSString *)folderName error:(NSError **)error;
 
+// Copies a single already-on-disk file (not a security-scoped picker
+// URL - e.g. a temp file this tweak produced itself, like
+// BundleDoctorService's doctored-bundle output) into folderName the same
+// way +importFileURLs:intoFolder:error: does, and returns the resulting
+// entry directly so a caller can immediately follow up with
+// +recordInstalledStockBundlePath:forEntry:inFolder:error: without a
+// second +entriesInFolder: round trip. `doctored` seeds the new entry's
+// doctored flag (irrelevant for bank-kind files).
++ (nullable ModAssetLibraryEntry *)importLocalFileAtPath:(NSString *)localPath
+                                                intoFolder:(NSString *)folderName
+                                                 doctored:(BOOL)doctored
+                                                     error:(NSError **)error;
+
+// Updates one bundle-kind entry's installedStockBundlePath (and
+// livePathDescription) after a real BundleDoctorInstaller swap, and
+// rewrites the manifest. `entry` is matched by its `path` against what's
+// currently on disk for folderName - pass back the same
+// ModAssetLibraryEntry (or an equal-`path` one) returned by
+// +importLocalFileAtPath:intoFolder:doctored:error: or
+// +entriesInFolder:error:. Fails with ModAssetLibraryErrorEntryNotFound
+// if no current entry in folderName has a matching path.
++ (BOOL)recordInstalledStockBundlePath:(NSString *)stockBundlePath
+                              forEntry:(ModAssetLibraryEntry *)entry
+                              inFolder:(NSString *)folderName
+                                 error:(NSError **)error;
+
 // Removes one entry's on-disk file and its manifest.json record. Does
-// NOT touch anything under +unityCacheSharedDirectory/
-// +mobileFMODBuildsDirectory or either backup directory - this only
-// forgets the library's own tracked copy.
+// NOT touch anything under +[BankTransplant mobileFMODBuildsDirectory]
+// or wherever a bundle-kind entry's installedStockBundlePath points -
+// this only forgets the library's own tracked copy.
 + (BOOL)removeEntry:(ModAssetLibraryEntry *)entry fromFolder:(NSString *)folderName error:(NSError **)error;
 
 // Deletes folderName entirely - its manifest.json, every tracked file
 // under it, and the folder itself. Same "library bookkeeping only"
-// scope as +removeEntry:fromFolder:error: - does NOT touch anything
-// under +unityCacheSharedDirectory/+mobileFMODBuildsDirectory or
-// either backup directory; callers that want the actual swapped-in
-// files restored first should walk +entriesInFolder:error: and drive
-// BundleTransplant/BankTransplant themselves before calling this.
+// scope as +removeEntry:fromFolder:error: - does NOT touch anything the
+// game itself reads; callers that want swapped-in files restored first
+// should drive BankTransplant/BundleDoctorInstaller themselves before
+// calling this.
 + (BOOL)deleteFolderNamed:(NSString *)folderName error:(NSError **)error;
 
 // Renames folderName's directory in place (its manifest.json and every

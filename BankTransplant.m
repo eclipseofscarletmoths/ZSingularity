@@ -30,8 +30,7 @@ static NSString * const kBTBackupSuffix = @".orig-bak";
     return [documentsDir stringByAppendingPathComponent:@"Assets/Sound/FMODBuilds/Mobile"];
 }
 
-// Backups deliberately do NOT live in +mobileFMODBuildsDirectory - same
-// lesson as BundleTransplant's swap backups (see that file's notes):
+// Backups deliberately do NOT live in +mobileFMODBuildsDirectory:
 // whatever validates that directory treated an unexpected
 // <name>.bank.orig-bak sibling sitting there as reason to flag the bank
 // and force a redownload, and since a backup is written once and then

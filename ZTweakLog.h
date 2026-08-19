@@ -32,19 +32,4 @@ static NSString * const kZLogTag = @"[ZSingularity]";
 
 #define ZLog(fmt, ...) NSLog(@"%@ " fmt, kZLogTag, ##__VA_ARGS__)
 
-// Extra-detail tier, added specifically to debug the Texture2D retarget
-// pipeline's per-object behavior (why a given object parsed/didn't,
-// which conversion decision it got, whether its patch verified, etc.) -
-// see findings.md. Same kZLogTag, so it still shows up in the debug
-// panel's Verbose overlay filter same as ZLog, but gated separately so
-// a full per-object trace across every object in a bundle (a couple
-// hundred lines, easily) doesn't drown out the terse one-line-per-stage
-// summaries every normal run already produces via plain ZLog. Flip to
-// NO once the pipeline's behavior on a given bundle/corpus is
-// understood - this is diagnostic-session logging, not steady-state
-// output every call site should assume is on.
-static BOOL kZSVerbosePipelineLogging = YES;
-
-#define ZLogVerbose(fmt, ...) do { if (kZSVerbosePipelineLogging) NSLog(@"%@[verbose] " fmt, kZLogTag, ##__VA_ARGS__); } while (0)
-
 #endif /* ZTweakLog_h */

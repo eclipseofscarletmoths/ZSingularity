@@ -19,8 +19,7 @@
 // can always get back to the untouched stock file regardless of how many
 // times a bank has since been re-swapped.
 //
-// IMPORTANT (learned the hard way, see BundleTransplant.h for the same
-// lesson on the visual-asset side): that backup must NOT live inside
+// IMPORTANT (learned the hard way): that backup must NOT live inside
 // +mobileFMODBuildsDirectory as a same-folder sibling file
 // (<name>.bank.orig-bak right next to <name>.bank). Whatever validates
 // that directory treated an unrecognized extra file as reason to flag
