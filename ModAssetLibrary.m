@@ -1,4 +1,4 @@
-// ModAssetLibrary.m — see the header for the why/shape.
+// ModAssetLibrary.m -- see the header for the why/shape.
 
 #import "ModAssetLibrary.h"
 #import "BankTransplant.h"
@@ -58,6 +58,13 @@ static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
 + (NSString *)mal_uniqueFileNameFor:(NSString *)desired inFolder:(NSString *)folderPath;
 + (ModAssetLibraryEntryKind)mal_kindForFileAtPath:(NSString *)path;
 + (NSString *)mal_libraryRelativePath:(NSString *)path;
++ (NSString *)mal_sandboxRelativePath:(NSString *)path;
++ (NSString *)mal_livePathDescriptionForKind:(ModAssetLibraryEntryKind)kind
+                                     fileName:(NSString *)fileName
+                     installedStockBundlePath:(nullable NSString *)installedStockBundlePath;
++ (ModAssetLibraryEntry *)mal_entryForNewlyCopiedFileAtPath:(NSString *)destPath
+                                                     fileName:(NSString *)destName
+                                                     doctored:(BOOL)doctored;
 @end
 
 @implementation ModAssetLibrary
