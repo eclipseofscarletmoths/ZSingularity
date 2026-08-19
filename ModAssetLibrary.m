@@ -19,6 +19,23 @@ static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
                             userInfo:@{NSLocalizedDescriptionKey: message}];
 }
 
+// Forward-declared here, before ModAssetLibraryEntry's own
+// @implementation below - +mal_fromDictionary: (inside that
+// @implementation) calls +[ModAssetLibrary
+// mal_livePathDescriptionForKind:fileName:installedStockBundlePath:],
+// and an explicit ClassName class-method send needs its declaration
+// visible at the call site, not just somewhere earlier in the file.
+// The rest of ModAssetLibrary's private surface is still forward-
+// declared in the ModAssetLibrary ( ) extension further down, right
+// before its own @implementation - this one's pulled out on its own
+// because it's the one private method a even earlier @implementation
+// block needs.
+@interface ModAssetLibrary (LivePathDescriptionForwardDecl)
++ (NSString *)mal_livePathDescriptionForKind:(ModAssetLibraryEntryKind)kind
+                                     fileName:(NSString *)fileName
+                     installedStockBundlePath:(nullable NSString *)installedStockBundlePath;
+@end
+
 @implementation ModAssetLibraryEntry
 
 - (NSDictionary<NSString *, id> *)mal_dictionaryRepresentation {
@@ -59,9 +76,6 @@ static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
 + (ModAssetLibraryEntryKind)mal_kindForFileAtPath:(NSString *)path;
 + (NSString *)mal_libraryRelativePath:(NSString *)path;
 + (NSString *)mal_sandboxRelativePath:(NSString *)path;
-+ (NSString *)mal_livePathDescriptionForKind:(ModAssetLibraryEntryKind)kind
-                                     fileName:(NSString *)fileName
-                     installedStockBundlePath:(nullable NSString *)installedStockBundlePath;
 + (ModAssetLibraryEntry *)mal_entryForNewlyCopiedFileAtPath:(NSString *)destPath
                                                      fileName:(NSString *)destName
                                                      doctored:(BOOL)doctored;
