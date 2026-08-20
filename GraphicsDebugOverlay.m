@@ -2842,31 +2842,63 @@ static UIView *gd_make_title_block(void) {
 @property (nonatomic, strong) UITextField *authRepoLinkField;
 @property (nonatomic, strong) UITextField *authTokenField;
 
-// Load Mods (BundleDoctorService) two-step picker flow - pick the
-// modded desktop bundle first, doctor it via GitHub Actions, THEN pick
-// the stock bundle to overwrite (see BundleDoctorInstaller.h's header
-// on why this class doesn't guess that location itself). weak refs to
-// the two UIDocumentPickerViewController instances let the shared
-// -documentPicker:didPickDocumentsAtURLs: delegate method (also used by
-// -importModTapped's own picker) tell which step just completed;
-// pendingDoctoredBundleURL bridges the two steps.
-@property (nonatomic, weak) UIDocumentPickerViewController *doctorSourcePicker;
+// Load Mods is a single button that routes each picked file to its own
+// pipeline by kind (see -gd_handleLoadModsPickedURLs:intoFolder:): a
+// .bank goes straight through BankTransplant (synchronous, batched);
+// an "__data" asset bundle is queued and run one at a time through
+// BundleDoctorService's upload-doctor-pick-target-install flow, since
+// that flow needs its own on-device target-file picker per bundle
+// (see BundleDoctorInstaller.h's header on why this class doesn't
+// guess that location itself) and can't be batched the way bank swaps
+// can. doctorTargetPicker is a weak ref to the live target-file picker
+// so the shared -documentPicker:didPickDocumentsAtURLs: delegate
+// method knows which step just completed; pendingDoctoredBundleURL
+// bridges the doctor-upload step to the target-pick step for whichever
+// queue item is currently in flight.
 @property (nonatomic, weak) UIDocumentPickerViewController *doctorTargetPicker;
 @property (nonatomic, strong) NSURL *pendingDoctoredBundleURL;
 
-// Mods Library (ModAssetLibrary.h) - bookkeeping-only shelf of tracked
-// mod files, organized into named folders, rendered as an accordion
-// directly under the Load Mods row. Not wired to the swap-in pipelines
-// above (Import Bank Mod / Load Mods) - Add just files a copy away for
-// later reference; see -gd_rebuildModsLibrary.
+// Load Mods' own file picker (routes into
+// -gd_handleLoadModsPickedURLs:intoFolder: below) plus the folder that
+// was just created/named via -gd_promptForModFolderNameWithTitle:...
+// immediately before it was shown - see -loadModsTapped. Every file
+// submitted through this picker is imported into that folder (tracked
+// in the Mod Asset Library) regardless of whether it also routes to a
+// swap-in pipeline below.
+@property (nonatomic, weak) UIDocumentPickerViewController *loadModsPicker;
+@property (nonatomic, copy) NSString *loadModsTargetFolder;
+
+// Queue + running report for one Load Mods submission. loadModsDoctorQueue
+// holds the still-pending "__data" URLs (bank files don't queue - they're
+// swapped synchronously as a batch before the queue starts draining);
+// loadModsCurrentDoctorSourceURL is whichever one is currently mid-flight
+// through the doctor pipeline, kept around only so the eventual
+// success/failure line in loadModsSummaryLines can name the right file
+// (the doctor pipeline's own intermediate values, like the doctored temp
+// file, don't carry that name). loadModsSummaryLines accumulates one line
+// per submitted file - unrecognized-kind, bank-swap result, and
+// doctor-pipeline result alike - and is flushed into one combined alert
+// by -gd_presentLoadModsFinalSummary once nothing is left queued.
+@property (nonatomic, strong) NSMutableArray<NSURL *> *loadModsDoctorQueue;
+@property (nonatomic, strong) NSURL *loadModsCurrentDoctorSourceURL;
+@property (nonatomic, strong) NSMutableArray<NSString *> *loadModsSummaryLines;
+
+// Mods Library (ModAssetLibrary.h) - bookkeeping shelf of tracked mod
+// files, organized into named folders, rendered as an accordion in the
+// same Mods section directly under the Load Mods / Restore Originals
+// row (no section of its own). A folder is only ever created as part
+// of -loadModsTapped now - there's no standalone "New Folder" control
+// - and Load Mods is what imports files into it (see
+// -gd_handleLoadModsPickedURLs:intoFolder: above). A folder's own
+// "+" pill (gd_make_mods_folder_row) still adds more files into it
+// later without going through Load Mods again.
 @property (nonatomic, strong) UIStackView *modsLibraryStack;
 @property (nonatomic, strong) NSMutableSet<NSString *> *modsLibraryExpandedFolders;      // folder names currently expanded
 @property (nonatomic, strong) NSMutableSet<NSString *> *modsLibraryExpandedInfoEntries;  // entry paths whose Info dropdown is open
-// Generic "Add Asset" picker flow, separate from the doctor two-step
-// picker pair above - weak ref to the live picker (so
-// -documentPicker:didPickDocumentsAtURLs: can tell it apart from the
-// doctor pickers/importModTapped's own) plus which folder it's
-// importing into.
+// Generic "Add Asset" picker flow, separate from Load Mods' own picker
+// and the doctor target picker above - weak ref to the live picker (so
+// -documentPicker:didPickDocumentsAtURLs: can tell it apart from those)
+// plus which folder it's importing into.
 @property (nonatomic, weak) UIDocumentPickerViewController *libraryImportPicker;
 @property (nonatomic, copy) NSString *libraryImportTargetFolder;
 
@@ -3579,21 +3611,25 @@ static const CGFloat kContentFadeHeight = 22;
     [self gd_rebuildSyslogBlacklistEntries];
 
     // --- Mods ---
-    // BankTransplant.h does the actual splice/backup/swap for Import
-    // Bank Mod - see that file's header; it sniffs each picked file by
-    // extension (.bank) and hands it to BankTransplant directly. Load
-    // Mods below is the separate BundleDoctorService cloud pipeline for
-    // bundle assets. Restore Originals reverts every backed-up .bank to
-    // its stock bytes. The Mods Library accordion further down (see
-    // "--- Mods Library ---") is a separate, purely organizational
-    // shelf on top of these two (ModAssetLibrary.h) - it doesn't swap
-    // anything into the game itself.
+    // Load Mods is a single button - see -loadModsTapped and
+    // -gd_handleLoadModsPickedURLs:intoFolder: - that prompts for a
+    // folder name, then presents one file picker and routes each
+    // picked file to its own pipeline by kind: BankTransplant.h does
+    // the actual splice/backup/swap for a .bank; an "__data" asset
+    // bundle is queued through BundleDoctorService's cloud doctor
+    // pipeline instead (re-platformed to iOS + textures re-encoded via
+    // the GitHub Actions workflow configured in the Auth section
+    // below, then slotted in via BundleDoctorInstaller). Every
+    // submitted file is also imported into the named folder in the
+    // Mod Asset Library right below this row, regardless of which
+    // pipeline (if any) it routed to. Restore Originals reverts every
+    // backed-up .bank to its stock bytes.
     gd_add_section_header(self.stack, @"Mods");
     GDRow *modsRow = gd_make_button_pair_row(
-        @"Import Bank Mod", [UIColor colorWithRed:0.42 green:0.62 blue:1.0 alpha:1.0],
+        @"Load Mods", [UIColor colorWithRed:0.55 green:0.42 blue:1.0 alpha:1.0],
         @"Restore Originals", [UIColor colorWithRed:1.0 green:0.42 blue:0.42 alpha:1.0]);
-    UIButton *importModButton = objc_getAssociatedObject(modsRow, "gd_button_left");
-    [importModButton addTarget:self action:@selector(importModTapped) forControlEvents:UIControlEventTouchUpInside];
+    UIButton *loadModsButton = objc_getAssociatedObject(modsRow, "gd_button_left");
+    [loadModsButton addTarget:self action:@selector(loadModsTapped) forControlEvents:UIControlEventTouchUpInside];
     UIButton *restoreOriginalsButton = objc_getAssociatedObject(modsRow, "gd_button_right");
     // Hold-to-confirm (1.5s, same red-fill mechanism as the Syslog
     // button's own hold - see gd_attach_pill_hold_to_confirm) rather
@@ -3608,33 +3644,17 @@ static const CGFloat kContentFadeHeight = 22;
     });
     [self.stack addArrangedSubview:modsRow];
 
-    // Load Mods - BundleDoctorService's send-and-intercept pipeline
-    // (see that file's header): pick a modded DESKTOP bundle, it's
-    // forwarded to the GitHub Actions workflow configured in the Auth
-    // section below, doctored (re-platformed to iOS + textures
-    // re-encoded), and slotted in via BundleDoctorInstaller once it
-    // comes back - see -loadModsTapped.
-    GDRow *loadModsRow = gd_make_single_button_row(@"Load Mods", [UIColor colorWithRed:0.55 green:0.42 blue:1.0 alpha:1.0]);
-    UIButton *loadModsButton = objc_getAssociatedObject(loadModsRow, "gd_button");
-    [loadModsButton addTarget:self action:@selector(loadModsTapped) forControlEvents:UIControlEventTouchUpInside];
-    [self.stack addArrangedSubview:loadModsRow];
-
-    // --- Mods Library ---
-    // Bookkeeping-only shelf of tracked mod files, organized into named
-    // folders (see ModAssetLibrary.h) - NOT wired to either swap-in
-    // pipeline above. "+ New Folder" prompts for a name and creates an
-    // empty one; each folder's own "+" pill (gd_make_mods_folder_row)
-    // adds more files into it later without going through this prompt
-    // again. modsLibraryExpandedFolders/modsLibraryExpandedInfoEntries
-    // persist which folders/entries are expanded across a
-    // -gd_rebuildModsLibrary rebuild, the same way syslogBlacklist's
-    // own entries survive rebuilds.
-    gd_add_section_header(self.stack, @"Mods Library");
-    GDRow *newFolderRow = gd_make_single_button_row(@"New Folder", [UIColor colorWithRed:0.42 green:0.62 blue:1.0 alpha:1.0]);
-    UIButton *newFolderButton = objc_getAssociatedObject(newFolderRow, "gd_button");
-    [newFolderButton addTarget:self action:@selector(gd_newModFolderTapped) forControlEvents:UIControlEventTouchUpInside];
-    [self.stack addArrangedSubview:newFolderRow];
-
+    // Mod Asset Library - bookkeeping shelf of tracked mod files (see
+    // ModAssetLibrary.h), rendered as an accordion directly under the
+    // row above. Lives in the same Mods section rather than one of its
+    // own - there's no header here. A folder is only ever created as
+    // part of -loadModsTapped now (no standalone "New Folder" control);
+    // each folder's own "+" pill (gd_make_mods_folder_row) still adds
+    // more files into it later without going through Load Mods again.
+    // modsLibraryExpandedFolders/modsLibraryExpandedInfoEntries persist
+    // which folders/entries are expanded across a -gd_rebuildModsLibrary
+    // rebuild, the same way syslogBlacklist's own entries survive
+    // rebuilds.
     self.modsLibraryExpandedFolders = [NSMutableSet set];
     self.modsLibraryExpandedInfoEntries = [NSMutableSet set];
     self.modsLibraryStack = [[UIStackView alloc] init];
@@ -3786,21 +3806,52 @@ static const CGFloat kContentFadeHeight = 22;
     [haptic impactOccurred];
 }
 
-#pragma mark Mods (import)
+#pragma mark Mods (Load Mods - single entry point, routes by file kind)
 //
-// UI-side glue only - the actual splice/backup/swap logic lives in
-// BankTransplant.h. See that file's header for what "transplant"
-// means here. This is a direct one-file swap: pick a modded .bank, it
-// replaces the matching stock .bank under
-// Documents/Assets/Sound/FMODBuilds/Mobile. The separate Mods Library
-// accordion (organizational only, doesn't swap anything in) is handled
-// by its own "#pragma mark Mods Library" section further down.
+// UI-side glue only. Two swap-in pipelines live behind this one
+// button: BankTransplant.h does the actual splice/backup/swap for a
+// .bank (see that file's header for what "transplant" means there);
+// an "__data" asset bundle goes through the separate BundleDoctorService
+// cloud pipeline further down (see "#pragma mark Mods (doctor
+// pipeline)"). Every file submitted through Load Mods is also imported
+// into the Mod Asset Library folder created for this run, regardless
+// of which (if either) pipeline it routed to - see
+// -gd_handleLoadModsPickedURLs:intoFolder:. The Mods Library accordion
+// itself (organizational bookkeeping only, doesn't swap anything in)
+// is handled by its own "#pragma mark Mods Library" section further
+// down.
+
+// Load Mods' entry point: prompts for a folder name first (reusing the
+// same compact one-field prompt the old standalone "New Folder"
+// control used), creates that folder, then presents the file picker.
+// Every file the person submits in that picker goes into the
+// just-created folder - see -gd_handleLoadModsPickedURLs:intoFolder:.
+- (void)loadModsTapped {
+    __weak typeof(self) weakSelf = self;
+    [self gd_promptForModFolderNameWithTitle:@"New Mod Folder"
+                                  actionTitle:@"Create"
+                                   completion:^(NSString *trimmedName) {
+        typeof(self) strongSelf = weakSelf;
+        if (!strongSelf) return;
+
+        NSError *error = nil;
+        BOOL created = [ModAssetLibrary createFolderNamed:trimmedName error:&error];
+        if (!created) {
+            [strongSelf gd_presentModsAlertWithTitle:@"Couldn't Create Folder" message:error.localizedDescription ?: @"Unknown error."];
+            return;
+        }
+        [strongSelf gd_rebuildModsLibrary];
+        [strongSelf gd_presentLoadModsPickerIntoFolder:trimmedName];
+    }];
+}
 
 // Presents the system file picker so the person can hand-pick one or
-// more modded .bank files. There's no registered UTI for ".bank" (an
-// FMOD-specific container, not a system type), so this opens on the
-// generic "any file" content type rather than filtering.
-- (void)importModTapped {
+// more mod files of either recognized kind (.bank or "__data") in a
+// single pass. There's no registered UTI for either (an FMOD-specific
+// container and an extensionless Unity asset bundle, not system
+// types), so this opens on the generic "any file" content type rather
+// than filtering.
+- (void)gd_presentLoadModsPickerIntoFolder:(NSString *)folderName {
     UIDocumentPickerViewController *picker;
     if (@available(iOS 14.0, *)) {
         picker = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTTypeData, UTTypeItem]];
@@ -3816,13 +3867,17 @@ static const CGFloat kContentFadeHeight = 22;
         ZLog(@"[Mods] no root view controller to present the file picker from");
         return;
     }
+    self.loadModsPicker = picker;
+    self.loadModsTargetFolder = folderName;
     [presenter presentViewController:picker animated:YES completion:nil];
 }
 
 - (void)documentPicker:(UIDocumentPickerViewController *)controller didPickDocumentsAtURLs:(NSArray<NSURL *> *)urls {
     if (urls.count == 0) return;
-    if (controller == self.doctorSourcePicker) {
-        [self gd_handlePickedDoctorSourceURL:urls.firstObject];
+    if (controller == self.loadModsPicker) {
+        NSString *folderName = self.loadModsTargetFolder;
+        self.loadModsTargetFolder = nil;
+        if (folderName) [self gd_handleLoadModsPickedURLs:urls intoFolder:folderName];
         return;
     }
     if (controller == self.doctorTargetPicker) {
@@ -3835,26 +3890,82 @@ static const CGFloat kContentFadeHeight = 22;
         if (folderName) [self gd_handlePickedLibraryImportURLs:urls intoFolder:folderName];
         return;
     }
-    [self gd_handlePickedModURLs:urls];
 }
 
 - (void)documentPickerWasCancelled:(UIDocumentPickerViewController *)controller {
-    if (controller == self.doctorTargetPicker && self.pendingDoctoredBundleURL) {
-        // Doctoring already succeeded and produced a temp file - the
-        // person just backed out of picking where it goes. Clean up the
-        // temp file rather than leaking it; they can re-run Load Mods.
-        [[NSFileManager defaultManager] removeItemAtURL:self.pendingDoctoredBundleURL error:nil];
-        self.pendingDoctoredBundleURL = nil;
+    if (controller == self.doctorTargetPicker) {
+        if (self.pendingDoctoredBundleURL) {
+            // Doctoring already succeeded and produced a temp file -
+            // the person just backed out of picking where it goes.
+            // Clean up the temp file rather than leaking it.
+            [[NSFileManager defaultManager] removeItemAtURL:self.pendingDoctoredBundleURL error:nil];
+            self.pendingDoctoredBundleURL = nil;
+        }
+        // Report this queue item as skipped rather than silently
+        // dropping it out of the eventual combined summary, then keep
+        // draining whatever else is still queued behind it.
+        if (self.loadModsCurrentDoctorSourceURL) {
+            [self.loadModsSummaryLines addObject:
+                [NSString stringWithFormat:@"%@: skipped - no destination picked", self.loadModsCurrentDoctorSourceURL.lastPathComponent]];
+            self.loadModsCurrentDoctorSourceURL = nil;
+        }
+        [self gd_startNextLoadModsDoctorQueueItem];
     }
     if (controller == self.libraryImportPicker) {
         self.libraryImportTargetFolder = nil;
     }
 }
 
-// Swaps every picked .bank on a background queue, then reports one
-// combined summary. Anything not ending in .bank is reported back as
-// unrecognized rather than silently dropped or misclassified.
-- (void)gd_handlePickedModURLs:(NSArray<NSURL *> *)urls {
+// Single entry point for everything Load Mods' picker returned.
+// Imports every submitted file into the Mod Asset Library folder named
+// moments earlier (tracked regardless of routing outcome - per spec,
+// anything submitted lands in that folder), then partitions the files
+// by kind: .bank files are swapped synchronously as one batch (see
+// -gd_processLoadModsBankURLs:thenStartDoctorQueue:), "__data" files
+// are queued and drained one at a time through the doctor pipeline
+// (see -gd_startNextLoadModsDoctorQueueItem), and anything else is
+// reported as unrecognized. All three sets land in one combined
+// end-of-run alert - see -gd_presentLoadModsFinalSummary.
+- (void)gd_handleLoadModsPickedURLs:(NSArray<NSURL *> *)urls intoFolder:(NSString *)folderName {
+    if (urls.count == 0) return;
+
+    NSError *importError = nil;
+    BOOL imported = [ModAssetLibrary importFileURLs:urls intoFolder:folderName error:&importError];
+    if (!imported) {
+        ZLog(@"[Mods] couldn't add picked files to Mod Asset Library folder \"%@\": %@", folderName, importError);
+    }
+    [self gd_rebuildModsLibrary];
+
+    NSMutableArray<NSURL *> *bankURLs = [NSMutableArray array];
+    NSMutableArray<NSURL *> *doctorURLs = [NSMutableArray array];
+    NSMutableArray<NSString *> *unrecognizedLines = [NSMutableArray array];
+
+    for (NSURL *url in urls) {
+        if ([url.pathExtension caseInsensitiveCompare:@"bank"] == NSOrderedSame) {
+            [bankURLs addObject:url];
+        } else if ([url.lastPathComponent caseInsensitiveCompare:@"__data"] == NSOrderedSame) {
+            [doctorURLs addObject:url];
+        } else {
+            [unrecognizedLines addObject:[NSString stringWithFormat:@"%@: not a recognized bank or bundle", url.lastPathComponent]];
+        }
+    }
+
+    self.loadModsSummaryLines = [NSMutableArray arrayWithArray:unrecognizedLines];
+    self.loadModsDoctorQueue = doctorURLs.count > 0 ? [doctorURLs mutableCopy] : nil;
+
+    [self gd_processLoadModsBankURLs:bankURLs];
+}
+
+// Swaps every picked .bank on a background queue as one batch, appends
+// one result line per file to loadModsSummaryLines, then hands off to
+// the doctor queue (which finishes the run itself, or - if nothing was
+// queued - goes straight to -gd_presentLoadModsFinalSummary).
+- (void)gd_processLoadModsBankURLs:(NSArray<NSURL *> *)bankURLs {
+    if (bankURLs.count == 0) {
+        [self gd_startNextLoadModsDoctorQueueItem];
+        return;
+    }
+
     UIViewController *presenter = gd_key_window().rootViewController;
     UIAlertController *working = [UIAlertController alertControllerWithTitle:@"Swapping Files\u2026"
                                                                        message:@"Matching modded banks against stock originals and swapping them in."
@@ -3869,19 +3980,14 @@ static const CGFloat kContentFadeHeight = 22;
     ]];
     if (presenter) [presenter presentViewController:working animated:YES completion:nil];
 
+    __weak typeof(self) weakSelf = self;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSMutableArray<NSString *> *lines = [NSMutableArray array];
-        NSInteger totalSwapped = 0;
 
-        for (NSURL *url in urls) {
-            if ([url.pathExtension caseInsensitiveCompare:@"bank"] != NSOrderedSame) {
-                [lines addObject:[NSString stringWithFormat:@"%@: not a recognized bank", url.lastPathComponent]];
-                continue;
-            }
+        for (NSURL *url in bankURLs) {
             NSError *bankErr = nil;
             BOOL ok = [BankTransplant transplantAndSwapModdedBankAtURL:url error:&bankErr];
             if (ok) {
-                totalSwapped++;
                 [lines addObject:[NSString stringWithFormat:@"%@: swapped", url.lastPathComponent]];
             } else {
                 [lines addObject:[NSString stringWithFormat:@"%@: %@", url.lastPathComponent, bankErr.localizedDescription ?: @"failed"]];
@@ -3889,20 +3995,16 @@ static const CGFloat kContentFadeHeight = 22;
         }
 
         dispatch_async(dispatch_get_main_queue(), ^{
-            void (^showResult)(void) = ^{
-                UINotificationFeedbackGenerator *haptic = [UINotificationFeedbackGenerator new];
-                [haptic notificationOccurred:(totalSwapped > 0) ? UINotificationFeedbackTypeSuccess : UINotificationFeedbackTypeWarning];
-                NSString *title = totalSwapped > 0 ? @"Files Swapped" : @"No Matches";
-                NSString *message = [lines componentsJoinedByString:@"\n"];
-                if (totalSwapped > 0) {
-                    message = [message stringByAppendingString:@"\n\nRestart the game for swapped files to take effect."];
-                }
-                [self gd_presentModsAlertWithTitle:title message:message];
+            void (^afterDismiss)(void) = ^{
+                typeof(self) strongSelf = weakSelf;
+                if (!strongSelf) return;
+                [strongSelf.loadModsSummaryLines addObjectsFromArray:lines];
+                [strongSelf gd_startNextLoadModsDoctorQueueItem];
             };
             if (working.presentingViewController) {
-                [working dismissViewControllerAnimated:YES completion:showResult];
+                [working dismissViewControllerAnimated:YES completion:afterDismiss];
             } else {
-                showResult();
+                afterDismiss();
             }
         });
     });
@@ -3934,51 +4036,67 @@ static const CGFloat kContentFadeHeight = 22;
     [self gd_presentModsAlertWithTitle:@"Restore Originals" message:message];
 }
 
-#pragma mark Mods (Load Mods / doctor pipeline)
+#pragma mark Mods (doctor pipeline)
 //
-// send-and-intercept, client side: pick a modded DESKTOP bundle ->
+// send-and-intercept, client side, one "__data" bundle at a time:
 // BundleDoctorService forwards it to the GitHub Actions workflow
 // configured in the Auth section (repo link + PAT, see
 // -gd_loadAuthFields/-gd_persistAuthFields above) -> once doctored,
 // pick the stock bundle to overwrite -> BundleDoctorInstaller backs it
-// up once and swaps the doctored bytes in. Two separate
-// UIDocumentPickerViewController passes rather than one - see
-// BundleDoctorInstaller.h's header for why this doesn't try to locate
-// the stock bundle's directory itself.
+// up once and swaps the doctored bytes in. Driven entirely by
+// loadModsDoctorQueue (see -gd_startNextLoadModsDoctorQueueItem) -
+// there's no standalone entry point into this anymore; every "__data"
+// file in a Load Mods submission is queued and drained through here
+// one at a time, since the on-device target-file picker step below is
+// inherently a single-file-at-a-time UI, and every result (success,
+// failure, or a cancelled target pick) is folded into the one combined
+// summary Load Mods shows at the end of its run rather than its own
+// separate alert.
 
-- (void)loadModsTapped {
+// Pulls the next "__data" URL off loadModsDoctorQueue and runs it
+// through the doctor pipeline, or - once the queue's empty - closes
+// out the run with -gd_presentLoadModsFinalSummary. Checked once per
+// item rather than once per Load Mods run so a mid-run credential
+// change (however unlikely) isn't assumed to apply to items already
+// queued before it; if auth still isn't configured, every remaining
+// queued item is reported skipped in one pass rather than repeating
+// the same "Auth Not Configured" alert once per file.
+- (void)gd_startNextLoadModsDoctorQueueItem {
+    if (self.loadModsDoctorQueue.count == 0) {
+        [self gd_presentLoadModsFinalSummary];
+        return;
+    }
+
     BundleDoctorConfig *config = [BundleDoctorSettings loadConfig];
     if (config.repoOwner.length == 0 || config.repoName.length == 0 || config.authToken.length == 0) {
-        [self gd_presentModsAlertWithTitle:@"Auth Not Configured"
-                                    message:@"Set a GitHub Repository Link and Personal Access Token under Mods \u2192 Auth first."];
+        for (NSURL *url in self.loadModsDoctorQueue) {
+            [self.loadModsSummaryLines addObject:
+                [NSString stringWithFormat:@"%@: skipped - set a GitHub Repository Link and Personal Access Token under Mods \u2192 Auth first", url.lastPathComponent]];
+        }
+        self.loadModsDoctorQueue = nil;
+        [self gd_presentLoadModsFinalSummary];
         return;
     }
 
-    UIDocumentPickerViewController *picker;
-    if (@available(iOS 14.0, *)) {
-        picker = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTTypeData, UTTypeItem]];
-    } else {
-        picker = [[UIDocumentPickerViewController alloc] initWithDocumentTypes:@[@"public.data", @"public.item"]
-                                                                          inMode:UIDocumentPickerModeImport];
-    }
-    picker.delegate = self;
-    picker.allowsMultipleSelection = NO;
-    self.doctorSourcePicker = picker;
-
-    UIViewController *presenter = gd_key_window().rootViewController;
-    if (!presenter) {
-        ZLog(@"[BundleDoctorService] no root view controller to present the file picker from");
-        return;
-    }
-    [presenter presentViewController:picker animated:YES completion:nil];
+    NSURL *nextURL = self.loadModsDoctorQueue.firstObject;
+    [self.loadModsDoctorQueue removeObjectAtIndex:0];
+    self.loadModsCurrentDoctorSourceURL = nextURL;
+    [self gd_doctorQueueItemAtURL:nextURL];
 }
 
-// Step 1 result: kicks off BundleDoctorService, driving a spinner alert
-// whose message is updated live from the service's progress callback.
-- (void)gd_handlePickedDoctorSourceURL:(NSURL *)moddedURL {
+// Kicks off BundleDoctorService for one queued bundle, driving a
+// spinner alert whose message is updated live from the service's
+// progress callback. remainingInQueue is folded into the spinner's
+// title purely as a "X left" cue when more than one "__data" file was
+// submitted in this Load Mods run - it doesn't change any behavior.
+- (void)gd_doctorQueueItemAtURL:(NSURL *)moddedURL {
     BundleDoctorConfig *config = [BundleDoctorSettings loadConfig];
+    NSInteger remainingInQueue = self.loadModsDoctorQueue.count;
+    NSString *title = remainingInQueue > 0
+        ? [NSString stringWithFormat:@"Doctoring Bundle\u2026 (%ld left after this)", (long)remainingInQueue]
+        : @"Doctoring Bundle\u2026";
 
-    UIAlertController *working = [UIAlertController alertControllerWithTitle:@"Doctoring Bundle\u2026"
+    UIAlertController *working = [UIAlertController alertControllerWithTitle:title
                                                                        message:@"Starting\u2026"
                                                                 preferredStyle:UIAlertControllerStyleAlert];
     UIActivityIndicatorView *spinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
@@ -4004,14 +4122,12 @@ static const CGFloat kContentFadeHeight = 22;
             if (!strongSelf) return;
 
             if (!doctoredBundleURL) {
-                UINotificationFeedbackGenerator *haptic = [UINotificationFeedbackGenerator new];
-                [haptic notificationOccurred:UINotificationFeedbackTypeError];
-                NSString *message = error.localizedDescription ?: @"Unknown error.";
+                NSString *line = [NSString stringWithFormat:@"%@: %@", moddedURL.lastPathComponent, error.localizedDescription ?: @"doctoring failed"];
                 NSString *runURL = error.userInfo[BundleDoctorServiceRunURLKey];
-                if (runURL.length > 0) {
-                    message = [message stringByAppendingFormat:@"\n\n%@", runURL];
-                }
-                [strongSelf gd_presentModsAlertWithTitle:@"Doctoring Failed" message:message];
+                if (runURL.length > 0) line = [line stringByAppendingFormat:@" (%@)", runURL];
+                [strongSelf.loadModsSummaryLines addObject:line];
+                strongSelf.loadModsCurrentDoctorSourceURL = nil;
+                [strongSelf gd_startNextLoadModsDoctorQueueItem];
                 return;
             }
 
@@ -4050,12 +4166,17 @@ static const CGFloat kContentFadeHeight = 22;
 }
 
 // Step 2 result: the person picked which on-disk stock bundle the
-// doctored one should replace - hand both off to BundleDoctorInstaller.
+// doctored one should replace - hand both off to BundleDoctorInstaller,
+// fold the outcome into loadModsSummaryLines, then keep draining
+// whatever's still queued behind this one.
 - (void)gd_handlePickedDoctorTargetURL:(NSURL *)stockURL {
     NSURL *doctoredURL = self.pendingDoctoredBundleURL;
     self.pendingDoctoredBundleURL = nil;
+    NSString *sourceName = self.loadModsCurrentDoctorSourceURL.lastPathComponent ?: stockURL.lastPathComponent;
+    self.loadModsCurrentDoctorSourceURL = nil;
     if (!doctoredURL) {
         ZLog(@"[BundleDoctorService] target picked but no pending doctored bundle - shouldn't happen");
+        [self gd_startNextLoadModsDoctorQueueItem];
         return;
     }
 
@@ -4065,15 +4186,47 @@ static const CGFloat kContentFadeHeight = 22;
     if (scoped) [stockURL stopAccessingSecurityScopedResource];
     [[NSFileManager defaultManager] removeItemAtURL:doctoredURL error:nil]; // done with the temp file either way
 
-    UINotificationFeedbackGenerator *haptic = [UINotificationFeedbackGenerator new];
     if (ok) {
-        [haptic notificationOccurred:UINotificationFeedbackTypeSuccess];
-        [self gd_presentModsAlertWithTitle:@"Bundle Installed"
-                                    message:[NSString stringWithFormat:@"%@ replaced with the doctored bundle. Restart the game for it to take effect.", stockURL.lastPathComponent]];
+        [self.loadModsSummaryLines addObject:
+            [NSString stringWithFormat:@"%@: installed, replacing %@", sourceName, stockURL.lastPathComponent]];
     } else {
-        [haptic notificationOccurred:UINotificationFeedbackTypeError];
-        [self gd_presentModsAlertWithTitle:@"Install Failed" message:installError.localizedDescription ?: @"Unknown error."];
+        [self.loadModsSummaryLines addObject:
+            [NSString stringWithFormat:@"%@: %@", sourceName, installError.localizedDescription ?: @"install failed"]];
     }
+    [self gd_startNextLoadModsDoctorQueueItem];
+}
+
+// Flushes loadModsSummaryLines into one combined alert covering
+// everything submitted through Load Mods this run - unrecognized
+// files, every bank swap result, and every doctor-pipeline result
+// alike - then clears the run's state. Called once the doctor queue
+// (if any) has fully drained; -gd_processLoadModsBankURLs: calls
+// straight through to -gd_startNextLoadModsDoctorQueueItem first, so
+// this is always the last thing to run in a given Load Mods pass.
+- (void)gd_presentLoadModsFinalSummary {
+    NSArray<NSString *> *lines = self.loadModsSummaryLines ?: @[];
+    self.loadModsSummaryLines = nil;
+
+    UINotificationFeedbackGenerator *haptic = [UINotificationFeedbackGenerator new];
+    if (lines.count == 0) {
+        [haptic notificationOccurred:UINotificationFeedbackTypeWarning];
+        [self gd_presentModsAlertWithTitle:@"No Files Loaded" message:@"No files were submitted."];
+        return;
+    }
+
+    BOOL anySucceeded = NO;
+    for (NSString *line in lines) {
+        if ([line rangeOfString:@": swapped"].location != NSNotFound || [line rangeOfString:@": installed"].location != NSNotFound) {
+            anySucceeded = YES;
+            break;
+        }
+    }
+    [haptic notificationOccurred:anySucceeded ? UINotificationFeedbackTypeSuccess : UINotificationFeedbackTypeWarning];
+    NSString *message = [lines componentsJoinedByString:@"\n"];
+    if (anySucceeded) {
+        message = [message stringByAppendingString:@"\n\nRestart the game for swapped/installed files to take effect."];
+    }
+    [self gd_presentModsAlertWithTitle:@"Load Mods" message:message];
 }
 
 - (void)gd_presentModsAlertWithTitle:(NSString *)title message:(NSString *)message {
@@ -4159,25 +4312,6 @@ static const CGFloat kContentFadeHeight = 22;
         completion(trimmed);
     }]];
     [presenter presentViewController:prompt animated:YES completion:nil];
-}
-
-// "+ New Folder" row's action - prompts for a name and creates an
-// empty folder (+[ModAssetLibrary createFolderNamed:error:]) up front,
-// so +entriesInFolder:error: and friends never have to distinguish
-// "just created, nothing added yet" from "doesn't exist".
-- (void)gd_newModFolderTapped {
-    __weak typeof(self) weakSelf = self;
-    [self gd_promptForModFolderNameWithTitle:@"New Mod Folder"
-                                  actionTitle:@"Create"
-                                   completion:^(NSString *trimmedName) {
-        NSError *error = nil;
-        BOOL created = [ModAssetLibrary createFolderNamed:trimmedName error:&error];
-        if (!created) {
-            [weakSelf gd_presentModsAlertWithTitle:@"Couldn't Create Folder" message:error.localizedDescription ?: @"Unknown error."];
-            return;
-        }
-        [weakSelf gd_rebuildModsLibrary];
-    }];
 }
 
 // Full rebuild from +[ModAssetLibrary folderNames]/+entriesInFolder:error: -
@@ -4674,12 +4808,13 @@ static const CGFloat kContentFadeHeight = 22;
 }
 
 // "Add Asset" picker flow - bookkeeping only, see ModAssetLibrary.h.
-// Deliberately separate from -importModTapped's own picker (different
+// Deliberately separate from Load Mods' own picker (different
 // UIDocumentPickerViewController instance, tracked via
-// libraryImportPicker rather than doctorSourcePicker/doctorTargetPicker)
+// libraryImportPicker rather than loadModsPicker/doctorTargetPicker)
 // so -documentPicker:didPickDocumentsAtURLs: can route the result here
-// instead of into BankTransplant. No registered UTI restriction, same
-// reasoning as -importModTapped: a mod file can be anything.
+// instead of into either swap-in pipeline. No registered UTI
+// restriction, same reasoning as Load Mods' own picker: a mod file can
+// be anything.
 - (void)gd_presentModImportPickerForFolder:(NSString *)folderName {
     UIDocumentPickerViewController *picker;
     if (@available(iOS 14.0, *)) {
@@ -4705,7 +4840,7 @@ static const CGFloat kContentFadeHeight = 22;
 // every picked file into the target folder via +[ModAssetLibrary
 // importFileURLs:intoFolder:error:] and re-renders. See
 // -documentPicker:didPickDocumentsAtURLs: for how this gets routed here
-// instead of -gd_handlePickedModURLs:.
+// instead of -gd_handleLoadModsPickedURLs:intoFolder:.
 - (void)gd_handlePickedLibraryImportURLs:(NSArray<NSURL *> *)urls intoFolder:(NSString *)folderName {
     NSError *error = nil;
     BOOL ok = [ModAssetLibrary importFileURLs:urls intoFolder:folderName error:&error];
@@ -5204,8 +5339,22 @@ static const CGFloat kContentFadeHeight = 22;
         fieldContainer.alpha = 0;
     } completion:^(BOOL finished) {
         [NSLayoutConstraint deactivateConstraints:rowConstraints];
-        [fieldContainer removeFromSuperview];
 
+        // Reparent via -addSubview: directly rather than calling
+        // -removeFromSuperview first. field is `field`'s live
+        // UITextField and is still first responder at this point - an
+        // explicit -removeFromSuperview momentarily detaches
+        // fieldContainer (and therefore `field`) from any window before
+        // the follow-up -addSubview: reattaches it, and UIKit resigns
+        // first-responder status the instant a responder's view goes
+        // windowless. That resignation fires -textFieldDidEndEditing:
+        // mid-float, which calls -gd_restoreAuthField: right back
+        // (since authFieldCurrentlyFloated is already set to `field` -
+        // see above) - undoing this exact move a frame after it starts
+        // and dropping the keyboard. window here is the same UIWindow
+        // fieldContainer's row already lives in (see gd_key_window()),
+        // so -addSubview: below reparents it in one atomic step without
+        // ever making it windowless, and first-responder status survives.
         fieldContainer.translatesAutoresizingMaskIntoConstraints = NO;
         [window addSubview:fieldContainer];
         [window bringSubviewToFront:fieldContainer];
@@ -5263,9 +5412,13 @@ static const CGFloat kContentFadeHeight = 22;
         fieldContainer.alpha = 0;
     } completion:^(BOOL finished) {
         if (floatConstraints) [NSLayoutConstraint deactivateConstraints:floatConstraints];
-        [fieldContainer removeFromSuperview];
         objc_setAssociatedObject(field, kGDAuthFieldFloatingConstraintsKey, nil, OBJC_ASSOCIATION_RETAIN);
 
+        // Same atomic-reparent reasoning as -gd_floatAuthField: above -
+        // -addSubview: directly instead of -removeFromSuperview then
+        // -addSubview:, so `field` never goes windowless if it's still
+        // first responder here (e.g. a defensive restore from
+        // -gd_keyboardWillChangeFrame: while the person is still typing).
         fieldContainer.translatesAutoresizingMaskIntoConstraints = NO;
         [originalRow addSubview:fieldContainer];
         [NSLayoutConstraint activateConstraints:rowConstraints];
