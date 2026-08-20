@@ -32,6 +32,18 @@ typedef NS_ENUM(NSInteger, BundleDoctorInstallerErrorCode) {
     BundleDoctorInstallerErrorCantReadDoctored = 1,
     BundleDoctorInstallerErrorBackupFailed,     // couldn't create the one-time backup of the original before touching it
     BundleDoctorInstallerErrorWriteFailed,      // swapping the doctored file in failed
+    // Not raised by this class itself - a synthesized code for
+    // GraphicsDebugOverlay.m's own download/install orchestration (see
+    // its "Mods (doctor pipeline)" section) to use for every way it can
+    // fail to ever GET a stockBundleURL to hand this class in the first
+    // place: no UnityCacheLocator match and the person cancelled the
+    // manual picker, another entry's download already had the one
+    // modal picker claimed, or there was no view controller to present
+    // it from at all. Kept in this domain/enum rather than a new one of
+    // its own since every one of these is still, from the person's
+    // point of view, "the install didn't happen" - same family of
+    // failure as the three above, just one step earlier.
+    BundleDoctorInstallerErrorNoInstallTarget,
 };
 
 @interface BundleDoctorInstaller : NSObject

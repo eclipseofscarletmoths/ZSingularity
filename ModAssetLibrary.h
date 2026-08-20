@@ -37,6 +37,39 @@ typedef NS_ENUM(NSInteger, ModAssetLibraryErrorCode) {
     ModAssetLibraryErrorManifestReadFailed,
     ModAssetLibraryErrorManifestWriteFailed,
     ModAssetLibraryErrorDeleteFailed,
+    ModAssetLibraryErrorEntryNotFound,          // +updateDoctorStateForEntry:... couldn't find a manifest row matching entry.path
+};
+
+// Where one entry sits in the (new, opt-in) manual dispatch flow for the
+// BundleDoctorService cloud pipeline. This replaces the old behavior of
+// kicking a bundle to the doctor pipeline automatically at import time -
+// see BundleDoctorService.h's own header for the phase-by-phase API this
+// tracks. Persisted per-entry in manifest.json so it survives the app
+// being backgrounded/relaunched mid-flight; the panel rebuilds its rows
+// from this on every -gd_rebuildModsLibrary, it does not keep its own
+// shadow state.
+//
+// Meaningless (and left at NotDispatched/0) for anything that never goes
+// through the doctor pipeline in the first place - i.e. .bank entries;
+// ModAssetLibrary itself doesn't gate on file kind (see this header's
+// top comment - bookkeeping only), the panel is what decides which rows
+// get a dispatch capsule at all.
+// Installed is appended AFTER Failed (rather than slotted in where it
+// conceptually belongs, right after ReadyToDownload) on purpose - every
+// case's raw integer value is persisted verbatim into manifest.json (see
+// ModAssetLibrary.m's +dictionaryRepresentation/+entryFromDictionary:),
+// so inserting a case in the middle would silently reinterpret every
+// already-written Failed row (previously the last/highest value) as
+// something else. Appending keeps every prior case's on-disk meaning
+// stable; only the C enum's declaration order looks slightly out of
+// sequence as a result.
+typedef NS_ENUM(NSInteger, ModAssetLibraryDoctorStatus) {
+    ModAssetLibraryDoctorStatusNotDispatched = 0, // default - dispatch capsule shown, nothing sent yet
+    ModAssetLibraryDoctorStatusUploading,          // BundleDoctorService dispatchBundleAtURL:... in flight - see doctorUploadProgress
+    ModAssetLibraryDoctorStatusProcessing,         // uploaded + workflow dispatched, waiting on the run - see doctorProcessProgress
+    ModAssetLibraryDoctorStatusReadyToDownload,    // run succeeded, doctored bundle not yet pulled down - download button shown
+    ModAssetLibraryDoctorStatusFailed,             // see doctorLastError
+    ModAssetLibraryDoctorStatusInstalled,          // doctored bundle fetched AND swapped in via BundleDoctorInstaller - terminal, no button
 };
 
 // One tracked file inside one folder. See this header's own top comment
@@ -57,6 +90,18 @@ typedef NS_ENUM(NSInteger, ModAssetLibraryErrorCode) {
 // Resolved exactly ONCE, at import time
 // (+importFileURLs:intoFolder:error:), and never recomputed after.
 @property (nonatomic, copy, nullable) NSString *livePathDescription;
+
+// --- Doctor-pipeline dispatch state (see ModAssetLibraryDoctorStatus above) ---
+// All of this is plain bookkeeping mirrored from BundleDoctorService
+// call sites via +updateDoctorStateForEntry:inFolder:applyBlock:error:
+// below - this class never calls BundleDoctorService itself.
+@property (nonatomic, assign) ModAssetLibraryDoctorStatus doctorStatus;
+@property (nonatomic, assign) double doctorUploadProgress;   // 0.0-1.0; meaningful only while doctorStatus == Uploading
+@property (nonatomic, assign) double doctorProcessProgress;  // 0.0-1.0; meaningful only while doctorStatus == Processing
+@property (nonatomic, copy, nullable) NSString *doctorScratchBranch; // BundleDoctorHandle.scratchBranch, once dispatched
+@property (nonatomic, copy, nullable) NSString *doctorRunID;         // filled in once +resolveRunForHandle:... finds it
+@property (nonatomic, copy, nullable) NSString *doctorRunURL;        // for surfacing "view run" on failure
+@property (nonatomic, copy, nullable) NSString *doctorLastError;     // localizedDescription of the last failure, if doctorStatus == Failed
 @end
 
 @interface ModAssetLibrary : NSObject
@@ -101,6 +146,22 @@ typedef NS_ENUM(NSInteger, ModAssetLibraryErrorCode) {
 // +mobileFMODBuildsDirectory or either backup directory - this only
 // forgets the library's own tracked copy.
 + (BOOL)removeEntry:(ModAssetLibraryEntry *)entry fromFolder:(NSString *)folderName error:(NSError **)error;
+
+// Reads folderName's manifest, finds the row matching entry.path,
+// invokes applyBlock with a mutable copy of that row's current state
+// so the caller can set doctorStatus/doctorUploadProgress/etc, then
+// writes the whole manifest back and returns the updated entry. This is
+// a read-modify-write against on-disk state, not against the `entry`
+// object passed in - so it's safe to call repeatedly from a 6s poll
+// timer even if `entry` itself is stale (e.g. the accordion was
+// rebuilt since). Returns nil and fills error with
+// ModAssetLibraryErrorEntryNotFound if no row in folderName still has
+// entry.path (e.g. it was deleted mid-flight), or
+// ModAssetLibraryErrorFolderNotFound if folderName itself is gone.
++ (nullable ModAssetLibraryEntry *)updateDoctorStateForEntry:(ModAssetLibraryEntry *)entry
+                                                      inFolder:(NSString *)folderName
+                                                    applyBlock:(void (NS_NOESCAPE ^)(ModAssetLibraryEntry *entryToMutate))applyBlock
+                                                         error:(NSError **)error;
 
 // Deletes folderName entirely - its manifest.json, every tracked file
 // under it, and the folder itself. Same "library bookkeeping only"

@@ -82,6 +82,20 @@ static NSString * const kManifestFileName = @"manifest.json";
 
     if (![self bds_ensureBackupDirectoryExists:error]) return NO;
 
+    // stockBundleURL can arrive two ways now that the download tap
+    // handler (GraphicsDebugOverlay.m's "Mods (doctor pipeline)"
+    // section) drives this: a UnityCacheLocator match under this app's
+    // own Library directory (never security-scoped), or a person's own
+    // pick from UIDocumentPickerViewController (always security-scoped)
+    // when no cache match was found. -startAccessingSecurityScopedResource
+    // is a documented no-op (returns NO, changes nothing) on a URL that
+    // was never security-scoped in the first place, so it's safe to
+    // wrap every call here unconditionally rather than have the caller
+    // track which kind of URL it's holding - same convention
+    // BankTransplant.m/BundleDoctorService.m already use for their own
+    // picker-sourced URLs.
+    BOOL scoped = [stockBundleURL startAccessingSecurityScopedResource];
+
     NSString *name = stockBundleURL.lastPathComponent;
     NSString *backupPath = [[self bundleBackupDirectory] stringByAppendingPathComponent:[name stringByAppendingString:kBackupSuffix]];
     NSFileManager *fm = [NSFileManager defaultManager];
@@ -98,6 +112,7 @@ static NSString * const kManifestFileName = @"manifest.json";
                                               code:BundleDoctorInstallerErrorBackupFailed
                                           userInfo:@{NSLocalizedDescriptionKey: backupError.localizedDescription ?: @"Couldn't back up the original bundle."}];
             }
+            if (scoped) [stockBundleURL stopAccessingSecurityScopedResource];
             return NO;
         }
 
@@ -113,9 +128,11 @@ static NSString * const kManifestFileName = @"manifest.json";
                                           code:BundleDoctorInstallerErrorWriteFailed
                                       userInfo:@{NSLocalizedDescriptionKey: writeError.localizedDescription ?: @"Couldn't swap in the doctored bundle."}];
         }
+        if (scoped) [stockBundleURL stopAccessingSecurityScopedResource];
         return NO;
     }
 
+    if (scoped) [stockBundleURL stopAccessingSecurityScopedResource];
     ZLog(@"[BundleDoctorInstaller] installed doctored bundle at %@", stockBundleURL.path);
     return YES;
 }

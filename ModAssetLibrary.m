@@ -22,6 +22,18 @@ static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
     d[@"byteSize"] = @(self.byteSize);
     d[@"dateAdded"] = self.dateAdded;
     if (self.livePathDescription) d[@"livePathDescription"] = self.livePathDescription;
+
+    // Doctor-pipeline state - only written when non-default, so a
+    // manifest touched entirely by pre-dispatch-flow code (or an entry
+    // that never enters the pipeline, e.g. a .bank) stays exactly as
+    // compact as it always was.
+    if (self.doctorStatus != ModAssetLibraryDoctorStatusNotDispatched) d[@"doctorStatus"] = @(self.doctorStatus);
+    if (self.doctorUploadProgress != 0.0) d[@"doctorUploadProgress"] = @(self.doctorUploadProgress);
+    if (self.doctorProcessProgress != 0.0) d[@"doctorProcessProgress"] = @(self.doctorProcessProgress);
+    if (self.doctorScratchBranch) d[@"doctorScratchBranch"] = self.doctorScratchBranch;
+    if (self.doctorRunID) d[@"doctorRunID"] = self.doctorRunID;
+    if (self.doctorRunURL) d[@"doctorRunURL"] = self.doctorRunURL;
+    if (self.doctorLastError) d[@"doctorLastError"] = self.doctorLastError;
     return d;
 }
 
@@ -35,6 +47,21 @@ static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
     e.livePathDescription = [d[@"livePathDescription"] isKindOfClass:NSString.class] ? d[@"livePathDescription"] : nil;
     // Older manifests may still carry a "cab" key from before CAB
     // matching was retired - just ignored on read, nothing to migrate.
+
+    // Doctor-pipeline state - absent entirely on any manifest row
+    // written before this flow existed, which is indistinguishable from
+    // (and defaults to) NotDispatched/0/nil, same as a freshly-imported
+    // entry that just hasn't been dispatched yet.
+    id rawStatus = d[@"doctorStatus"];
+    NSInteger status = [rawStatus isKindOfClass:NSNumber.class] ? [rawStatus integerValue] : ModAssetLibraryDoctorStatusNotDispatched;
+    e.doctorStatus = (status >= ModAssetLibraryDoctorStatusNotDispatched && status <= ModAssetLibraryDoctorStatusInstalled)
+        ? (ModAssetLibraryDoctorStatus)status : ModAssetLibraryDoctorStatusNotDispatched;
+    e.doctorUploadProgress = [d[@"doctorUploadProgress"] isKindOfClass:NSNumber.class] ? [d[@"doctorUploadProgress"] doubleValue] : 0.0;
+    e.doctorProcessProgress = [d[@"doctorProcessProgress"] isKindOfClass:NSNumber.class] ? [d[@"doctorProcessProgress"] doubleValue] : 0.0;
+    e.doctorScratchBranch = [d[@"doctorScratchBranch"] isKindOfClass:NSString.class] ? d[@"doctorScratchBranch"] : nil;
+    e.doctorRunID = [d[@"doctorRunID"] isKindOfClass:NSString.class] ? d[@"doctorRunID"] : nil;
+    e.doctorRunURL = [d[@"doctorRunURL"] isKindOfClass:NSString.class] ? d[@"doctorRunURL"] : nil;
+    e.doctorLastError = [d[@"doctorLastError"] isKindOfClass:NSString.class] ? d[@"doctorLastError"] : nil;
     return e;
 }
 
@@ -313,6 +340,38 @@ static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
 
     [NSFileManager.defaultManager removeItemAtPath:entry.path error:nil]; // best-effort - manifest is the source of truth for the UI either way
     return [self mal_writeEntries:remaining toFolder:folderName error:error];
+}
+
++ (nullable ModAssetLibraryEntry *)updateDoctorStateForEntry:(ModAssetLibraryEntry *)entry
+                                                      inFolder:(NSString *)folderName
+                                                    applyBlock:(void (NS_NOESCAPE ^)(ModAssetLibraryEntry *entryToMutate))applyBlock
+                                                         error:(NSError **)error {
+    NSError *entriesErr = nil;
+    NSMutableArray<ModAssetLibraryEntry *> *current =
+        [([self entriesInFolder:folderName error:&entriesErr] ?: @[]) mutableCopy];
+    if (!current) {
+        if (error) *error = entriesErr;
+        return nil;
+    }
+
+    ModAssetLibraryEntry *match = nil;
+    for (ModAssetLibraryEntry *e in current) {
+        if ([e.path isEqualToString:entry.path]) { match = e; break; }
+    }
+    if (!match) {
+        if (error) *error = MALError(ModAssetLibraryErrorEntryNotFound,
+            [NSString stringWithFormat:@"\"%@\" is no longer in the mods library.", entry.fileName]);
+        return nil;
+    }
+
+    if (applyBlock) applyBlock(match);
+
+    NSError *writeErr = nil;
+    if (![self mal_writeEntries:current toFolder:folderName error:&writeErr]) {
+        if (error) *error = writeErr;
+        return nil;
+    }
+    return match;
 }
 
 + (BOOL)deleteFolderNamed:(NSString *)folderName error:(NSError **)error {

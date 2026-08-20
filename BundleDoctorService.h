@@ -71,6 +71,47 @@
 // callers can invoke it from the main thread without freezing the UI.
 // `progress` and `completion` are both always called back on the main
 // queue.
+//
+// DEPRECATED, IN FAVOR OF THE DECOUPLED PHASE API BELOW (read before
+// adding a new caller of the single-shot method above): the one-shot
+// +doctorBundleAtURL:config:progress:completion: call above is still
+// here and still works, but it made every caller's UI block on the
+// full upload-dispatch-poll-download round trip behind a single modal
+// popup with nothing useful to do while it waited - see
+// GraphicsDebugOverlay.m's Mods (doctor pipeline) section, which is
+// exactly what drove the redesign below. Ownership of a submission is
+// now split into four independent phases a caller can drive from its
+// own state machine (see ModAssetLibrary.h's ModAssetLibraryDoctorStatus,
+// which mirrors these phases 1:1) instead of one blocking call:
+//
+//   1. +dispatchBundleAtURL:config:uploadProgress:completion: - upload
+//      + commit + branch + workflow_dispatch. Real byte-level progress
+//      (0.0-1.0) via uploadProgress, since this is the only phase with
+//      an actual multi-second body to send. Returns a BundleDoctorHandle
+//      the caller persists (ModAssetLibrary's doctorScratchBranch/
+//      doctorRunID/doctorRunURL fields exist specifically to round-trip
+//      this across app relaunches).
+//
+//   2. +resolveRunForHandle:config:completion: - single-shot lookup of
+//      the run the dispatch in step 1 created (the dispatch endpoint
+//      itself never returns a run id - see this header's step 6 above).
+//      Cheap enough to call from a timer tick; `found == NO` just means
+//      "not yet", not a failure - the run typically takes a few seconds
+//      to appear in the runs list after dispatch.
+//
+//   3. +fetchRunStatusForHandle:config:completion: - single-shot status
+//      + percent-complete check once handle.runID is known. No internal
+//      loop/sleep, unlike the old method's +bds_waitForRunCompletion: -
+//      the caller's own timer (e.g. a 6s NSTimer) drives repeated calls.
+//
+//   4. +fetchDoctoredBundleForHandle:config:completion: - call once
+//      phase 3 reports BundleDoctorRunStatusSucceeded. Downloads the
+//      doctored bundle via the Contents API and best-effort deletes the
+//      scratch branch, same as the old method's tail end.
+//
+// None of these four take a `progress:` status-string block the way the
+// old method did - phases 2-4 are each one cheap JSON request with a
+// single outcome, not a multi-step sequence worth narrating.
 
 #import <Foundation/Foundation.h>
 
@@ -92,6 +133,15 @@ typedef NS_ENUM(NSInteger, BundleDoctorServiceErrorCode) {
 extern NSString * const BundleDoctorServiceHTTPStatusKey;   // NSNumber (NSInteger)
 extern NSString * const BundleDoctorServiceResponseBodyKey; // NSString, truncated
 extern NSString * const BundleDoctorServiceRunURLKey;       // NSString - the run's html_url, for the person to go look at logs
+
+// Coarse state for the decoupled phase API's +fetchRunStatusForHandle:...
+// - see that method below.
+typedef NS_ENUM(NSInteger, BundleDoctorRunStatus) {
+    BundleDoctorRunStatusQueued = 0,   // run exists but no job has started yet - percentComplete is 0
+    BundleDoctorRunStatusInProgress,   // at least one job step has completed - see percentComplete
+    BundleDoctorRunStatusSucceeded,    // completed with conclusion "success" - percentComplete is 1.0; call +fetchDoctoredBundleForHandle:... next
+    BundleDoctorRunStatusFailed,       // completed with any other conclusion - see the completion block's own NSError
+};
 
 // Single request's worth of config - see BundleDoctorSettings.h for how
 // this gets loaded from/saved to disk+Keychain. Every property except
@@ -115,6 +165,35 @@ extern NSString * const BundleDoctorServiceRunURLKey;       // NSString - the ru
 
 @end
 
+// Identifies one in-flight (or completed) doctor-bundle submission across
+// the four decoupled phases below. Opaque other than the properties
+// spelled out here - callers don't construct one directly except via
+// +handleFromDictionaryRepresentation:config: when restoring one that was
+// persisted (see ModAssetLibrary's doctorScratchBranch/doctorRunID/
+// doctorRunURL fields, which are exactly this object's own fields
+// flattened for manifest.json storage).
+@interface BundleDoctorHandle : NSObject
+@property (nonatomic, copy, readonly) NSString *scratchBranch;   // the never-reused "bundle-doctor/<uuid>" branch this submission lives on
+@property (nonatomic, copy, nullable) NSString *runID;           // nil until +resolveRunForHandle:config:completion: fills it in
+@property (nonatomic, copy, nullable) NSString *runURL;          // nil until the same call fills it in - the run's html_url, for surfacing on failure
+
+// Flattened form of this handle's own three properties, suitable for
+// storing verbatim into ModAssetLibraryEntry's doctorScratchBranch/
+// doctorRunID/doctorRunURL. Does NOT include repoOwner/repoName/
+// authToken - those come back from whatever BundleDoctorConfig the
+// caller already has stored (BundleDoctorSettings.h), not from this
+// object.
+- (NSDictionary<NSString *, NSString *> *)dictionaryRepresentation;
+
+// Reconstructs a handle from a previously-persisted
+// -dictionaryRepresentation (e.g. after an app relaunch mid-submission).
+// Returns nil if scratchBranch is missing/empty - runID/runURL are
+// optional (a submission that hadn't resolved its run yet before the
+// app was killed comes back with those nil, exactly as if
+// +resolveRunForHandle:config:completion: simply hadn't succeeded yet).
++ (nullable instancetype)handleFromDictionaryRepresentation:(NSDictionary<NSString *, NSString *> *)dict;
+@end
+
 @interface BundleDoctorService : NSObject
 
 // moddedBundleURL: the modded DESKTOP bundle to doctor - possibly a
@@ -136,6 +215,66 @@ extern NSString * const BundleDoctorServiceRunURLKey;       // NSString - the ru
                     config:(BundleDoctorConfig *)config
                   progress:(nullable void (^)(NSString *status))progress
                 completion:(void (^)(NSURL * _Nullable doctoredBundleURL, NSError * _Nullable error))completion;
+
+#pragma mark - Decoupled phase API (see this file's header)
+
+// Phase 1: reads moddedBundleURL, uploads it as a git blob (with real
+// byte-level progress via uploadProgress - every other phase below is a
+// single small JSON request with nothing meaningful to report mid-flight),
+// commits it onto a brand-new scratch branch, and dispatches the
+// doctor-bundle workflow on that branch. uploadProgress is called on the
+// main queue zero or more times with a 0.0-1.0 fraction as the blob's
+// body is sent; completion is called exactly once, also on the main
+// queue. On success, the returned handle's runID/runURL are still nil -
+// call +resolveRunForHandle:config:completion: next.
++ (void)dispatchBundleAtURL:(NSURL *)moddedBundleURL
+                       config:(BundleDoctorConfig *)config
+               uploadProgress:(nullable void (^)(double fractionComplete))uploadProgress
+                   completion:(void (^)(BundleDoctorHandle * _Nullable handle, NSError * _Nullable error))completion;
+
+// Phase 2: single-shot lookup of the run that phase 1's dispatch call
+// created on handle.scratchBranch. Safe to call repeatedly (e.g. once
+// right after phase 1, then again on the same 6s timer phase 3 uses,
+// until it succeeds) - `found == NO` with a nil error means "the run
+// hasn't shown up in the runs list yet", which is normal for the first
+// few seconds after a dispatch, not a failure. On found == YES,
+// handle.runID/runURL are filled in for the caller to persist alongside
+// the rest of the handle.
++ (void)resolveRunForHandle:(BundleDoctorHandle *)handle
+                       config:(BundleDoctorConfig *)config
+                   completion:(void (^)(BOOL found, NSError * _Nullable error))completion;
+
+// Phase 3: single-shot status/progress check for a run whose id is
+// already known (handle.runID non-nil - call +resolveRunForHandle:...
+// first if it isn't). Does not loop or sleep internally - intended to be
+// driven by the caller's own poll timer (per this project's spec, every
+// 6 seconds). percentComplete is derived from the run's own jobs/steps
+// (completed steps / total steps across every job in the run) since the
+// workflow reports no finer-grained progress than that - see the .m for
+// exactly how steps are counted. status/percentComplete are both 0/
+// Queued if the run hasn't started any job yet. On
+// BundleDoctorRunStatusFailed, error is filled in (same
+// BundleDoctorServiceErrorRunFailed shape as the old one-shot method
+// used, including BundleDoctorServiceRunURLKey); on every other status,
+// error is nil even though this always calls completion (never treats
+// "still queued/in progress" as an error the way a timeout-based loop
+// would).
++ (void)fetchRunStatusForHandle:(BundleDoctorHandle *)handle
+                           config:(BundleDoctorConfig *)config
+                       completion:(void (^)(BundleDoctorRunStatus status, double percentComplete, NSError * _Nullable error))completion;
+
+// Phase 4: call once phase 3 reports BundleDoctorRunStatusSucceeded.
+// Reads the doctored bundle back from handle.scratchBranch via the
+// Contents API, writes it to a temp file the caller owns (same
+// ownership convention as the deprecated one-shot method's
+// doctoredBundleURL), and best-effort deletes the scratch branch
+// (logged, not surfaced, same as before). Safe to call more than once if
+// the caller's own download step needs retrying - the scratch branch is
+// only deleted after a successful fetch, and deleting an
+// already-deleted branch is itself best-effort/silent.
++ (void)fetchDoctoredBundleForHandle:(BundleDoctorHandle *)handle
+                                config:(BundleDoctorConfig *)config
+                            completion:(void (^)(NSURL * _Nullable doctoredBundleURL, NSError * _Nullable error))completion;
 
 @end
 

@@ -42,6 +42,81 @@ static const NSTimeInterval kBDSRunCompletionPollInterval = 5.0;
 
 @end
 
+#pragma mark - BundleDoctorHandle
+
+@implementation BundleDoctorHandle {
+    NSString *_scratchBranch;
+}
+
+- (instancetype)initWithScratchBranch:(NSString *)scratchBranch {
+    if ((self = [super init])) {
+        _scratchBranch = [scratchBranch copy];
+    }
+    return self;
+}
+
+- (NSString *)scratchBranch { return _scratchBranch; }
+
+- (NSDictionary<NSString *, NSString *> *)dictionaryRepresentation {
+    NSMutableDictionary<NSString *, NSString *> *d = [NSMutableDictionary dictionary];
+    d[@"scratchBranch"] = self.scratchBranch;
+    if (self.runID) d[@"runID"] = self.runID;
+    if (self.runURL) d[@"runURL"] = self.runURL;
+    return d;
+}
+
++ (nullable instancetype)handleFromDictionaryRepresentation:(NSDictionary<NSString *, NSString *> *)dict {
+    NSString *branch = dict[@"scratchBranch"];
+    if (![branch isKindOfClass:NSString.class] || branch.length == 0) return nil;
+    BundleDoctorHandle *handle = [[BundleDoctorHandle alloc] initWithScratchBranch:branch];
+    handle.runID = [dict[@"runID"] isKindOfClass:NSString.class] ? dict[@"runID"] : nil;
+    handle.runURL = [dict[@"runURL"] isKindOfClass:NSString.class] ? dict[@"runURL"] : nil;
+    return handle;
+}
+
+@end
+
+#pragma mark - BDSUploadProgressDelegate
+
+// Bridges NSURLSessionTaskDelegate's byte-level upload callback to a
+// plain block, so +bds_createBlobWithData:progress:... below can report
+// real progress on the one request in this whole pipeline with an
+// actual multi-second body (the base64-encoded bundle blob). Nothing
+// else in this file needs this - every other request is a small JSON
+// body/response, over before a progress callback would mean anything.
+@interface BDSUploadProgressDelegate : NSObject <NSURLSessionTaskDelegate, NSURLSessionDataDelegate>
+@property (nonatomic, copy, nullable) void (^onProgress)(double fractionComplete);
+@property (nonatomic, strong, nullable) NSMutableData *collectedData;
+@property (nonatomic, strong, nullable) NSHTTPURLResponse *httpResponse;
+@end
+
+@implementation BDSUploadProgressDelegate
+
+- (void)URLSession:(NSURLSession *)session
+              task:(NSURLSessionTask *)task
+    didSendBodyData:(int64_t)bytesSent
+     totalBytesSent:(int64_t)totalBytesSent
+totalBytesExpectedToSend:(int64_t)totalBytesExpectedToSend {
+    if (!self.onProgress || totalBytesExpectedToSend <= 0) return;
+    double fraction = (double)totalBytesSent / (double)totalBytesExpectedToSend;
+    self.onProgress(MIN(MAX(fraction, 0.0), 1.0));
+}
+
+- (void)URLSession:(NSURLSession *)session dataTask:(NSURLSessionDataTask *)dataTask didReceiveData:(NSData *)data {
+    if (!self.collectedData) self.collectedData = [NSMutableData data];
+    [self.collectedData appendData:data];
+}
+
+- (void)URLSession:(NSURLSession *)session
+          dataTask:(NSURLSessionDataTask *)dataTask
+didReceiveResponse:(NSURLResponse *)response
+ completionHandler:(void (^)(NSURLSessionResponseDisposition))completionHandler {
+    if ([response isKindOfClass:NSHTTPURLResponse.class]) self.httpResponse = (NSHTTPURLResponse *)response;
+    completionHandler(NSURLSessionResponseAllow);
+}
+
+@end
+
 #pragma mark - BundleDoctorService
 
 @implementation BundleDoctorService
@@ -169,6 +244,260 @@ static const NSTimeInterval kBDSRunCompletionPollInterval = 5.0;
     });
 }
 
+#pragma mark - Decoupled phase API (see this file's header)
+
++ (void)dispatchBundleAtURL:(NSURL *)moddedBundleURL
+                       config:(BundleDoctorConfig *)rawConfig
+               uploadProgress:(void (^)(double))uploadProgress
+                   completion:(void (^)(BundleDoctorHandle * _Nullable, NSError * _Nullable))completion {
+    void (^reportProgress)(double) = ^(double fraction) {
+        if (!uploadProgress) return;
+        dispatch_async(dispatch_get_main_queue(), ^{ uploadProgress(fraction); });
+    };
+    void (^finish)(BundleDoctorHandle * _Nullable, NSError * _Nullable) = ^(BundleDoctorHandle * _Nullable handle, NSError * _Nullable error) {
+        dispatch_async(dispatch_get_main_queue(), ^{ completion(handle, error); });
+    };
+
+    BundleDoctorConfig *config = [rawConfig normalizedConfig];
+    if (config.repoOwner.length == 0 || config.repoName.length == 0 || config.authToken.length == 0) {
+        finish(nil, [self bds_errorWithCode:BundleDoctorServiceErrorInvalidConfig
+                                 description:@"Set a GitHub repository link and Personal Access Token under Mods \u2192 Auth first."]);
+        return;
+    }
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSError *error = nil;
+
+        BOOL scoped = [moddedBundleURL startAccessingSecurityScopedResource];
+        NSData *moddedData = [NSData dataWithContentsOfURL:moddedBundleURL options:0 error:&error];
+        if (scoped) [moddedBundleURL stopAccessingSecurityScopedResource];
+        if (!moddedData) {
+            finish(nil, [self bds_errorWithCode:BundleDoctorServiceErrorCantReadModdedBundle
+                                     description:error.localizedDescription ?: @"Couldn't read the modded bundle."]);
+            return;
+        }
+
+        NSString *scratchBranch = [NSString stringWithFormat:@"bundle-doctor/%@", [NSUUID UUID].UUIDString];
+        ZLog(@"[BundleDoctorService] dispatching %@/%@, scratch branch %@",
+              config.repoOwner, config.repoName, scratchBranch);
+
+        NSString *baseCommitSHA = nil, *baseTreeSHA = nil;
+        if (![self bds_resolveBaseCommitSHA:&baseCommitSHA treeSHA:&baseTreeSHA config:config error:&error]) {
+            finish(nil, error);
+            return;
+        }
+
+        NSString *blobSHA = nil;
+        if (![self bds_createBlobWithData:moddedData progress:reportProgress config:config outSHA:&blobSHA error:&error]) {
+            finish(nil, error);
+            return;
+        }
+        reportProgress(1.0); // the blob POST is the entire uploadProgress contract - make sure callers land on a clean 100%
+
+        NSString *newTreeSHA = nil;
+        if (![self bds_createTreeWithBaseTreeSHA:baseTreeSHA path:kBDSInputPath blobSHA:blobSHA
+                                            config:config outSHA:&newTreeSHA error:&error]) {
+            finish(nil, error);
+            return;
+        }
+
+        NSString *newCommitSHA = nil;
+        if (![self bds_createCommitWithTreeSHA:newTreeSHA parentSHA:baseCommitSHA
+                                        config:config outSHA:&newCommitSHA error:&error]) {
+            finish(nil, error);
+            return;
+        }
+
+        if (![self bds_createBranch:scratchBranch atCommitSHA:newCommitSHA config:config error:&error]) {
+            finish(nil, error);
+            return;
+        }
+
+        if (![self bds_dispatchWorkflowOnBranch:scratchBranch config:config error:&error]) {
+            [self bds_deleteBranch:scratchBranch config:config]; // best-effort cleanup, ignore result
+            finish(nil, error);
+            return;
+        }
+
+        BundleDoctorHandle *handle = [[BundleDoctorHandle alloc] initWithScratchBranch:scratchBranch];
+        finish(handle, nil);
+    });
+}
+
++ (void)resolveRunForHandle:(BundleDoctorHandle *)handle
+                       config:(BundleDoctorConfig *)rawConfig
+                   completion:(void (^)(BOOL, NSError * _Nullable))completion {
+    void (^finish)(BOOL, NSError * _Nullable) = ^(BOOL found, NSError * _Nullable error) {
+        dispatch_async(dispatch_get_main_queue(), ^{ completion(found, error); });
+    };
+
+    BundleDoctorConfig *config = [rawConfig normalizedConfig];
+    if (config.repoOwner.length == 0 || config.repoName.length == 0 || config.authToken.length == 0) {
+        finish(NO, [self bds_errorWithCode:BundleDoctorServiceErrorInvalidConfig
+                                description:@"Set a GitHub repository link and Personal Access Token under Mods \u2192 Auth first."]);
+        return;
+    }
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        // A single pass over the runs list, filtered to this handle's
+        // scratch branch - deliberately NOT the retried/timeout loop
+        // +bds_findRunOnBranch:... below runs for the deprecated one-shot
+        // method. This is meant to be called again by the caller's own
+        // 6s poll timer until it succeeds, same spirit as
+        // +fetchRunStatusForHandle:... not looping internally either.
+        NSString *urlPath = [NSString stringWithFormat:@"/repos/%@/%@/actions/workflows/%@/runs?branch=%@&event=workflow_dispatch&per_page=10",
+                              config.repoOwner, config.repoName, config.workflowFile,
+                              [handle.scratchBranch stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]]];
+
+        NSError *error = nil;
+        id result = [self bds_getJSON:urlPath config:config error:&error];
+        if (!result) {
+            finish(NO, error);
+            return;
+        }
+
+        NSArray *runs = result[@"workflow_runs"];
+        if ([runs isKindOfClass:NSArray.class] && runs.count > 0) {
+            // Every run on this branch was created by this handle's own
+            // dispatch call (the branch is a fresh UUID, never reused -
+            // see this file's header) - the most recently created one is
+            // the right one if more than one somehow shows up.
+            NSDictionary *best = nil;
+            NSDate *bestDate = nil;
+            NSDateFormatter *iso = [self bds_iso8601Formatter];
+            for (NSDictionary *run in runs) {
+                if (![run isKindOfClass:NSDictionary.class]) continue;
+                NSDate *createdAt = [iso dateFromString:run[@"created_at"] ?: @""];
+                if (!best || (createdAt && (!bestDate || [createdAt compare:bestDate] == NSOrderedDescending))) {
+                    best = run;
+                    bestDate = createdAt;
+                }
+            }
+            if (best) {
+                handle.runID = [best[@"id"] stringValue];
+                handle.runURL = best[@"html_url"];
+                finish(YES, nil);
+                return;
+            }
+        }
+
+        finish(NO, nil); // not found yet - not an error, see this method's header
+    });
+}
+
++ (void)fetchRunStatusForHandle:(BundleDoctorHandle *)handle
+                           config:(BundleDoctorConfig *)rawConfig
+                       completion:(void (^)(BundleDoctorRunStatus, double, NSError * _Nullable))completion {
+    void (^finish)(BundleDoctorRunStatus, double, NSError * _Nullable) = ^(BundleDoctorRunStatus status, double percent, NSError * _Nullable error) {
+        dispatch_async(dispatch_get_main_queue(), ^{ completion(status, percent, error); });
+    };
+
+    BundleDoctorConfig *config = [rawConfig normalizedConfig];
+    if (handle.runID.length == 0) {
+        finish(BundleDoctorRunStatusQueued, 0.0, [self bds_errorWithCode:BundleDoctorServiceErrorRunNotFound
+                                                              description:@"No run id on this handle yet - call +resolveRunForHandle:config:completion: first."]);
+        return;
+    }
+    if (config.repoOwner.length == 0 || config.repoName.length == 0 || config.authToken.length == 0) {
+        finish(BundleDoctorRunStatusQueued, 0.0, [self bds_errorWithCode:BundleDoctorServiceErrorInvalidConfig
+                                                              description:@"Set a GitHub repository link and Personal Access Token under Mods \u2192 Auth first."]);
+        return;
+    }
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSString *runPath = [NSString stringWithFormat:@"/repos/%@/%@/actions/runs/%@", config.repoOwner, config.repoName, handle.runID];
+        NSError *error = nil;
+        id run = [self bds_getJSON:runPath config:config error:&error];
+        if (!run) {
+            finish(BundleDoctorRunStatusQueued, 0.0, error);
+            return;
+        }
+
+        NSString *runStatus = run[@"status"];
+        if ([runStatus isEqualToString:@"completed"]) {
+            NSString *conclusion = run[@"conclusion"];
+            if ([conclusion isEqualToString:@"success"]) {
+                finish(BundleDoctorRunStatusSucceeded, 1.0, nil);
+            } else {
+                NSMutableDictionary *userInfo = [NSMutableDictionary dictionary];
+                userInfo[NSLocalizedDescriptionKey] = [NSString stringWithFormat:@"Workflow run finished with conclusion \"%@\".", conclusion ?: @"unknown"];
+                if (handle.runURL) userInfo[BundleDoctorServiceRunURLKey] = handle.runURL;
+                NSError *runError = [NSError errorWithDomain:BundleDoctorServiceErrorDomain code:BundleDoctorServiceErrorRunFailed userInfo:userInfo];
+                finish(BundleDoctorRunStatusFailed, 0.0, runError);
+            }
+            return;
+        }
+
+        // Still queued or in progress - derive a percentage from the
+        // run's own jobs/steps rather than reporting nothing. The
+        // doctor-bundle workflow itself emits no finer-grained progress
+        // than "which step is running" (see the .github/workflows YAML
+        // this file's header points at) - completed-steps / total-steps
+        // across every job on the run is the best signal available
+        // without changing that YAML to emit its own percentage.
+        NSString *jobsPath = [NSString stringWithFormat:@"/repos/%@/%@/actions/runs/%@/jobs", config.repoOwner, config.repoName, handle.runID];
+        id jobsResult = [self bds_getJSON:jobsPath config:config error:nil]; // best-effort - a failure here just means "0%", not a hard error
+        double percent = 0.0;
+        NSArray *jobs = [jobsResult isKindOfClass:NSDictionary.class] ? jobsResult[@"jobs"] : nil;
+        if ([jobs isKindOfClass:NSArray.class]) {
+            NSInteger totalSteps = 0, completedSteps = 0;
+            for (NSDictionary *job in jobs) {
+                if (![job isKindOfClass:NSDictionary.class]) continue;
+                NSArray *steps = job[@"steps"];
+                if (![steps isKindOfClass:NSArray.class]) continue;
+                for (NSDictionary *step in steps) {
+                    if (![step isKindOfClass:NSDictionary.class]) continue;
+                    totalSteps++;
+                    if ([step[@"status"] isEqualToString:@"completed"]) completedSteps++;
+                }
+            }
+            if (totalSteps > 0) percent = (double)completedSteps / (double)totalSteps;
+        }
+
+        BundleDoctorRunStatus status = percent > 0.0 ? BundleDoctorRunStatusInProgress : BundleDoctorRunStatusQueued;
+        finish(status, percent, nil);
+    });
+}
+
++ (void)fetchDoctoredBundleForHandle:(BundleDoctorHandle *)handle
+                                config:(BundleDoctorConfig *)rawConfig
+                            completion:(void (^)(NSURL * _Nullable, NSError * _Nullable))completion {
+    void (^finish)(NSURL * _Nullable, NSError * _Nullable) = ^(NSURL * _Nullable url, NSError * _Nullable error) {
+        dispatch_async(dispatch_get_main_queue(), ^{ completion(url, error); });
+    };
+
+    BundleDoctorConfig *config = [rawConfig normalizedConfig];
+    if (config.repoOwner.length == 0 || config.repoName.length == 0 || config.authToken.length == 0) {
+        finish(nil, [self bds_errorWithCode:BundleDoctorServiceErrorInvalidConfig
+                                 description:@"Set a GitHub repository link and Personal Access Token under Mods \u2192 Auth first."]);
+        return;
+    }
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSError *error = nil;
+        NSData *doctoredData = nil;
+        if (![self bds_fetchContentsAtPath:kBDSOutputPath ref:handle.scratchBranch config:config
+                                       data:&doctoredData error:&error]) {
+            finish(nil, error);
+            return;
+        }
+
+        [self bds_deleteBranch:handle.scratchBranch config:config]; // best-effort, logged not surfaced - see header
+
+        NSString *tempName = [NSString stringWithFormat:@"doctored-%@.bundle", [NSUUID UUID].UUIDString];
+        NSURL *tempURL = [NSURL fileURLWithPath:[NSTemporaryDirectory() stringByAppendingPathComponent:tempName]];
+        NSError *writeError = nil;
+        if (![doctoredData writeToURL:tempURL options:NSDataWritingAtomic error:&writeError]) {
+            finish(nil, [self bds_errorWithCode:BundleDoctorServiceErrorRequestFailed
+                                     description:writeError.localizedDescription ?: @"Couldn't write doctored bundle to a temp file."]);
+            return;
+        }
+
+        ZLog(@"[BundleDoctorService] doctored bundle ready at %@ (%lu bytes)", tempURL.path, (unsigned long)doctoredData.length);
+        finish(tempURL, nil);
+    });
+}
+
 #pragma mark - Git Data API steps
 
 + (BOOL)bds_resolveBaseCommitSHA:(NSString **)outCommitSHA
@@ -218,6 +547,112 @@ static const NSTimeInterval kBDSRunCompletionPollInterval = 5.0;
 
     NSString *sha = result[@"sha"];
     if (![sha isKindOfClass:[NSString class]]) {
+        if (error) *error = [self bds_errorWithCode:BundleDoctorServiceErrorAPIError description:@"Blob creation didn't return a sha."];
+        return NO;
+    }
+    if (outSHA) *outSHA = sha;
+    return YES;
+}
+
+// Same request as +bds_createBlobWithData:config:outSHA:error: above,
+// but sent as an upload task on a dedicated delegate-backed NSURLSession
+// instead of the shared session's dataTaskWithRequest:, so
+// BDSUploadProgressDelegate's didSendBodyData: callback can report real
+// byte-level progress as the (base64-encoded, so ~1.33x the original
+// bundle's size) body goes out. This is the only bds_* request in this
+// file worth doing this for - see this method's caller,
+// +dispatchBundleAtURL:config:uploadProgress:completion:, and this
+// file's header on why every other phase is a single small JSON
+// request with nothing meaningful to report mid-flight.
++ (BOOL)bds_createBlobWithData:(NSData *)data
+                        progress:(nullable void (^)(double fractionComplete))progress
+                          config:(BundleDoctorConfig *)config
+                          outSHA:(NSString **)outSHA
+                           error:(NSError **)error {
+    NSString *path = [NSString stringWithFormat:@"/repos/%@/%@/git/blobs", config.repoOwner, config.repoName];
+    NSDictionary *body = @{
+        @"content": [data base64EncodedStringWithOptions:0],
+        @"encoding": @"base64",
+    };
+
+    NSError *encodeError = nil;
+    NSData *bodyData = [NSJSONSerialization dataWithJSONObject:body options:0 error:&encodeError];
+    if (!bodyData) {
+        if (error) *error = [self bds_errorWithCode:BundleDoctorServiceErrorRequestFailed
+                                         description:encodeError.localizedDescription ?: @"Couldn't encode request body."];
+        return NO;
+    }
+
+    NSMutableURLRequest *request = [self bds_requestForPath:path config:config];
+    if (!request) {
+        if (error) *error = [self bds_errorWithCode:BundleDoctorServiceErrorRequestFailed description:@"Couldn't build request URL."];
+        return NO;
+    }
+    request.HTTPMethod = @"POST";
+    [request setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+
+    BDSUploadProgressDelegate *delegate = [BDSUploadProgressDelegate new];
+    delegate.onProgress = progress;
+    NSURLSession *session = [NSURLSession sessionWithConfiguration:NSURLSessionConfiguration.defaultSessionConfiguration
+                                                             delegate:delegate
+                                                        delegateQueue:nil];
+
+    __block NSError *transportError = nil;
+    dispatch_semaphore_t sema = dispatch_semaphore_create(0);
+    NSURLSessionUploadTask *task = [session uploadTaskWithRequest:request fromData:bodyData
+                                                  completionHandler:^(NSData *ignoredData, NSURLResponse *ignoredResponse, NSError *taskError) {
+        // The real response body/status come from the delegate
+        // (didReceiveResponse:/didReceiveData:) since this session has
+        // one - the completion handler's own data/response are not
+        // populated when a delegate is set. Only the transport error is
+        // read from here.
+        transportError = taskError;
+        dispatch_semaphore_signal(sema);
+    }];
+    [task resume];
+    dispatch_semaphore_wait(sema, DISPATCH_TIME_FOREVER);
+    [session finishTasksAndInvalidate];
+
+    if (transportError) {
+        if (error) {
+            *error = [NSError errorWithDomain:BundleDoctorServiceErrorDomain
+                                          code:BundleDoctorServiceErrorRequestFailed
+                                      userInfo:@{
+                                          NSLocalizedDescriptionKey: transportError.localizedDescription ?: @"Network request failed.",
+                                          NSUnderlyingErrorKey: transportError,
+                                      }];
+        }
+        return NO;
+    }
+
+    NSInteger status = delegate.httpResponse.statusCode;
+    NSData *responseData = delegate.collectedData;
+    if (status < 200 || status >= 300) {
+        NSString *bodyString = responseData ? [[NSString alloc] initWithData:responseData encoding:NSUTF8StringEncoding] : @"";
+        if (bodyString.length > 500) bodyString = [bodyString substringToIndex:500];
+        ZLog(@"[BundleDoctorService] POST %@ -> %ld: %@", path, (long)status, bodyString);
+        if (error) {
+            *error = [NSError errorWithDomain:BundleDoctorServiceErrorDomain
+                                          code:BundleDoctorServiceErrorAPIError
+                                      userInfo:@{
+                                          NSLocalizedDescriptionKey: [NSString stringWithFormat:@"GitHub API returned %ld.", (long)status],
+                                          BundleDoctorServiceHTTPStatusKey: @(status),
+                                          BundleDoctorServiceResponseBodyKey: bodyString,
+                                      }];
+        }
+        return NO;
+    }
+
+    NSError *parseError = nil;
+    id result = responseData.length > 0 ? [NSJSONSerialization JSONObjectWithData:responseData options:0 error:&parseError] : @{};
+    if (!result) {
+        if (error) *error = [self bds_errorWithCode:BundleDoctorServiceErrorAPIError
+                                         description:parseError.localizedDescription ?: @"Couldn't parse GitHub API response."];
+        return NO;
+    }
+
+    NSString *sha = result[@"sha"];
+    if (![sha isKindOfClass:NSString.class]) {
         if (error) *error = [self bds_errorWithCode:BundleDoctorServiceErrorAPIError description:@"Blob creation didn't return a sha."];
         return NO;
     }

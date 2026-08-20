@@ -190,7 +190,7 @@
 #import "BundleDoctorSettings.h" // BundleDoctorSettings/BundleDoctorConfig - Auth section load/save, see -gd_loadAuthFields/-gd_persistAuthFields below
 #import "BundleDoctorService.h"     // send-and-intercept: GitHub Actions doctor-bundle pipeline, see -loadModsTapped below
 #import "BundleDoctorInstaller.h"   // backup+swap of the doctored bundle into place, mirrors BankTransplant's own pattern
-#import "UnityCacheLocator.h"       // CAB-based auto-match for the doctor pipeline's target bundle, see -gd_doctorQueueItemAtURL:
+#import "UnityCacheLocator.h"       // CAB-based auto-match for the doctor pipeline's download/install target - see -gd_doctorLocateInstallTargetForDoctoredURL:entryPath:inFolder:
 #import "ModAssetLibrary.h"         // Mods Library accordion (organizational only) - see that file's header
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h> // UTType-based UIDocumentPickerViewController init, for the Mods section's "Import Bank Mod" button
 
@@ -2494,12 +2494,66 @@ static UIView *gd_make_mods_folder_row(NSString *folderName, BOOL expanded, id t
 // "gd_button_delete" associated objects are those two buttons - the
 // caller reads them the same way it always has to wire hold-to-confirm
 // (see -gd_rebuildModsLibrary).
-static UIView *gd_make_mods_entry_row(ModAssetLibraryEntry *entry, id target, SEL tapAction, SEL resetAction, BOOL showActions) {
+//
+// --- Doctor-pipeline dispatch slot (dispatch/upload/process/download) ---
+// Section 2 of the bundle-dispatch-UX rework (see progress.md). Only
+// rows for a bundle-kind file get this slot at all - matched the same
+// way -gd_handleLoadModsPickedURLs: already partitions picked files by
+// kind (case-insensitive compare against "__data", not a re-derived
+// pathExtension check - .bank rows never had a dispatch pipeline and
+// still don't). ModAssetLibrary itself doesn't gate on file kind (see
+// its own header) - this row-building function is where that decision
+// actually lives, same as it already was for the bank/generic-doc icon
+// choice a few lines up.
+//
+// UNLIKE Reset/Delete, this slot is NOT gated behind `showActions` -
+// it renders regardless of whether the row's info dropdown is open.
+// ModAssetLibraryDoctorStatusNotDispatched's own header comment ("default
+// - dispatch capsule shown, nothing sent yet") reads as this being the
+// row's normal at-rest affordance, not something buried behind an extra
+// tap - and unlike Reset/Delete it isn't destructive, so there's no
+// "protect against a stray tap" reason to hide it. When showActions is
+// also YES (dropdown open, delete/reset present), this slot sits
+// immediately to the LEFT of the delete button, per the spec ("right
+// next to the delete button ... on its left"); reset (if present) is
+// pushed one slot further left as a result. When showActions is NO,
+// this is simply the row's trailing-most control.
+//
+// NotDispatched/ReadyToDownload render a small glass capsule button
+// (gd_style_button_as_native_glass - same native-glass text-button API
+// the panel's other one-shot actions use, just sized down to fit this
+// row's compact chrome) titled "dispatch"/"download" and wired to
+// `dispatchAction`/`downloadAction`. Uploading/Processing render plain
+// percentage subtext instead - there's nothing to tap mid-transfer.
+// Failed renders a small red "retry" capsule (wired to `retryAction`,
+// the obvious "tap to go back to NotDispatched" behavior flagged in
+// progress.md as not yet confirmed by the person) - the full
+// doctorLastError text itself is NOT crammed into this row; it's
+// added as an extra line in the entry's expandable info panel instead
+// (see gd_make_mods_entry_info_panel) so a one-line row layout doesn't
+// have to reflow around an arbitrarily long error string.
+//
+// dispatchAction/downloadAction/retryAction are only ever invoked with
+// `entry` already stashed on the control via the same "gd_modsEntry"
+// associated-object convention resetButton/deleteButton use above, so
+// the target's handler can look the entry up the same way.
+static const CGFloat kGDModsDoctorCapsuleHeight = 18;    // matches the row's existing 18pt icon-button footprint
+static const CGFloat kGDModsDoctorCapsuleMinWidth = 54;  // enough for "dispatch"/"download"/"retry" at kGDModsDoctorCapsuleFontSize
+static const CGFloat kGDModsDoctorCapsuleFontSize = 9;
+
+static UIView *gd_make_mods_entry_row(ModAssetLibraryEntry *entry, id target, SEL tapAction, SEL resetAction,
+                                       SEL dispatchAction, SEL downloadAction, SEL retryAction, BOOL showActions,
+                                       BOOL downloadInFlight) {
     UIView *row = [[UIView alloc] init];
     row.translatesAutoresizingMaskIntoConstraints = NO;
     objc_setAssociatedObject(row, "gd_modsEntry", entry, OBJC_ASSOCIATION_RETAIN);
 
     BOOL isBank = ([entry.fileName.pathExtension caseInsensitiveCompare:@"bank"] == NSOrderedSame);
+    // Same file-kind check -gd_handleLoadModsPickedURLs: already uses to
+    // decide which picked files get queued into the doctor pipeline in
+    // the first place - mirrored here rather than re-derived, per this
+    // function's own header comment above.
+    BOOL isDoctorEligible = ([entry.fileName caseInsensitiveCompare:@"__data"] == NSOrderedSame);
     UIImageSymbolConfiguration *iconConfig = [UIImageSymbolConfiguration configurationWithPointSize:12 weight:UIImageSymbolWeightRegular];
     UIImageView *icon = [[UIImageView alloc] initWithImage:
         [UIImage systemImageNamed:(isBank ? @"waveform" : @"doc.fill") withConfiguration:iconConfig]];
@@ -2543,13 +2597,121 @@ static UIView *gd_make_mods_entry_row(ModAssetLibraryEntry *entry, id target, SE
         objc_setAssociatedObject(row, "gd_button_delete", deleteButton, OBJC_ASSOCIATION_RETAIN);
     }
 
+    // Doctor-pipeline slot - built after reset/delete so its leading
+    // constraint can anchor against whichever of them (if either) is
+    // actually present this pass.
+    UIView *doctorView = nil;      // whichever view ends up in the slot - button or subtext label
+    UIButton *doctorButton = nil;  // non-nil only for the tappable states (NotDispatched/ReadyToDownload/Failed)
+    if (isDoctorEligible) {
+        switch (entry.doctorStatus) {
+            case ModAssetLibraryDoctorStatusNotDispatched: {
+                doctorButton = [UIButton buttonWithType:UIButtonTypeSystem];
+                doctorButton.translatesAutoresizingMaskIntoConstraints = NO;
+                gd_style_button_as_native_glass(doctorButton, @"dispatch", gd_accent_green_color());
+                doctorButton.titleLabel.font = [UIFont systemFontOfSize:kGDModsDoctorCapsuleFontSize weight:UIFontWeightSemibold];
+                [doctorButton addTarget:target action:dispatchAction forControlEvents:UIControlEventTouchUpInside];
+                objc_setAssociatedObject(row, "gd_button_dispatch", doctorButton, OBJC_ASSOCIATION_RETAIN);
+                doctorView = doctorButton;
+                break;
+            }
+            case ModAssetLibraryDoctorStatusUploading: {
+                NSInteger percent = (NSInteger)round(MAX(0.0, MIN(1.0, entry.doctorUploadProgress)) * 100.0);
+                UILabel *progressLabel = [[UILabel alloc] init];
+                progressLabel.translatesAutoresizingMaskIntoConstraints = NO;
+                progressLabel.text = [NSString stringWithFormat:@"%ld%% uploaded", (long)percent];
+                progressLabel.font = [UIFont systemFontOfSize:10 weight:UIFontWeightMedium];
+                progressLabel.textColor = gd_accent_green_color();
+                progressLabel.textAlignment = NSTextAlignmentRight;
+                objc_setAssociatedObject(row, "gd_label_doctorProgress", progressLabel, OBJC_ASSOCIATION_RETAIN);
+                doctorView = progressLabel;
+                break;
+            }
+            case ModAssetLibraryDoctorStatusProcessing: {
+                NSInteger percent = (NSInteger)round(MAX(0.0, MIN(1.0, entry.doctorProcessProgress)) * 100.0);
+                UILabel *progressLabel = [[UILabel alloc] init];
+                progressLabel.translatesAutoresizingMaskIntoConstraints = NO;
+                progressLabel.text = [NSString stringWithFormat:@"%ld%% processed", (long)percent];
+                progressLabel.font = [UIFont systemFontOfSize:10 weight:UIFontWeightMedium];
+                progressLabel.textColor = gd_accent_green_color();
+                progressLabel.textAlignment = NSTextAlignmentRight;
+                objc_setAssociatedObject(row, "gd_label_doctorProgress", progressLabel, OBJC_ASSOCIATION_RETAIN);
+                doctorView = progressLabel;
+                break;
+            }
+            case ModAssetLibraryDoctorStatusReadyToDownload: {
+                // downloadInFlight: the fetch+install for THIS row is
+                // already running (see -gd_modsLibraryEntryDownloadTapped:'s
+                // doctorDownloadInFlightPaths) - doctorStatus itself
+                // stays ReadyToDownload for the whole thing (nothing to
+                // persist mid-flight, see that method's own header), so
+                // this is the one doctor-pipeline row state that isn't
+                // driven by entry.doctorStatus alone. Render the same
+                // non-interactive subtext style Uploading/Processing use
+                // rather than a disabled button, so it doesn't look like
+                // a still-tappable control that's simply not responding.
+                if (downloadInFlight) {
+                    UILabel *progressLabel = [[UILabel alloc] init];
+                    progressLabel.translatesAutoresizingMaskIntoConstraints = NO;
+                    progressLabel.text = @"downloading…";
+                    progressLabel.font = [UIFont systemFontOfSize:10 weight:UIFontWeightMedium];
+                    progressLabel.textColor = gd_accent_green_color();
+                    progressLabel.textAlignment = NSTextAlignmentRight;
+                    objc_setAssociatedObject(row, "gd_label_doctorProgress", progressLabel, OBJC_ASSOCIATION_RETAIN);
+                    doctorView = progressLabel;
+                    break;
+                }
+                doctorButton = [UIButton buttonWithType:UIButtonTypeSystem];
+                doctorButton.translatesAutoresizingMaskIntoConstraints = NO;
+                gd_style_button_as_native_glass(doctorButton, @"download", gd_accent_green_color());
+                doctorButton.titleLabel.font = [UIFont systemFontOfSize:kGDModsDoctorCapsuleFontSize weight:UIFontWeightSemibold];
+                [doctorButton addTarget:target action:downloadAction forControlEvents:UIControlEventTouchUpInside];
+                objc_setAssociatedObject(row, "gd_button_download", doctorButton, OBJC_ASSOCIATION_RETAIN);
+                doctorView = doctorButton;
+                break;
+            }
+            case ModAssetLibraryDoctorStatusInstalled: {
+                // Terminal, non-interactive - see ModAssetLibrary.h's own
+                // comment on why this case was appended after Failed
+                // rather than inserted after ReadyToDownload. No button,
+                // no SEL wired; matches the Uploading/Processing subtext
+                // shape since it's informational only.
+                UILabel *installedLabel = [[UILabel alloc] init];
+                installedLabel.translatesAutoresizingMaskIntoConstraints = NO;
+                installedLabel.text = @"installed";
+                installedLabel.font = [UIFont systemFontOfSize:10 weight:UIFontWeightMedium];
+                installedLabel.textColor = [UIColor colorWithWhite:1 alpha:0.4];
+                installedLabel.textAlignment = NSTextAlignmentRight;
+                objc_setAssociatedObject(row, "gd_label_doctorProgress", installedLabel, OBJC_ASSOCIATION_RETAIN);
+                doctorView = installedLabel;
+                break;
+            }
+            case ModAssetLibraryDoctorStatusFailed: {
+                doctorButton = [UIButton buttonWithType:UIButtonTypeSystem];
+                doctorButton.translatesAutoresizingMaskIntoConstraints = NO;
+                UIColor *failTint = [UIColor colorWithRed:1.0 green:0.42 blue:0.42 alpha:1.0];
+                gd_style_button_as_native_glass(doctorButton, @"retry", failTint);
+                doctorButton.titleLabel.font = [UIFont systemFontOfSize:kGDModsDoctorCapsuleFontSize weight:UIFontWeightSemibold];
+                [doctorButton addTarget:target action:retryAction forControlEvents:UIControlEventTouchUpInside];
+                objc_setAssociatedObject(row, "gd_button_retry", doctorButton, OBJC_ASSOCIATION_RETAIN);
+                doctorView = doctorButton;
+                break;
+            }
+        }
+        if (doctorView) {
+            objc_setAssociatedObject(doctorView, "gd_modsEntry", entry, OBJC_ASSOCIATION_RETAIN);
+            [row addSubview:doctorView];
+            objc_setAssociatedObject(row, "gd_view_doctor", doctorView, OBJC_ASSOCIATION_RETAIN);
+        }
+    }
+
+    UIView *labelTrailingNeighbor = doctorView ?: (resetButton ?: row);
     [NSLayoutConstraint activateConstraints:@[
         [icon.leadingAnchor constraintEqualToAnchor:row.leadingAnchor constant:22], // indented under the folder icon above
         [icon.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
         [icon.widthAnchor constraintEqualToConstant:16],
 
         [label.leadingAnchor constraintEqualToAnchor:icon.trailingAnchor constant:5],
-        [label.trailingAnchor constraintLessThanOrEqualToAnchor:(resetButton ?: row).trailingAnchor constant:(resetButton ? -6 : -8)],
+        [label.trailingAnchor constraintLessThanOrEqualToAnchor:labelTrailingNeighbor.trailingAnchor constant:(labelTrailingNeighbor == row ? -8 : -6)],
         [label.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
 
         [row.topAnchor constraintEqualToAnchor:label.topAnchor constant:-3],
@@ -2563,11 +2725,32 @@ static UIView *gd_make_mods_entry_row(ModAssetLibraryEntry *entry, id target, SE
             [deleteButton.widthAnchor constraintEqualToConstant:18],
             [deleteButton.heightAnchor constraintEqualToConstant:18],
 
-            [resetButton.trailingAnchor constraintEqualToAnchor:deleteButton.leadingAnchor constant:-3],
+            [resetButton.trailingAnchor constraintEqualToAnchor:(doctorView ?: deleteButton).leadingAnchor constant:-3],
             [resetButton.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
             [resetButton.widthAnchor constraintEqualToConstant:18],
             [resetButton.heightAnchor constraintEqualToConstant:18],
         ]];
+        if (doctorView) {
+            [NSLayoutConstraint activateConstraints:@[
+                [doctorView.trailingAnchor constraintEqualToAnchor:deleteButton.leadingAnchor constant:-3],
+            ]];
+        }
+    } else if (doctorView) {
+        // No reset/delete this pass (row collapsed) - the doctor slot is
+        // simply the row's own trailing-most control.
+        [NSLayoutConstraint activateConstraints:@[
+            [doctorView.trailingAnchor constraintEqualToAnchor:row.trailingAnchor],
+        ]];
+    }
+
+    if (doctorView) {
+        [NSLayoutConstraint activateConstraints:@[
+            [doctorView.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
+            [doctorView.widthAnchor constraintGreaterThanOrEqualToConstant:kGDModsDoctorCapsuleMinWidth],
+        ]];
+        if (doctorButton) {
+            [doctorView.heightAnchor constraintEqualToConstant:kGDModsDoctorCapsuleHeight].active = YES;
+        }
     }
 
     return row;
@@ -2621,6 +2804,21 @@ static UIView *gd_make_mods_entry_info_panel(ModAssetLibraryEntry *entry) {
     dateLabel.font = subtextFont;
     dateLabel.textColor = subtextColor;
     [panel addArrangedSubview:dateLabel];
+
+    // Doctor-pipeline failure detail - only ever present when the row's
+    // compact "retry" capsule (see gd_make_mods_entry_row) is showing,
+    // i.e. doctorStatus == Failed. The full message lives here rather
+    // than in the row itself so the row's own layout never has to
+    // reflow around an arbitrarily long error string - see that
+    // function's header comment for the rest of this reasoning.
+    if (entry.doctorStatus == ModAssetLibraryDoctorStatusFailed && entry.doctorLastError.length) {
+        GDMarqueeLabel *errorLabel = [[GDMarqueeLabel alloc] init];
+        errorLabel.text = [NSString stringWithFormat:@"Error: %@", entry.doctorLastError];
+        errorLabel.font = subtextFont;
+        errorLabel.textColor = [UIColor colorWithRed:1.0 green:0.5 blue:0.5 alpha:0.85];
+        errorLabel.marqueeKey = [entry.path stringByAppendingString:@"|doctorError"];
+        [panel addArrangedSubview:errorLabel];
+    }
 
     [NSLayoutConstraint activateConstraints:@[
         [panel.topAnchor constraintEqualToAnchor:container.topAnchor],
@@ -2866,43 +3064,27 @@ static UIView *gd_make_title_block(void) {
 
 // Load Mods is a single button that routes each picked file to its own
 // pipeline by kind (see -gd_handleLoadModsPickedURLs:intoFolder:): a
-// .bank goes straight through BankTransplant (synchronous, batched);
-// an "__data" asset bundle is queued and run one at a time through
-// BundleDoctorService's upload-doctor-pick-target-install flow, since
-// that flow needs its own on-device target-file picker per bundle
-// (see BundleDoctorInstaller.h's header on why this class doesn't
-// guess that location itself) and can't be batched the way bank swaps
-// can. doctorTargetPicker is a weak ref to the live target-file picker
-// so the shared -documentPicker:didPickDocumentsAtURLs: delegate
-// method knows which step just completed; pendingDoctoredBundleURL
-// bridges the doctor-upload step to the target-pick step for whichever
-// queue item is currently in flight.
-@property (nonatomic, weak) UIDocumentPickerViewController *doctorTargetPicker;
-@property (nonatomic, strong) NSURL *pendingDoctoredBundleURL;
-
-// Load Mods' own file picker (routes into
-// -gd_handleLoadModsPickedURLs:intoFolder: below) plus the folder that
-// was just created/named via -gd_promptForModFolderNameWithTitle:...
-// immediately before it was shown - see -loadModsTapped. Every file
-// submitted through this picker is imported into that folder (tracked
-// in the Mod Asset Library) regardless of whether it also routes to a
-// swap-in pipeline below.
+// .bank goes straight through BankTransplant (synchronous, batched); an
+// "__data" asset bundle is just imported into the Mod Asset Library like
+// any other file - it no longer auto-uploads to the doctor pipeline at
+// import time (see "#pragma mark Mods (doctor pipeline)" below for the
+// per-entry dispatch/poll/download flow that replaced that). There's no
+// import-time picker/queue for the doctor pipeline anymore as a result -
+// the old queue-shaped doctorTargetPicker/pendingDoctoredBundleURL
+// (upload-then-pick-a-target-file) and loadModsDoctorQueue/
+// loadModsCurrentDoctorSourceURL (one-at-a-time drain queue) are gone
+// for good. The target-file-pick step they used to do at the tail of
+// that queue is back, but reshaped per-entry rather than per-queue-item -
+// see doctorInstallTargetPicker below and "#pragma mark Mods (doctor
+// pipeline)"'s download handler.
 @property (nonatomic, weak) UIDocumentPickerViewController *loadModsPicker;
 @property (nonatomic, copy) NSString *loadModsTargetFolder;
 
-// Queue + running report for one Load Mods submission. loadModsDoctorQueue
-// holds the still-pending "__data" URLs (bank files don't queue - they're
-// swapped synchronously as a batch before the queue starts draining);
-// loadModsCurrentDoctorSourceURL is whichever one is currently mid-flight
-// through the doctor pipeline, kept around only so the eventual
-// success/failure line in loadModsSummaryLines can name the right file
-// (the doctor pipeline's own intermediate values, like the doctored temp
-// file, don't carry that name). loadModsSummaryLines accumulates one line
-// per submitted file - unrecognized-kind, bank-swap result, and
-// doctor-pipeline result alike - and is flushed into one combined alert
-// by -gd_presentLoadModsFinalSummary once nothing is left queued.
-@property (nonatomic, strong) NSMutableArray<NSURL *> *loadModsDoctorQueue;
-@property (nonatomic, strong) NSURL *loadModsCurrentDoctorSourceURL;
+// One line per file submitted through Load Mods this run - unrecognized-
+// kind, bank-swap result, and "landed in the library" doctor-eligible
+// files alike - flushed into one combined alert by
+// -gd_presentLoadModsFinalSummary once -gd_processLoadModsBankURLs:
+// finishes (there's no queue left to drain after it - see above).
 @property (nonatomic, strong) NSMutableArray<NSString *> *loadModsSummaryLines;
 
 // Mods Library (ModAssetLibrary.h) - bookkeeping shelf of tracked mod
@@ -2923,6 +3105,68 @@ static UIView *gd_make_title_block(void) {
 // plus which folder it's importing into.
 @property (nonatomic, weak) UIDocumentPickerViewController *libraryImportPicker;
 @property (nonatomic, copy) NSString *libraryImportTargetFolder;
+
+// Section 3 runtime state for the doctor-pipeline dispatch/poll flow
+// (see "#pragma mark Mods (doctor pipeline)" below) - none of this is
+// persisted itself (doctorStatus/doctorUploadProgress/etc. on the
+// manifest entry are the actual source of truth, via
+// +[ModAssetLibrary updateDoctorStateForEntry:inFolder:applyBlock:error:])
+// - this is just the in-memory bookkeeping needed to drive it. Every
+// dictionary here is keyed by ModAssetLibraryEntry.path, which is
+// stable across a -gd_rebuildModsLibrary rebuild the way a stashed
+// entry object itself isn't (a fresh array is read back from the
+// manifest every rebuild).
+//
+// doctorPollTimers - one repeating 6s NSTimer per entry currently in
+// ModAssetLibraryDoctorStatusProcessing, polling that run's status.
+// Stopped (and removed) the moment that entry leaves Processing, for
+// any reason (succeeded, failed, or reset via Retry).
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSTimer *> *doctorPollTimers;
+// doctorUploadProgressLastPercent/doctorProcessProgressLastPercent -
+// last rounded 0-100 percent actually written to the manifest (and
+// rebuilt onto screen) for each entry, so a burst of upload-progress
+// callbacks or a poll tick that reports the same percentage as last
+// time is a no-op rather than another read-modify-write manifest
+// write plus a full accordion rebuild.
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *doctorUploadProgressLastPercent;
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *doctorProcessProgressLastPercent;
+// Entries (by path) whose "download" tap is currently being handled -
+// fetch from GitHub, then (CAB match failing) a target-file pick, then
+// install, all of which is NOT a manifest-persisted doctorStatus the
+// way Uploading/Processing are (see -gd_modsLibraryEntryDownloadTapped:'s
+// own header comment on why: a fetch is one un-resumable request, so
+// there's nothing to recover on relaunch the way a killed upload's
+// state needs -gd_recoverStaleDoctorStateForThisLaunch to handle - the
+// row just falls back to a plain, re-tappable "download" capsule if the
+// app dies mid-flight). Purely in-memory, same purpose as
+// doctorUploadProgressLastPercent above: gd_make_mods_entry_row checks
+// this set to render a non-interactive "downloading…" label instead of
+// the button while a path is in it, and -gd_modsLibraryEntryDownloadTapped:
+// checks it first to ignore a second tap on the same row mid-flight.
+@property (nonatomic, strong) NSMutableSet<NSString *> *doctorDownloadInFlightPaths;
+// Target-bundle picker for the download/install flow's manual fallback
+// (see -gd_presentDoctorInstallTargetPickerForDoctoredURL:entryPath:
+// inFolder: below) - separate from loadModsPicker/libraryImportPicker
+// for the same reason those are separate from each other: so
+// -documentPicker:didPickDocumentsAtURLs: can tell which flow a result
+// belongs to. Only one of these can be presented at a time (it's a
+// modal), so - unlike doctorDownloadInFlightPaths above, which can
+// legitimately hold more than one entry mid-fetch at once - the pending
+// fields below are singular, not dictionaries; a second entry reaching
+// the "need a manual pick" branch while one is already up is turned
+// away with an alert rather than queued (see that method).
+@property (nonatomic, weak) UIDocumentPickerViewController *doctorInstallTargetPicker;
+@property (nonatomic, copy) NSURL *doctorInstallPendingDoctoredURL;
+@property (nonatomic, copy) NSString *doctorInstallPendingEntryPath;
+@property (nonatomic, copy) NSString *doctorInstallPendingFolderName;
+// Set once the very first time -gd_rebuildModsLibrary runs after this
+// launch - gates -gd_recoverStaleDoctorStateForThisLaunch so it only
+// ever inspects the manifest for leftover Uploading/Processing rows
+// once per process lifetime, not on every one of the many rebuilds a
+// normal session triggers (which would otherwise re-flip an upload
+// that's actively in flight RIGHT NOW, in this same session, straight
+// to Failed the instant its first progress callback rebuilds the row).
+@property (nonatomic, assign) BOOL doctorStateRecoveredThisLaunch;
 
 // Generic press-and-hold-to-confirm state, shared by every X (delete)
 // icon in the Mods Library accordion (folder rows and entry rows
@@ -3999,39 +4243,42 @@ static const CGFloat kContentFadeHeight = 22;
         if (folderName) [self gd_handleLoadModsPickedURLs:urls intoFolder:folderName];
         return;
     }
-    if (controller == self.doctorTargetPicker) {
-        [self gd_handlePickedDoctorTargetURL:urls.firstObject];
-        return;
-    }
     if (controller == self.libraryImportPicker) {
         NSString *folderName = self.libraryImportTargetFolder;
         self.libraryImportTargetFolder = nil;
         if (folderName) [self gd_handlePickedLibraryImportURLs:urls intoFolder:folderName];
         return;
     }
+    if (controller == self.doctorInstallTargetPicker) {
+        NSURL *doctoredURL = self.doctorInstallPendingDoctoredURL;
+        NSString *entryPath = self.doctorInstallPendingEntryPath;
+        NSString *folderName = self.doctorInstallPendingFolderName;
+        self.doctorInstallPendingDoctoredURL = nil;
+        self.doctorInstallPendingEntryPath = nil;
+        self.doctorInstallPendingFolderName = nil;
+        if (doctoredURL && entryPath && folderName) {
+            [self gd_doctorInstallDoctoredURL:doctoredURL toStockBundleURL:urls.firstObject entryPath:entryPath inFolder:folderName];
+        }
+        return;
+    }
 }
 
 - (void)documentPickerWasCancelled:(UIDocumentPickerViewController *)controller {
-    if (controller == self.doctorTargetPicker) {
-        if (self.pendingDoctoredBundleURL) {
-            // Doctoring already succeeded and produced a temp file -
-            // the person just backed out of picking where it goes.
-            // Clean up the temp file rather than leaking it.
-            [[NSFileManager defaultManager] removeItemAtURL:self.pendingDoctoredBundleURL error:nil];
-            self.pendingDoctoredBundleURL = nil;
-        }
-        // Report this queue item as skipped rather than silently
-        // dropping it out of the eventual combined summary, then keep
-        // draining whatever else is still queued behind it.
-        if (self.loadModsCurrentDoctorSourceURL) {
-            [self.loadModsSummaryLines addObject:
-                [NSString stringWithFormat:@"%@: skipped - no destination picked", self.loadModsCurrentDoctorSourceURL.lastPathComponent]];
-            self.loadModsCurrentDoctorSourceURL = nil;
-        }
-        [self gd_startNextLoadModsDoctorQueueItem];
-    }
     if (controller == self.libraryImportPicker) {
         self.libraryImportTargetFolder = nil;
+    }
+    if (controller == self.doctorInstallTargetPicker) {
+        NSString *entryPath = self.doctorInstallPendingEntryPath;
+        NSString *folderName = self.doctorInstallPendingFolderName;
+        self.doctorInstallPendingDoctoredURL = nil;
+        self.doctorInstallPendingEntryPath = nil;
+        self.doctorInstallPendingFolderName = nil;
+        if (entryPath && folderName) {
+            [self gd_doctorDownloadFailedForEntryPath:entryPath inFolder:folderName error:
+                [NSError errorWithDomain:BundleDoctorInstallerErrorDomain
+                                     code:BundleDoctorInstallerErrorNoInstallTarget
+                                 userInfo:@{NSLocalizedDescriptionKey: @"Cancelled - no stock bundle was picked to install into."}]];
+        }
     }
 }
 
@@ -4040,11 +4287,12 @@ static const CGFloat kContentFadeHeight = 22;
 // moments earlier (tracked regardless of routing outcome - per spec,
 // anything submitted lands in that folder), then partitions the files
 // by kind: .bank files are swapped synchronously as one batch (see
-// -gd_processLoadModsBankURLs:thenStartDoctorQueue:), "__data" files
-// are queued and drained one at a time through the doctor pipeline
-// (see -gd_startNextLoadModsDoctorQueueItem), and anything else is
-// reported as unrecognized. All three sets land in one combined
-// end-of-run alert - see -gd_presentLoadModsFinalSummary.
+// -gd_processLoadModsBankURLs:), "__data" files get one summary line
+// noting they're sitting in the library ready to dispatch (dispatching
+// is now a manual per-entry action - see "#pragma mark Mods (doctor
+// pipeline)" below, there's no queue to feed here anymore), and
+// anything else is reported as unrecognized. All three sets land in
+// one combined end-of-run alert - see -gd_presentLoadModsFinalSummary.
 - (void)gd_handleLoadModsPickedURLs:(NSArray<NSURL *> *)urls intoFolder:(NSString *)folderName {
     if (urls.count == 0) return;
 
@@ -4056,32 +4304,33 @@ static const CGFloat kContentFadeHeight = 22;
     [self gd_rebuildModsLibrary];
 
     NSMutableArray<NSURL *> *bankURLs = [NSMutableArray array];
-    NSMutableArray<NSURL *> *doctorURLs = [NSMutableArray array];
-    NSMutableArray<NSString *> *unrecognizedLines = [NSMutableArray array];
+    NSMutableArray<NSString *> *summaryLines = [NSMutableArray array];
 
     for (NSURL *url in urls) {
         if ([url.pathExtension caseInsensitiveCompare:@"bank"] == NSOrderedSame) {
             [bankURLs addObject:url];
         } else if ([url.lastPathComponent caseInsensitiveCompare:@"__data"] == NSOrderedSame) {
-            [doctorURLs addObject:url];
+            [summaryLines addObject:[NSString stringWithFormat:@"%@: added to Mods Library - tap Dispatch when ready to send it for processing", url.lastPathComponent]];
         } else {
-            [unrecognizedLines addObject:[NSString stringWithFormat:@"%@: not a recognized bank or bundle", url.lastPathComponent]];
+            [summaryLines addObject:[NSString stringWithFormat:@"%@: not a recognized bank or bundle", url.lastPathComponent]];
         }
     }
 
-    self.loadModsSummaryLines = [NSMutableArray arrayWithArray:unrecognizedLines];
-    self.loadModsDoctorQueue = doctorURLs.count > 0 ? [doctorURLs mutableCopy] : nil;
+    self.loadModsSummaryLines = summaryLines;
 
     [self gd_processLoadModsBankURLs:bankURLs];
 }
 
 // Swaps every picked .bank on a background queue as one batch, appends
-// one result line per file to loadModsSummaryLines, then hands off to
-// the doctor queue (which finishes the run itself, or - if nothing was
-// queued - goes straight to -gd_presentLoadModsFinalSummary).
+// one result line per file to loadModsSummaryLines, then closes out the
+// run - see -gd_presentLoadModsFinalSummary. (There's no doctor queue
+// to hand off to anymore - "__data" files already got their own
+// summary line in -gd_handleLoadModsPickedURLs:intoFolder: above and
+// don't do anything further until their entry's own Dispatch button is
+// tapped.)
 - (void)gd_processLoadModsBankURLs:(NSArray<NSURL *> *)bankURLs {
     if (bankURLs.count == 0) {
-        [self gd_startNextLoadModsDoctorQueueItem];
+        [self gd_presentLoadModsFinalSummary];
         return;
     }
 
@@ -4118,7 +4367,7 @@ static const CGFloat kContentFadeHeight = 22;
                 typeof(self) strongSelf = weakSelf;
                 if (!strongSelf) return;
                 [strongSelf.loadModsSummaryLines addObjectsFromArray:lines];
-                [strongSelf gd_startNextLoadModsDoctorQueueItem];
+                [strongSelf gd_presentLoadModsFinalSummary];
             };
             if (working.presentingViewController) {
                 [working dismissViewControllerAnimated:YES completion:afterDismiss];
@@ -4223,231 +4472,443 @@ static const CGFloat kContentFadeHeight = 22;
 
 #pragma mark Mods (doctor pipeline)
 //
-// send-and-intercept, client side, one "__data" bundle at a time:
-// BundleDoctorService forwards it to the GitHub Actions workflow
-// configured in the Auth section (repo link + PAT, see
-// -gd_loadAuthFields/-gd_persistAuthFields above) -> once doctored,
-// pick the stock bundle to overwrite -> BundleDoctorInstaller backs it
-// up once and swaps the doctored bytes in. Driven entirely by
-// loadModsDoctorQueue (see -gd_startNextLoadModsDoctorQueueItem) -
-// there's no standalone entry point into this anymore; every "__data"
-// file in a Load Mods submission is queued and drained through here
-// one at a time, since the on-device target-file picker step below is
-// inherently a single-file-at-a-time UI, and every result (success,
-// failure, or a cancelled target pick) is folded into the one combined
-// summary Load Mods shows at the end of its run rather than its own
-// separate alert.
+// send-and-intercept, client side, per-entry and opt-in: a "__data"
+// bundle sits in the Mod Asset Library at ModAssetLibraryDoctorStatus
+// NotDispatched (just like any other imported file) until the person
+// taps that entry's own "dispatch" capsule (see gd_make_mods_entry_row)
+// - there's no auto-upload-on-import and no blocking popup anymore (see
+// progress.md's "Section 3 - Wiring / state machine" for the full
+// before/after). From there BundleDoctorService's four decoupled phases
+// (see that header) drive the entry through Uploading -> Processing ->
+// ReadyToDownload -> Installed, with every transition persisted onto
+// the manifest row via +[ModAssetLibrary updateDoctorStateForEntry:
+// inFolder:applyBlock:error:] so it survives the app being backgrounded
+// or killed mid-flight - see -gd_recoverStaleDoctorStateForThisLaunch
+// below for what happens on the next launch after that (Installed isn't
+// mentioned there - it's a terminal state with nothing left in flight
+// to recover).
+//
+// Dispatch, Retry, and Download are all wired below (Section 3 is done,
+// per progress.md's own split into first/second half). Download's own
+// target-file-pick step - CAB-auto-match via UnityCacheLocator first,
+// falling back to a manual UIDocumentPickerViewController pick - is the
+// old queue-based flow's target-picker machinery, reintroduced adapted
+// to a per-entry (rather than per-queue-item) shape; see
+// -gd_modsLibraryEntryDownloadTapped:'s own header for the full three
+// steps.
 
-// Pulls the next "__data" URL off loadModsDoctorQueue and runs it
-// through the doctor pipeline, or - once the queue's empty - closes
-// out the run with -gd_presentLoadModsFinalSummary. Checked once per
-// item rather than once per Load Mods run so a mid-run credential
-// change (however unlikely) isn't assumed to apply to items already
-// queued before it; if auth still isn't configured, every remaining
-// queued item is reported skipped in one pass rather than repeating
-// the same "Auth Not Configured" alert once per file.
-- (void)gd_startNextLoadModsDoctorQueueItem {
-    if (self.loadModsDoctorQueue.count == 0) {
-        [self gd_presentLoadModsFinalSummary];
+// ModAssetLibraryEntry doesn't carry the name of the folder it lives in
+// (see ModAssetLibrary.h's own header on why - it's bookkeeping the
+// panel itself owns) but every call into
+// +updateDoctorStateForEntry:inFolder:applyBlock:error: below needs
+// one, and a tap handler only ever gets the entry back (via the
+// "gd_modsEntry" associated object - see gd_make_mods_entry_row).
+// entry.path is always root/folderName/fileName (see
+// +[ModAssetLibrary importFileURLs:intoFolder:error:]), so the owning
+// folder is just its path's parent directory's last component - no
+// extra bookkeeping needed to thread a folder name through every call
+// site here.
+static NSString *gd_mods_folder_name_for_entry(ModAssetLibraryEntry *entry) {
+    return entry.path.stringByDeletingLastPathComponent.lastPathComponent;
+}
+
+// Lightweight stand-in for +updateDoctorStateForEntry:inFolder:
+// applyBlock:error:'s `entry` argument, needed by every async callback
+// below (upload progress, poll ticks) that only has an entry PATH
+// (captured at dispatch time, stable across a rebuild) rather than a
+// live entry object - that method only ever uses entry.path to find
+// the manifest row it's mutating, per its own header, so this is all
+// it needs.
+static ModAssetLibraryEntry *gd_mods_entry_placeholder_for_path(NSString *path) {
+    ModAssetLibraryEntry *placeholder = [ModAssetLibraryEntry new];
+    placeholder.path = path;
+    return placeholder;
+}
+
+static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "polls the GitHub repo every 6 seconds"
+
+// Wired to an entry row's "dispatch" capsule (NotDispatched state only
+// - see gd_make_mods_entry_row). Flips the entry to Uploading, then
+// kicks off BundleDoctorService's phase 1 (upload + commit + branch +
+// workflow_dispatch). uploadProgress ticks are throttled to one
+// manifest write + rebuild per whole-number percent (see
+// -gd_doctorHandleUploadProgress:forEntryPath:inFolder:) rather than
+// hammering both on every callback, which can fire many times a
+// second per BundleDoctorService's own header.
+- (void)gd_modsLibraryEntryDispatchTapped:(UIButton *)sender {
+    ModAssetLibraryEntry *entry = objc_getAssociatedObject(sender, "gd_modsEntry");
+    if (!entry) return;
+    NSString *folderName = gd_mods_folder_name_for_entry(entry);
+    if (!folderName) {
+        ZLog(@"[Mods Library] Dispatch tapped for %@ but couldn't derive its owning folder from its path (%@) - not proceeding.", entry.fileName, entry.path);
         return;
     }
 
     BundleDoctorConfig *config = [BundleDoctorSettings loadConfig];
     if (config.repoOwner.length == 0 || config.repoName.length == 0 || config.authToken.length == 0) {
-        for (NSURL *url in self.loadModsDoctorQueue) {
-            [self.loadModsSummaryLines addObject:
-                [NSString stringWithFormat:@"%@: skipped - set a GitHub Repository Link and Personal Access Token under Mods \u2192 Auth first", url.lastPathComponent]];
-        }
-        self.loadModsDoctorQueue = nil;
-        [self gd_presentLoadModsFinalSummary];
+        [self gd_presentModsAlertWithTitle:@"Auth Not Configured"
+                                    message:@"Set a GitHub Repository Link and Personal Access Token under Mods \u2192 Auth first."];
         return;
     }
 
-    NSURL *nextURL = self.loadModsDoctorQueue.firstObject;
-    [self.loadModsDoctorQueue removeObjectAtIndex:0];
-    self.loadModsCurrentDoctorSourceURL = nextURL;
-    [self gd_doctorQueueItemAtURL:nextURL];
-}
+    NSString *entryPath = entry.path; // captured now - stays valid as a manifest lookup key even once `entry` itself is stale
+    [self.doctorUploadProgressLastPercent removeObjectForKey:entryPath];
+    [self.doctorProcessProgressLastPercent removeObjectForKey:entryPath];
 
-// Kicks off BundleDoctorService for one queued bundle, driving a
-// spinner alert whose message is updated live from the service's
-// progress callback. remainingInQueue is folded into the spinner's
-// title purely as a "X left" cue when more than one "__data" file was
-// submitted in this Load Mods run - it doesn't change any behavior.
-- (void)gd_doctorQueueItemAtURL:(NSURL *)moddedURL {
-    BundleDoctorConfig *config = [BundleDoctorSettings loadConfig];
-    NSInteger remainingInQueue = self.loadModsDoctorQueue.count;
-    NSString *title = remainingInQueue > 0
-        ? [NSString stringWithFormat:@"Doctoring Bundle\u2026 (%ld left after this)", (long)remainingInQueue]
-        : @"Doctoring Bundle\u2026";
-
-    UIAlertController *working = [UIAlertController alertControllerWithTitle:title
-                                                                       message:@"Starting\u2026"
-                                                                preferredStyle:UIAlertControllerStyleAlert];
-    UIActivityIndicatorView *spinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
-    spinner.translatesAutoresizingMaskIntoConstraints = NO;
-    [working.view addSubview:spinner];
-    [spinner startAnimating];
-    [NSLayoutConstraint activateConstraints:@[
-        [spinner.centerXAnchor constraintEqualToAnchor:working.view.centerXAnchor],
-        [spinner.bottomAnchor constraintEqualToAnchor:working.view.bottomAnchor constant:-16],
-    ]];
-    UIViewController *presenter = gd_key_window().rootViewController;
-    if (presenter) [presenter presentViewController:working animated:YES completion:nil];
-
-    __weak typeof(self) weakSelf = self;
-    [BundleDoctorService doctorBundleAtURL:moddedURL
-                                     config:config
-                                   progress:^(NSString *status) {
-        working.message = status; // presented UIAlertController.message re-lays-out live on status text changes
+    NSError *stateError = nil;
+    ModAssetLibraryEntry *updated = [ModAssetLibrary updateDoctorStateForEntry:entry
+                                                                        inFolder:folderName
+                                                                      applyBlock:^(ModAssetLibraryEntry *entryToMutate) {
+        entryToMutate.doctorStatus = ModAssetLibraryDoctorStatusUploading;
+        entryToMutate.doctorUploadProgress = 0.0;
+        entryToMutate.doctorProcessProgress = 0.0;
+        entryToMutate.doctorLastError = nil;
     }
-                                 completion:^(NSURL * _Nullable doctoredBundleURL, NSError * _Nullable error) {
-        void (^afterDismiss)(void) = ^{
-            typeof(self) strongSelf = weakSelf;
-            if (!strongSelf) return;
+                                                                           error:&stateError];
+    if (!updated) {
+        ZLog(@"[Mods Library] couldn't flip %@ to Uploading: %@", entry.fileName, stateError);
+        return;
+    }
+    [self gd_rebuildModsLibrary];
 
-            if (!doctoredBundleURL) {
-                NSString *line = [NSString stringWithFormat:@"%@: %@", moddedURL.lastPathComponent, error.localizedDescription ?: @"doctoring failed"];
-                NSString *runURL = error.userInfo[BundleDoctorServiceRunURLKey];
-                if (runURL.length > 0) line = [line stringByAppendingFormat:@" (%@)", runURL];
-                [strongSelf.loadModsSummaryLines addObject:line];
-                strongSelf.loadModsCurrentDoctorSourceURL = nil;
-                [strongSelf gd_startNextLoadModsDoctorQueueItem];
-                return;
-            }
-
-            // Bundle's doctored and sitting in a temp file - try to place
-            // it automatically before falling back to the manual picker.
-            // See -gd_attemptCABAutoInstallForDoctoredURL:sourceURL: for
-            // the CAB read + UnityCache/Shared search this does.
-            strongSelf.pendingDoctoredBundleURL = doctoredBundleURL;
-            [strongSelf gd_attemptCABAutoInstallForDoctoredURL:doctoredBundleURL sourceURL:moddedURL];
-        };
-
-        if (working.presentingViewController) {
-            [working dismissViewControllerAnimated:YES completion:afterDismiss];
-        } else {
-            afterDismiss();
-        }
+    NSURL *bundleURL = [NSURL fileURLWithPath:entryPath];
+    __weak typeof(self) weakSelf = self;
+    [BundleDoctorService dispatchBundleAtURL:bundleURL
+                                        config:config
+                                uploadProgress:^(double fractionComplete) {
+        [weakSelf gd_doctorHandleUploadProgress:fractionComplete forEntryPath:entryPath inFolder:folderName];
+    }
+                                    completion:^(BundleDoctorHandle * _Nullable handle, NSError * _Nullable error) {
+        [weakSelf gd_doctorDispatchCompletedForEntryPath:entryPath inFolder:folderName handle:handle error:error];
     }];
 }
 
-// Reintroduces the CAB-based auto-match this project used to have (see
-// BundleDoctorInstaller.h's own header on why it doesn't guess a stock
-// bundle's location itself) as the FIRST thing tried once a bundle comes
-// back from BundleDoctorService, before falling back to the manual
-// target picker: read the CAB baked into the just-doctored bundle's own
-// directory table (doctoring only re-encodes Texture2D/TextAsset object
-// bytes, not that identity string - see UnityCacheLocator.h), then
-// search every UnityCache/Shared root this app can find for a cached
-// file that reports the SAME CAB as ITS OWN identity. A hit means "this
-// is the same logical asset" regardless of which cache subfolder it's
-// sitting in, so it can be installed straight away with no picker at
-// all. A miss (CAB unreadable, no UnityCache/Shared found, or nothing
-// under it matches - all three logged via ZLog for diagnosis) falls
-// back to exactly the manual flow this project already had.
-- (void)gd_attemptCABAutoInstallForDoctoredURL:(NSURL *)doctoredURL sourceURL:(NSURL *)sourceURL {
-    BOOL scoped = [sourceURL startAccessingSecurityScopedResource];
-    NSError *cabError = nil;
-    NSString *cab = [UnityCacheLocator cabForBundleAtPath:sourceURL.path error:&cabError];
-    if (scoped) [sourceURL stopAccessingSecurityScopedResource];
+// Wired to an entry row's "retry" capsule (Failed state only - see
+// gd_make_mods_entry_row). Stops any poll timer still (incorrectly)
+// armed for this entry, clears the throttle bookkeeping, and resets
+// every doctor-pipeline field back to its NotDispatched default so the
+// row falls back to showing the dispatch capsule - the "obvious tap =
+// start over" behavior progress.md flagged as the likely choice here
+// but not yet confirmed by the person.
+- (void)gd_modsLibraryEntryRetryTapped:(UIButton *)sender {
+    ModAssetLibraryEntry *entry = objc_getAssociatedObject(sender, "gd_modsEntry");
+    if (!entry) return;
+    NSString *folderName = gd_mods_folder_name_for_entry(entry);
+    if (!folderName) return;
 
-    if (!cab) {
-        ZLog(@"[UnityCacheLocator] couldn't read a CAB off %@, falling back to manual target picker: %@",
-             sourceURL.lastPathComponent, cabError.localizedDescription);
-        [self gd_presentDoctorTargetPicker];
+    [self gd_stopDoctorPollTimerForEntryPath:entry.path];
+    [self.doctorUploadProgressLastPercent removeObjectForKey:entry.path];
+    [self.doctorProcessProgressLastPercent removeObjectForKey:entry.path];
+
+    NSError *error = nil;
+    ModAssetLibraryEntry *updated = [ModAssetLibrary updateDoctorStateForEntry:entry
+                                                                        inFolder:folderName
+                                                                      applyBlock:^(ModAssetLibraryEntry *entryToMutate) {
+        entryToMutate.doctorStatus = ModAssetLibraryDoctorStatusNotDispatched;
+        entryToMutate.doctorUploadProgress = 0.0;
+        entryToMutate.doctorProcessProgress = 0.0;
+        entryToMutate.doctorScratchBranch = nil;
+        entryToMutate.doctorRunID = nil;
+        entryToMutate.doctorRunURL = nil;
+        entryToMutate.doctorLastError = nil;
+    }
+                                                                           error:&error];
+    if (!updated) {
+        ZLog(@"[Mods Library] couldn't reset %@ back to NotDispatched: %@", entry.fileName, error);
         return;
     }
-
-    NSError *locateError = nil;
-    NSString *matchedPath = [UnityCacheLocator locateBundlePathForCAB:cab error:&locateError];
-    if (!matchedPath) {
-        ZLog(@"[UnityCacheLocator] no auto-match for CAB %@ (from %@), falling back to manual target picker: %@",
-             cab, sourceURL.lastPathComponent, locateError.localizedDescription);
-        [self gd_presentDoctorTargetPicker];
-        return;
-    }
-
-    // Same install + bookkeeping -gd_handlePickedDoctorTargetURL: does
-    // for the manual path, just without a picker round-trip.
-    self.pendingDoctoredBundleURL = nil;
-    NSString *sourceName = self.loadModsCurrentDoctorSourceURL.lastPathComponent ?: sourceURL.lastPathComponent;
-    self.loadModsCurrentDoctorSourceURL = nil;
-
-    NSURL *stockURL = [NSURL fileURLWithPath:matchedPath];
-    NSError *installError = nil;
-    BOOL ok = [BundleDoctorInstaller installDoctoredBundleAtURL:doctoredURL toStockBundleURL:stockURL error:&installError];
-    [[NSFileManager defaultManager] removeItemAtURL:doctoredURL error:nil]; // done with the temp file either way
-
-    if (ok) {
-        [self.loadModsSummaryLines addObject:
-            [NSString stringWithFormat:@"%@: installed, replacing %@ (auto-matched by CAB %@)",
-                sourceName, stockURL.lastPathComponent, cab]];
-    } else {
-        [self.loadModsSummaryLines addObject:
-            [NSString stringWithFormat:@"%@: %@", sourceName, installError.localizedDescription ?: @"install failed"]];
-    }
-    [self gd_startNextLoadModsDoctorQueueItem];
+    [self gd_rebuildModsLibrary];
 }
 
-- (void)gd_presentDoctorTargetPicker {
-    UIDocumentPickerViewController *picker;
-    if (@available(iOS 14.0, *)) {
-        picker = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTTypeData, UTTypeItem]];
-    } else {
-        picker = [[UIDocumentPickerViewController alloc] initWithDocumentTypes:@[@"public.data", @"public.item"]
-                                                                          inMode:UIDocumentPickerModeOpen];
-    }
-    picker.delegate = self;
-    picker.allowsMultipleSelection = NO;
-    self.doctorTargetPicker = picker;
+// Throttled write-back for phase 1's uploadProgress callback - skips
+// the manifest read-modify-write (and the accordion rebuild it would
+// otherwise trigger) unless the rounded whole-number percent actually
+// moved since the last call, since uploadProgress can fire many times
+// a second per BundleDoctorService's own header.
+- (void)gd_doctorHandleUploadProgress:(double)fractionComplete forEntryPath:(NSString *)entryPath inFolder:(NSString *)folderName {
+    NSInteger percent = (NSInteger)round(MAX(0.0, MIN(1.0, fractionComplete)) * 100.0);
+    if (!self.doctorUploadProgressLastPercent) self.doctorUploadProgressLastPercent = [NSMutableDictionary dictionary];
+    NSNumber *last = self.doctorUploadProgressLastPercent[entryPath];
+    if (last && last.integerValue == percent) return;
+    self.doctorUploadProgressLastPercent[entryPath] = @(percent);
 
-    UIViewController *presenter = gd_key_window().rootViewController;
-    if (!presenter) {
-        ZLog(@"[BundleDoctorService] no root view controller to present the target-file picker from");
-        return;
+    NSError *error = nil;
+    ModAssetLibraryEntry *updated = [ModAssetLibrary updateDoctorStateForEntry:gd_mods_entry_placeholder_for_path(entryPath)
+                                                                        inFolder:folderName
+                                                                      applyBlock:^(ModAssetLibraryEntry *entryToMutate) {
+        entryToMutate.doctorUploadProgress = fractionComplete;
     }
-    [presenter presentViewController:picker animated:YES completion:nil];
+                                                                           error:&error];
+    if (!updated) return; // entry deleted mid-upload - nothing left to show progress on
+    [self gd_rebuildModsLibrary];
 }
 
-// Step 2 result: the person picked which on-disk stock bundle the
-// doctored one should replace - hand both off to BundleDoctorInstaller,
-// fold the outcome into loadModsSummaryLines, then keep draining
-// whatever's still queued behind this one.
-- (void)gd_handlePickedDoctorTargetURL:(NSURL *)stockURL {
-    NSURL *doctoredURL = self.pendingDoctoredBundleURL;
-    self.pendingDoctoredBundleURL = nil;
-    NSString *sourceName = self.loadModsCurrentDoctorSourceURL.lastPathComponent ?: stockURL.lastPathComponent;
-    self.loadModsCurrentDoctorSourceURL = nil;
-    if (!doctoredURL) {
-        ZLog(@"[BundleDoctorService] target picked but no pending doctored bundle - shouldn't happen");
-        [self gd_startNextLoadModsDoctorQueueItem];
+// Phase 1 completion: on success, persists the handle's scratchBranch
+// (runID/runURL are still nil at this point - phase 2 fills those in),
+// flips the entry to Processing, and arms its poll timer. On failure,
+// flips to Failed with the error surfaced via doctorLastError (full
+// text goes in the entry's info-panel Error line - see
+// gd_make_mods_entry_info_panel - the compact row itself just shows a
+// "retry" capsule).
+- (void)gd_doctorDispatchCompletedForEntryPath:(NSString *)entryPath
+                                        inFolder:(NSString *)folderName
+                                          handle:(BundleDoctorHandle *)handle
+                                           error:(NSError *)error {
+    [self.doctorUploadProgressLastPercent removeObjectForKey:entryPath];
+
+    if (!handle) {
+        [self gd_doctorFailEntryAtPath:entryPath inFolder:folderName error:error];
         return;
     }
 
-    BOOL scoped = [stockURL startAccessingSecurityScopedResource];
-    NSError *installError = nil;
-    BOOL ok = [BundleDoctorInstaller installDoctoredBundleAtURL:doctoredURL toStockBundleURL:stockURL error:&installError];
-    if (scoped) [stockURL stopAccessingSecurityScopedResource];
-    [[NSFileManager defaultManager] removeItemAtURL:doctoredURL error:nil]; // done with the temp file either way
-
-    if (ok) {
-        [self.loadModsSummaryLines addObject:
-            [NSString stringWithFormat:@"%@: installed, replacing %@", sourceName, stockURL.lastPathComponent]];
-    } else {
-        [self.loadModsSummaryLines addObject:
-            [NSString stringWithFormat:@"%@: %@", sourceName, installError.localizedDescription ?: @"install failed"]];
+    NSError *stateError = nil;
+    ModAssetLibraryEntry *updated = [ModAssetLibrary updateDoctorStateForEntry:gd_mods_entry_placeholder_for_path(entryPath)
+                                                                        inFolder:folderName
+                                                                      applyBlock:^(ModAssetLibraryEntry *entryToMutate) {
+        entryToMutate.doctorStatus = ModAssetLibraryDoctorStatusProcessing;
+        entryToMutate.doctorUploadProgress = 1.0;
+        entryToMutate.doctorProcessProgress = 0.0;
+        entryToMutate.doctorScratchBranch = handle.scratchBranch;
+        entryToMutate.doctorRunID = handle.runID;
+        entryToMutate.doctorRunURL = handle.runURL;
     }
-    [self gd_startNextLoadModsDoctorQueueItem];
+                                                                           error:&stateError];
+    if (!updated) {
+        ZLog(@"[Mods Library] dispatch finished for %@ but its manifest entry is gone (deleted mid-upload?) - not arming a poll timer.", entryPath.lastPathComponent);
+        return;
+    }
+    [self gd_rebuildModsLibrary];
+    [self gd_armDoctorPollTimerForEntryPath:entryPath inFolder:folderName];
 }
+
+// Shared by every failure path below (upload failure, run resolve/
+// status error, credentials pulled mid-poll) - stops this entry's poll
+// timer (if any) and records the failure onto the manifest so the row
+// falls back to a "retry" capsule.
+- (void)gd_doctorFailEntryAtPath:(NSString *)entryPath inFolder:(NSString *)folderName error:(NSError *)error {
+    [self gd_stopDoctorPollTimerForEntryPath:entryPath];
+
+    NSError *stateError = nil;
+    ModAssetLibraryEntry *updated = [ModAssetLibrary updateDoctorStateForEntry:gd_mods_entry_placeholder_for_path(entryPath)
+                                                                        inFolder:folderName
+                                                                      applyBlock:^(ModAssetLibraryEntry *entryToMutate) {
+        entryToMutate.doctorStatus = ModAssetLibraryDoctorStatusFailed;
+        entryToMutate.doctorLastError = error.localizedDescription ?: @"Unknown error.";
+    }
+                                                                           error:&stateError];
+    if (!updated) {
+        ZLog(@"[Mods Library] couldn't record doctor failure for %@ (entry deleted mid-flight?): %@", entryPath.lastPathComponent, stateError);
+        return;
+    }
+    [self gd_rebuildModsLibrary];
+}
+
+#pragma mark Mods (doctor pipeline) - 6s poll loop
+
+// Arms a repeating kDoctorPollInterval-second timer for one Processing
+// entry - same "timerWithTimeInterval:repeats:block: added to the main
+// run loop in common modes" convention -startPostFXReapply already
+// uses, so the poll keeps firing while the person is actively
+// scrolling/dragging elsewhere in the panel. Fires once immediately
+// (rather than waiting a full 6s for the first check) since the run is
+// least likely to have shown up in the runs list yet right after
+// dispatch anyway - see +resolveRunForHandle:config:completion:'s own
+// header on why `found == NO` there is normal, not an error.
+- (void)gd_armDoctorPollTimerForEntryPath:(NSString *)entryPath inFolder:(NSString *)folderName {
+    if (!self.doctorPollTimers) self.doctorPollTimers = [NSMutableDictionary dictionary];
+    [self.doctorPollTimers[entryPath] invalidate]; // shouldn't already exist, but never double-arm
+
+    __weak typeof(self) weakSelf = self;
+    NSTimer *timer = [NSTimer timerWithTimeInterval:kDoctorPollInterval
+                                              repeats:YES
+                                                block:^(NSTimer *timer) {
+        [weakSelf gd_pollDoctorRunForEntryPath:entryPath inFolder:folderName];
+    }];
+    [[NSRunLoop mainRunLoop] addTimer:timer forMode:NSRunLoopCommonModes];
+    self.doctorPollTimers[entryPath] = timer;
+
+    [self gd_pollDoctorRunForEntryPath:entryPath inFolder:folderName];
+}
+
+- (void)gd_stopDoctorPollTimerForEntryPath:(NSString *)entryPath {
+    NSTimer *timer = self.doctorPollTimers[entryPath];
+    [timer invalidate];
+    [self.doctorPollTimers removeObjectForKey:entryPath];
+}
+
+// One poll tick for one entry: reads the entry's current on-disk state
+// fresh (rather than trusting anything captured at arm-time, per
+// +updateDoctorStateForEntry:...'s own "safe to call repeatedly from a
+// timer even if the entry is stale" contract), bails out quietly if
+// it's been deleted or has moved off Processing some other way, then
+// runs phase 2 (resolve the run ID, if not already known) or phase 3
+// (status + percent, once it is).
+- (void)gd_pollDoctorRunForEntryPath:(NSString *)entryPath inFolder:(NSString *)folderName {
+    NSError *readError = nil;
+    NSArray<ModAssetLibraryEntry *> *entries = [ModAssetLibrary entriesInFolder:folderName error:&readError];
+    ModAssetLibraryEntry *current = nil;
+    for (ModAssetLibraryEntry *candidate in entries) {
+        if ([candidate.path isEqualToString:entryPath]) { current = candidate; break; }
+    }
+    if (!current || current.doctorStatus != ModAssetLibraryDoctorStatusProcessing) {
+        // Deleted mid-flight, folder itself gone, or already resolved
+        // (succeeded/failed/reset) through some other path - either
+        // way, nothing left here for this timer to do.
+        [self gd_stopDoctorPollTimerForEntryPath:entryPath];
+        return;
+    }
+
+    BundleDoctorConfig *config = [BundleDoctorSettings loadConfig];
+    if (config.repoOwner.length == 0 || config.repoName.length == 0 || config.authToken.length == 0) {
+        [self gd_doctorFailEntryAtPath:entryPath inFolder:folderName error:
+            [NSError errorWithDomain:BundleDoctorServiceErrorDomain
+                                 code:BundleDoctorServiceErrorInvalidConfig
+                             userInfo:@{NSLocalizedDescriptionKey: @"GitHub auth was cleared while this bundle was still processing."}]];
+        return;
+    }
+
+    BundleDoctorHandle *handle = [BundleDoctorHandle handleFromDictionaryRepresentation:@{
+        @"scratchBranch": current.doctorScratchBranch ?: @"",
+        @"runID": current.doctorRunID ?: @"",
+        @"runURL": current.doctorRunURL ?: @"",
+    }];
+    if (!handle) {
+        [self gd_doctorFailEntryAtPath:entryPath inFolder:folderName error:
+            [NSError errorWithDomain:BundleDoctorServiceErrorDomain
+                                 code:BundleDoctorServiceErrorRunNotFound
+                             userInfo:@{NSLocalizedDescriptionKey: @"Lost track of this submission's scratch branch."}]];
+        return;
+    }
+
+    __weak typeof(self) weakSelf = self;
+    if (current.doctorRunID.length == 0) {
+        // Phase 2 - the run this dispatch created hasn't been resolved
+        // yet. found == NO is normal (not an error) for the first few
+        // seconds after a dispatch - just try again next tick.
+        [BundleDoctorService resolveRunForHandle:handle config:config completion:^(BOOL found, NSError * _Nullable error) {
+            typeof(self) strongSelf = weakSelf;
+            if (!strongSelf) return;
+            if (error) {
+                [strongSelf gd_doctorFailEntryAtPath:entryPath inFolder:folderName error:error];
+                return;
+            }
+            if (!found) return;
+            [ModAssetLibrary updateDoctorStateForEntry:gd_mods_entry_placeholder_for_path(entryPath)
+                                                inFolder:folderName
+                                              applyBlock:^(ModAssetLibraryEntry *entryToMutate) {
+                entryToMutate.doctorRunID = handle.runID;
+                entryToMutate.doctorRunURL = handle.runURL;
+            }
+                                                   error:nil];
+            [strongSelf gd_rebuildModsLibrary];
+        }];
+        return;
+    }
+
+    // Phase 3 - runID is known, check status + percent.
+    [BundleDoctorService fetchRunStatusForHandle:handle config:config completion:^(BundleDoctorRunStatus status, double percentComplete, NSError * _Nullable error) {
+        typeof(self) strongSelf = weakSelf;
+        if (!strongSelf) return;
+
+        if (status == BundleDoctorRunStatusFailed) {
+            [strongSelf gd_doctorFailEntryAtPath:entryPath inFolder:folderName error:error];
+            return;
+        }
+        if (status == BundleDoctorRunStatusSucceeded) {
+            [strongSelf gd_stopDoctorPollTimerForEntryPath:entryPath];
+            [strongSelf.doctorProcessProgressLastPercent removeObjectForKey:entryPath];
+            NSError *stateError = nil;
+            ModAssetLibraryEntry *updated = [ModAssetLibrary updateDoctorStateForEntry:gd_mods_entry_placeholder_for_path(entryPath)
+                                                                                inFolder:folderName
+                                                                              applyBlock:^(ModAssetLibraryEntry *entryToMutate) {
+                entryToMutate.doctorStatus = ModAssetLibraryDoctorStatusReadyToDownload;
+                entryToMutate.doctorProcessProgress = 1.0;
+            }
+                                                                                   error:&stateError];
+            if (updated) [strongSelf gd_rebuildModsLibrary];
+            return;
+        }
+        // Queued/InProgress - just the percentage moved (or didn't).
+        [strongSelf gd_doctorHandleProcessProgress:percentComplete forEntryPath:entryPath inFolder:folderName];
+    }];
+}
+
+// Same whole-number-percent throttle as -gd_doctorHandleUploadProgress:
+// forEntryPath:inFolder: above, applied to phase 3's percentComplete
+// instead of phase 1's uploadProgress.
+- (void)gd_doctorHandleProcessProgress:(double)fractionComplete forEntryPath:(NSString *)entryPath inFolder:(NSString *)folderName {
+    NSInteger percent = (NSInteger)round(MAX(0.0, MIN(1.0, fractionComplete)) * 100.0);
+    if (!self.doctorProcessProgressLastPercent) self.doctorProcessProgressLastPercent = [NSMutableDictionary dictionary];
+    NSNumber *last = self.doctorProcessProgressLastPercent[entryPath];
+    if (last && last.integerValue == percent) return;
+    self.doctorProcessProgressLastPercent[entryPath] = @(percent);
+
+    NSError *error = nil;
+    ModAssetLibraryEntry *updated = [ModAssetLibrary updateDoctorStateForEntry:gd_mods_entry_placeholder_for_path(entryPath)
+                                                                        inFolder:folderName
+                                                                      applyBlock:^(ModAssetLibraryEntry *entryToMutate) {
+        entryToMutate.doctorProcessProgress = fractionComplete;
+    }
+                                                                           error:&error];
+    if (!updated) return;
+    [self gd_rebuildModsLibrary];
+}
+
+// Runs once per process launch, the first time -gd_rebuildModsLibrary
+// is called (see that method) - NOT on every rebuild, since that would
+// re-inspect (and potentially misjudge) an entry that's actively
+// mid-upload/mid-processing RIGHT NOW in this same session the instant
+// its own first progress callback triggers a rebuild.
+//
+// Processing entries just get their poll timer re-armed (their
+// scratchBranch/runID/runURL survive on the manifest, so polling can
+// resume exactly where it left off - see ModAssetLibrary.h's own header
+// on why those three fields are persisted at all).
+//
+// Uploading entries can't be resumed the same way - the in-flight
+// NSURLSessionUploadTask (if any) died along with the process that
+// launched it, so there's no partial upload left to continue. Per
+// progress.md's own flag on this ("the honest thing to do... is almost
+// certainly to flip it back to Failed... rather than pretend it's
+// still uploading" - called out there as a real product decision, not
+// a given): this flips those to Failed with a message explaining why,
+// rather than either leaving a stuck "XX% uploaded" that will never
+// move again, or silently resetting straight back to NotDispatched
+// without a trace. Worth confirming with the person once this is
+// actually reachable on a device.
+- (void)gd_recoverStaleDoctorStateForThisLaunch {
+    if (self.doctorStateRecoveredThisLaunch) return;
+    self.doctorStateRecoveredThisLaunch = YES;
+
+    for (NSString *folderName in [ModAssetLibrary folderNames]) {
+        NSError *error = nil;
+        NSArray<ModAssetLibraryEntry *> *entries = [ModAssetLibrary entriesInFolder:folderName error:&error];
+        for (ModAssetLibraryEntry *entry in entries) {
+            if (entry.doctorStatus == ModAssetLibraryDoctorStatusUploading) {
+                [ModAssetLibrary updateDoctorStateForEntry:entry
+                                                    inFolder:folderName
+                                                  applyBlock:^(ModAssetLibraryEntry *entryToMutate) {
+                    entryToMutate.doctorStatus = ModAssetLibraryDoctorStatusFailed;
+                    entryToMutate.doctorLastError = @"Upload was interrupted (the app was closed or backgrounded mid-upload). Tap Retry to send it again.";
+                }
+                                                       error:nil];
+            } else if (entry.doctorStatus == ModAssetLibraryDoctorStatusProcessing) {
+                if (!self.doctorPollTimers[entry.path]) {
+                    [self gd_armDoctorPollTimerForEntryPath:entry.path inFolder:folderName];
+                }
+            }
+        }
+    }
+}
+
 
 // Flushes loadModsSummaryLines into one combined alert covering
 // everything submitted through Load Mods this run - unrecognized
-// files, every bank swap result, and every doctor-pipeline result
-// alike - then clears the run's state. Called once the doctor queue
-// (if any) has fully drained; -gd_processLoadModsBankURLs: calls
-// straight through to -gd_startNextLoadModsDoctorQueueItem first, so
-// this is always the last thing to run in a given Load Mods pass.
+// files, every bank swap result, and every "added to the library, tap
+// Dispatch when ready" line for a doctor-eligible file alike - then
+// clears the run's state. -gd_processLoadModsBankURLs: calls straight
+// through to this once its own batch is done, so this is always the
+// last thing to run in a given Load Mods pass.
 - (void)gd_presentLoadModsFinalSummary {
     NSArray<NSString *> *lines = self.loadModsSummaryLines ?: @[];
     self.loadModsSummaryLines = nil;
@@ -4570,6 +5031,13 @@ static const CGFloat kContentFadeHeight = 22;
 - (void)gd_rebuildModsLibrary {
     if (!self.modsLibraryStack) return;
 
+    // One-shot per launch, not per rebuild - see
+    // -gd_recoverStaleDoctorStateForThisLaunch's own header comment for
+    // why re-running it on every rebuild would be wrong (it would
+    // misjudge an entry that's actively mid-upload in THIS session the
+    // instant its own progress callback triggers one of these calls).
+    [self gd_recoverStaleDoctorStateForThisLaunch];
+
     for (UIView *view in self.modsLibraryStack.arrangedSubviews) {
         // A row's delete/reset button's real-glass capsule (see
         // gd_attach_hold_to_confirm) lives in the shared
@@ -4641,11 +5109,20 @@ static const CGFloat kContentFadeHeight = 22;
             // you've actually looked at the file's info first, and the
             // capsule has the row's own free trailing space to expand
             // into instead of overlapping the dropdown's Path/Size/
-            // Added text.
+            // Added text. The doctor-pipeline dispatch/upload/process/
+            // download slot (bundle-kind rows only) is NOT gated the
+            // same way - it renders regardless of entryExpanded, since
+            // it's non-destructive and is meant to be the row's normal
+            // at-rest affordance - see gd_make_mods_entry_row's own
+            // header comment.
             UIView *entryRow = gd_make_mods_entry_row(entry, self,
                 @selector(gd_modsLibraryEntryInfoTapped:),
                 @selector(gd_modsLibraryEntryResetTapped:),
-                entryExpanded);
+                @selector(gd_modsLibraryEntryDispatchTapped:),
+                @selector(gd_modsLibraryEntryDownloadTapped:),
+                @selector(gd_modsLibraryEntryRetryTapped:),
+                entryExpanded,
+                [self.doctorDownloadInFlightPaths containsObject:entry.path]);
             [self.modsLibraryStack addArrangedSubview:entryRow];
 
             if (entryExpanded) {
@@ -4739,6 +5216,219 @@ static const CGFloat kContentFadeHeight = 22;
 // "Restore Originals" button.
 - (void)gd_modsLibraryEntryResetTapped:(UIButton *)sender {
     [self restoreOriginalsTapped];
+}
+
+// --- Doctor-pipeline download handler (Section 3, second half) ---
+//
+// Wired to an entry row's "download" capsule (ReadyToDownload state
+// only - see gd_make_mods_entry_row). Three steps, in order:
+//   1. +[BundleDoctorService fetchDoctoredBundleForHandle:config:
+//      completion:] - pulls the doctored bytes back from the scratch
+//      branch to a local temp file. No byte-level progress is reported
+//      here (it's a single Contents API GET, unlike phase 1's blob
+//      POST) - see doctorDownloadInFlightPaths' own header comment on
+//      why that means this state isn't persisted onto doctorStatus the
+//      way Uploading/Processing are.
+//   2. Figure out which on-disk stock bundle to overwrite.
+//      BundleDoctorInstaller.h deliberately doesn't guess this itself -
+//      see that file's header - so this tries UnityCacheLocator's
+//      CAB-based auto-match first (silent, no picker) and only falls
+//      back to a manual UIDocumentPickerViewController pass, per the
+//      spec, if that comes up empty.
+//   3. +[BundleDoctorInstaller installDoctoredBundleAtURL:
+//      toStockBundleURL:error:] - the actual on-disk swap. Per the
+//      person's own spec ("automatically slot it in place once it's
+//      fully downloaded") there's no separate confirm step once a
+//      target is known - auto-match or manual pick, either one goes
+//      straight to install.
+- (void)gd_modsLibraryEntryDownloadTapped:(UIButton *)sender {
+    ModAssetLibraryEntry *entry = objc_getAssociatedObject(sender, "gd_modsEntry");
+    if (!entry) return;
+    NSString *folderName = gd_mods_folder_name_for_entry(entry);
+    if (!folderName) {
+        ZLog(@"[Mods Library] Download tapped for %@ but couldn't derive its owning folder from its path (%@) - not proceeding.", entry.fileName, entry.path);
+        return;
+    }
+
+    if (!self.doctorDownloadInFlightPaths) self.doctorDownloadInFlightPaths = [NSMutableSet set];
+    if ([self.doctorDownloadInFlightPaths containsObject:entry.path]) return; // already in flight - ignore the double-tap
+
+    BundleDoctorConfig *config = [BundleDoctorSettings loadConfig];
+    if (config.repoOwner.length == 0 || config.repoName.length == 0 || config.authToken.length == 0) {
+        [self gd_presentModsAlertWithTitle:@"Auth Not Configured"
+                                    message:@"Set a GitHub Repository Link and Personal Access Token under Mods \u2192 Auth first."];
+        return;
+    }
+
+    BundleDoctorHandle *handle = [BundleDoctorHandle handleFromDictionaryRepresentation:@{
+        @"scratchBranch": entry.doctorScratchBranch ?: @"",
+        @"runID": entry.doctorRunID ?: @"",
+        @"runURL": entry.doctorRunURL ?: @"",
+    }];
+    if (!handle) {
+        [self gd_presentModsAlertWithTitle:@"Can't Download"
+                                    message:@"Lost track of this submission's scratch branch - try Retry to send it again."];
+        return;
+    }
+
+    NSString *entryPath = entry.path; // captured now, same reasoning as the dispatch handler's own entryPath capture
+    [self.doctorDownloadInFlightPaths addObject:entryPath];
+    [self gd_rebuildModsLibrary];
+
+    __weak typeof(self) weakSelf = self;
+    [BundleDoctorService fetchDoctoredBundleForHandle:handle config:config completion:^(NSURL * _Nullable doctoredBundleURL, NSError * _Nullable error) {
+        typeof(self) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        if (!doctoredBundleURL) {
+            [strongSelf gd_doctorDownloadFailedForEntryPath:entryPath inFolder:folderName error:error];
+            return;
+        }
+        [strongSelf gd_doctorLocateInstallTargetForDoctoredURL:doctoredBundleURL entryPath:entryPath inFolder:folderName];
+    }];
+}
+
+// Shared failure tail for the download/install flow - clears the
+// in-flight marker and surfaces an alert. Deliberately does NOT touch
+// entry.doctorStatus (stays ReadyToDownload) - per this method's own
+// callers, every failure here (fetch failed, no cache match AND the
+// person cancelled the manual picker, install itself failed) is
+// retryable by just tapping "download" again, same reasoning
+// +fetchDoctoredBundleForHandle:...'s own header gives for being safe
+// to call more than once.
+- (void)gd_doctorDownloadFailedForEntryPath:(NSString *)entryPath inFolder:(NSString *)folderName error:(NSError *)error {
+    [self.doctorDownloadInFlightPaths removeObject:entryPath];
+    UINotificationFeedbackGenerator *haptic = [UINotificationFeedbackGenerator new];
+    [haptic notificationOccurred:UINotificationFeedbackTypeError];
+    [self gd_presentModsAlertWithTitle:@"Download Failed"
+                                message:error.localizedDescription ?: @"Unknown error."];
+    [self gd_rebuildModsLibrary];
+}
+
+// Step 2 of the download flow (see -gd_modsLibraryEntryDownloadTapped:'s
+// own header) - tries UnityCacheLocator's CAB match before falling back
+// to a manual pick. doctoredURL's CAB (not the pre-doctor modded file
+// still sitting in the library at entryPath) is used, per
+// UnityCacheLocator.h's own note that doctoring doesn't touch a
+// bundle's directory-table CAB, so either file reads the same one -
+// doctoredURL is what's actually about to be installed, so reading its
+// own CAB is one fewer file this has to reason about being in sync.
+- (void)gd_doctorLocateInstallTargetForDoctoredURL:(NSURL *)doctoredURL entryPath:(NSString *)entryPath inFolder:(NSString *)folderName {
+    NSError *cabError = nil;
+    NSString *cab = [UnityCacheLocator cabForBundleAtPath:doctoredURL.path error:&cabError];
+    if (cab) {
+        NSError *locateError = nil;
+        NSString *matchPath = [UnityCacheLocator locateBundlePathForCAB:cab error:&locateError];
+        if (matchPath) {
+            [self gd_doctorInstallDoctoredURL:doctoredURL toStockBundleURL:[NSURL fileURLWithPath:matchPath] entryPath:entryPath inFolder:folderName];
+            return;
+        }
+        ZLog(@"[Mods Library] no UnityCache match for %@'s CAB (%@) - falling back to the manual picker: %@", entryPath.lastPathComponent, cab, locateError.localizedDescription);
+    } else {
+        ZLog(@"[Mods Library] couldn't read a CAB off the doctored bundle for %@ - falling back to the manual picker: %@", entryPath.lastPathComponent, cabError.localizedDescription);
+    }
+
+    [self gd_presentDoctorInstallTargetPickerForDoctoredURL:doctoredURL entryPath:entryPath inFolder:folderName];
+}
+
+// Manual fallback for step 2 - same picker shape as
+// -gd_presentLoadModsPickerIntoFolder:/-gd_presentModImportPickerForFolder:
+// (generic "any file" content type, no registered UTI for a stock Unity
+// bundle any more than a modded one), single selection since exactly
+// one stock file is being replaced. Routed back through
+// -documentPicker:didPickDocumentsAtURLs: like those two.
+- (void)gd_presentDoctorInstallTargetPickerForDoctoredURL:(NSURL *)doctoredURL entryPath:(NSString *)entryPath inFolder:(NSString *)folderName {
+    if (self.doctorInstallTargetPicker) {
+        // Only one modal document picker can be on screen at a time -
+        // another entry's download already claimed it. Turn this one
+        // away rather than silently dropping or queuing it; tapping
+        // download again once the other picker is dismissed retries
+        // cleanly (fetchDoctoredBundleForHandle:... is safe to re-call).
+        [self gd_doctorDownloadFailedForEntryPath:entryPath inFolder:folderName error:
+            [NSError errorWithDomain:BundleDoctorInstallerErrorDomain
+                                 code:BundleDoctorInstallerErrorNoInstallTarget
+                             userInfo:@{NSLocalizedDescriptionKey: @"Another download is already waiting on a file pick - finish that one, then try this download again."}]];
+        return;
+    }
+
+    UIDocumentPickerViewController *picker;
+    if (@available(iOS 14.0, *)) {
+        // initForOpeningContentTypes: (as opposed to the -init...
+        // variant the Import-mode fallback below uses) already means
+        // "give me a reference to the file where it lives" rather than
+        // "copy it in" - exactly what's needed here, since the whole
+        // point is to write the doctored bytes back to the STOCK
+        // bundle's own real location, not to a copy of it.
+        picker = [[UIDocumentPickerViewController alloc] initForOpeningContentTypes:@[UTTypeData, UTTypeItem]];
+    } else {
+        // Deliberately UIDocumentPickerModeOpen here, NOT
+        // UIDocumentPickerModeImport (unlike -gd_presentLoadModsPickerIntoFolder:/
+        // -gd_presentModImportPickerForFolder:, which both want a COPY
+        // of the picked file dropped into this app's own sandbox).
+        // Import mode would hand back a URL to a copy living somewhere
+        // under this app's container - writing the doctored bytes there
+        // would never touch the actual stock bundle the game reads
+        // from. Open mode returns (a security-scoped reference to) the
+        // original file at its real location, which is what
+        // BundleDoctorInstaller needs to overwrite in place.
+        picker = [[UIDocumentPickerViewController alloc] initWithDocumentTypes:@[@"public.data", @"public.item"]
+                                                                          inMode:UIDocumentPickerModeOpen];
+    }
+    picker.delegate = self;
+    picker.allowsMultipleSelection = NO;
+
+    UIViewController *presenter = gd_key_window().rootViewController;
+    if (!presenter) {
+        ZLog(@"[Mods Library] no root view controller to present the doctor install target picker from");
+        [self gd_doctorDownloadFailedForEntryPath:entryPath inFolder:folderName error:
+            [NSError errorWithDomain:BundleDoctorInstallerErrorDomain
+                                 code:BundleDoctorInstallerErrorNoInstallTarget
+                             userInfo:@{NSLocalizedDescriptionKey: @"Couldn't present the file picker."}]];
+        return;
+    }
+
+    self.doctorInstallTargetPicker = picker;
+    self.doctorInstallPendingDoctoredURL = doctoredURL;
+    self.doctorInstallPendingEntryPath = entryPath;
+    self.doctorInstallPendingFolderName = folderName;
+    // No explanatory alert first (unlike some other failure paths in
+    // this section) - presenting one here would just be a second modal
+    // fighting the picker for the same presenter one run-loop turn
+    // later. Same "just present the picker" convention
+    // -gd_presentLoadModsPickerIntoFolder:/-gd_presentModImportPickerForFolder:
+    // already use; a file-picker sheet appearing is self-explanatory
+    // enough without a preamble.
+    [presenter presentViewController:picker animated:YES completion:nil];
+}
+
+// Step 3 - the actual on-disk swap, then final bookkeeping.
+- (void)gd_doctorInstallDoctoredURL:(NSURL *)doctoredURL toStockBundleURL:(NSURL *)stockBundleURL entryPath:(NSString *)entryPath inFolder:(NSString *)folderName {
+    NSError *installError = nil;
+    BOOL installed = [BundleDoctorInstaller installDoctoredBundleAtURL:doctoredURL toStockBundleURL:stockBundleURL error:&installError];
+    [self.doctorDownloadInFlightPaths removeObject:entryPath];
+
+    if (!installed) {
+        UINotificationFeedbackGenerator *haptic = [UINotificationFeedbackGenerator new];
+        [haptic notificationOccurred:UINotificationFeedbackTypeError];
+        [self gd_presentModsAlertWithTitle:@"Install Failed"
+                                    message:installError.localizedDescription ?: @"Unknown error."];
+        [self gd_rebuildModsLibrary];
+        return;
+    }
+
+    NSError *stateError = nil;
+    ModAssetLibraryEntry *updated = [ModAssetLibrary updateDoctorStateForEntry:gd_mods_entry_placeholder_for_path(entryPath)
+                                                                        inFolder:folderName
+                                                                      applyBlock:^(ModAssetLibraryEntry *entryToMutate) {
+        entryToMutate.doctorStatus = ModAssetLibraryDoctorStatusInstalled;
+    }
+                                                                           error:&stateError];
+    if (!updated) {
+        ZLog(@"[Mods Library] installed %@ but couldn't record it as Installed on the manifest (entry deleted mid-flight?): %@", entryPath.lastPathComponent, stateError);
+    }
+
+    UINotificationFeedbackGenerator *haptic = [UINotificationFeedbackGenerator new];
+    [haptic notificationOccurred:UINotificationFeedbackTypeSuccess];
+    [self gd_rebuildModsLibrary];
 }
 
 // Best-effort restore of one tracked entry's swapped-in file back to
@@ -5062,7 +5752,7 @@ static const CGFloat kContentFadeHeight = 22;
 // "Add Asset" picker flow - bookkeeping only, see ModAssetLibrary.h.
 // Deliberately separate from Load Mods' own picker (different
 // UIDocumentPickerViewController instance, tracked via
-// libraryImportPicker rather than loadModsPicker/doctorTargetPicker)
+// libraryImportPicker rather than loadModsPicker)
 // so -documentPicker:didPickDocumentsAtURLs: can route the result here
 // instead of into either swap-in pipeline. No registered UTI
 // restriction, same reasoning as Load Mods' own picker: a mod file can
