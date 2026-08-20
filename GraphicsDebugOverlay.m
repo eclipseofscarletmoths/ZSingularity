@@ -2220,30 +2220,28 @@ static void * const kGDAuthFieldRowConstraintsKey = (void *)&kGDAuthFieldRowCons
 // -gd_restoreAuthField: knows what to tear down.
 static void * const kGDAuthFieldFloatingConstraintsKey = (void *)&kGDAuthFieldFloatingConstraintsKey;
 
-// Stacked "label above / native-glass field below" row - the Auth
-// section's GitHub Repository Link and Personal Access Token fields
-// use this instead of gd_make_button_and_glass_field_row's button+
-// field split, since neither of these two has a paired action button
-// of its own. Reuses gd_wrap_field_in_native_glass so the field is
-// the exact same real UIGlassEffect surface the Debug section's
-// blacklist entry field uses (see that function's own header comment
-// above) - same corner radius, same borderless UITextField underneath,
-// same pre-iOS-26 flat-rectangle fallback. `secure` masks the field's
-// entry (used for the PAT field so a shoulder-surf doesn't leak it).
-static GDRow *gd_make_labeled_glass_field_row(NSString *title, NSString *placeholder, BOOL secure) {
+// Bare native-glass field row - the Auth section's GitHub Repository
+// Link and Personal Access Token fields use this instead of
+// gd_make_button_and_glass_field_row's button+field split, since
+// neither of these two has a paired action button of its own (except
+// the PAT field's Verify button, see `trailingButton` below). Reuses
+// gd_wrap_field_in_native_glass so the field is the exact same real
+// UIGlassEffect surface the Debug section's blacklist entry field uses
+// (see that function's own header comment above) - same corner radius,
+// same borderless UITextField underneath, same pre-iOS-26 flat-
+// rectangle fallback. `secure` masks the field's entry (used for the
+// PAT field so a shoulder-surf doesn't leak it). No longer takes a
+// `title` - the "GitHub Repository Link"/"Personal Access Token"
+// labels that used to sit above each field were dropped per request;
+// the placeholder text alone identifies each field now. `trailingButton`,
+// when non-nil, is placed to the right of the field within the same
+// row - the field is narrowed to ~65% of the row's width (down from
+// the full width it takes when trailingButton is nil) to make room for
+// it. Only the PAT row passes one (its Verify button, see -buildPanel:'s
+// Auth section below).
+static GDRow *gd_make_labeled_glass_field_row(NSString *placeholder, BOOL secure, UIButton *trailingButton) {
     GDRow *row = [[GDRow alloc] initWithFrame:CGRectZero];
     row.translatesAutoresizingMaskIntoConstraints = NO;
-
-    // Same label styling as the "Blacklisted keywords" header below the
-    // syslog field (see -buildPanel:'s Debug section) - kept consistent
-    // rather than reusing gd_make_section_header, which is sized/weighted
-    // for a whole-section title, not a per-field label.
-    UILabel *label = [[UILabel alloc] init];
-    label.translatesAutoresizingMaskIntoConstraints = NO;
-    label.text = title;
-    label.font = [UIFont systemFontOfSize:11 weight:UIFontWeightMedium];
-    label.textColor = [UIColor colorWithWhite:0.9 alpha:1];
-    [row addSubview:label];
 
     UITextField *field = [[UITextField alloc] init];
     field.font = [UIFont systemFontOfSize:11 weight:UIFontWeightRegular];
@@ -2265,28 +2263,38 @@ static GDRow *gd_make_labeled_glass_field_row(NSString *title, NSString *placeho
     fieldContainer.translatesAutoresizingMaskIntoConstraints = NO;
     [row addSubview:fieldContainer];
 
-    [NSLayoutConstraint activateConstraints:@[
-        [label.leadingAnchor constraintEqualToAnchor:row.leadingAnchor],
-        [label.trailingAnchor constraintEqualToAnchor:row.trailingAnchor],
-        [label.topAnchor constraintEqualToAnchor:row.topAnchor],
-    ]];
-
-    // Named/kept as their own array (rather than folded into the
-    // activateConstraints: call above) so -gd_floatAuthField: can
-    // deactivate exactly these later without touching the label's own
-    // constraints - see kGDAuthFieldRowConstraintsKey above.
-    NSArray<NSLayoutConstraint *> *fieldConstraints = @[
+    // Named/kept as their own array (rather than folded into a single
+    // activateConstraints: call) so -gd_floatAuthField: can deactivate
+    // exactly these later - see kGDAuthFieldRowConstraintsKey above.
+    NSMutableArray<NSLayoutConstraint *> *fieldConstraints = [NSMutableArray arrayWithArray:@[
         [fieldContainer.leadingAnchor constraintEqualToAnchor:row.leadingAnchor],
-        [fieldContainer.trailingAnchor constraintEqualToAnchor:row.trailingAnchor],
-        [fieldContainer.topAnchor constraintEqualToAnchor:label.bottomAnchor constant:4],
+        [fieldContainer.topAnchor constraintEqualToAnchor:row.topAnchor],
         [fieldContainer.heightAnchor constraintEqualToConstant:28],
         [row.bottomAnchor constraintEqualToAnchor:fieldContainer.bottomAnchor],
-    ];
-    [NSLayoutConstraint activateConstraints:fieldConstraints];
+    ]];
+
+    if (trailingButton) {
+        trailingButton.translatesAutoresizingMaskIntoConstraints = NO;
+        [row addSubview:trailingButton];
+        // ~35% shrink off the field, handed straight to the button in
+        // the freed space - matches gd_make_button_pair_row's 8pt gap.
+        [fieldConstraints addObjectsFromArray:@[
+            [fieldContainer.widthAnchor constraintEqualToAnchor:row.widthAnchor multiplier:0.65],
+            [trailingButton.leadingAnchor constraintEqualToAnchor:fieldContainer.trailingAnchor constant:8],
+            [trailingButton.trailingAnchor constraintEqualToAnchor:row.trailingAnchor],
+            [trailingButton.topAnchor constraintEqualToAnchor:fieldContainer.topAnchor],
+            [trailingButton.bottomAnchor constraintEqualToAnchor:fieldContainer.bottomAnchor],
+        ]];
+    } else {
+        [fieldConstraints addObject:[fieldContainer.trailingAnchor constraintEqualToAnchor:row.trailingAnchor]];
+    }
+
+    NSArray<NSLayoutConstraint *> *finalFieldConstraints = [fieldConstraints copy];
+    [NSLayoutConstraint activateConstraints:finalFieldConstraints];
 
     objc_setAssociatedObject(field, kGDAuthFieldContainerKey, fieldContainer, OBJC_ASSOCIATION_RETAIN);
     objc_setAssociatedObject(field, kGDAuthFieldRowKey, row, OBJC_ASSOCIATION_RETAIN);
-    objc_setAssociatedObject(field, kGDAuthFieldRowConstraintsKey, fieldConstraints, OBJC_ASSOCIATION_RETAIN);
+    objc_setAssociatedObject(field, kGDAuthFieldRowConstraintsKey, finalFieldConstraints, OBJC_ASSOCIATION_RETAIN);
 
     return row;
 }
@@ -2470,9 +2478,9 @@ static UIView *gd_make_mods_folder_row(NSString *folderName, BOOL expanded, id t
 }
 
 // One tracked file's row, indented under its folder: [doc icon] [name]
-// .... [Reset, Delete - only when expanded]. Tapping anywhere on the
-// row (same whole-row tap-target approach as the folder row above)
-// toggles the path/size/date-added dropdown the caller (see
+// .... [Delete - only when expanded]. Tapping anywhere on the row
+// (same whole-row tap-target approach as the folder row above) toggles
+// the path/size/date-added dropdown the caller (see
 // -gd_rebuildModsLibrary) inserts right after this row when the
 // entry's path is in modsLibraryExpandedInfoEntries.
 //
@@ -2481,19 +2489,18 @@ static UIView *gd_make_mods_folder_row(NSString *folderName, BOOL expanded, id t
 // anymore (see ModAssetLibrary.h), so this is just an extension sniff
 // for display, nothing more.
 //
-// Reset/Delete live on THIS row, gated to only exist while `expanded`
-// is true (i.e. only once the dropdown is actually open) - same
-// "confirm you're looking at the right file before you can even reach
-// delete" safety idea as the folder row's always-visible X, just
-// scoped per-entry since there's no per-entry restore target to
-// protect against a stray tap on otherwise. Reset has no CAB-based
-// per-file restore to call anymore (see ModAssetLibrary.h's header) -
-// it just falls back to the panel's existing all-file "Restore
-// Originals" action, same as -gd_restoreModEntry: does before a
-// delete. When YES, the returned view's "gd_button_reset" and
-// "gd_button_delete" associated objects are those two buttons - the
-// caller reads them the same way it always has to wire hold-to-confirm
-// (see -gd_rebuildModsLibrary).
+// Delete lives on THIS row, gated to only exist while `expanded` is
+// true (i.e. only once the dropdown is actually open) - same "confirm
+// you're looking at the right file before you can even reach delete"
+// safety idea as the folder row's always-visible X. (This row used to
+// also carry a per-entry Reset/restore button here, but it had no
+// actual per-file restore target to call - see ModAssetLibrary.h's
+// header - and only ever fell back to the panel's existing all-file
+// "Restore Originals" action, same as it already runs on every backed-
+// up bank/bundle; redundant with that section-level button, so it's
+// been removed.) When YES, the returned view's "gd_button_delete"
+// associated object is that button - the caller reads it the same way
+// it always has to wire hold-to-confirm (see -gd_rebuildModsLibrary).
 //
 // --- Doctor-pipeline dispatch slot (dispatch/upload/process/download) ---
 // Section 2 of the bundle-dispatch-UX rework (see progress.md). Only
@@ -2506,18 +2513,17 @@ static UIView *gd_make_mods_folder_row(NSString *folderName, BOOL expanded, id t
 // actually lives, same as it already was for the bank/generic-doc icon
 // choice a few lines up.
 //
-// UNLIKE Reset/Delete, this slot is NOT gated behind `showActions` -
-// it renders regardless of whether the row's info dropdown is open.
+// UNLIKE Delete, this slot is NOT gated behind `showActions` - it
+// renders regardless of whether the row's info dropdown is open.
 // ModAssetLibraryDoctorStatusNotDispatched's own header comment ("default
 // - dispatch capsule shown, nothing sent yet") reads as this being the
 // row's normal at-rest affordance, not something buried behind an extra
-// tap - and unlike Reset/Delete it isn't destructive, so there's no
-// "protect against a stray tap" reason to hide it. When showActions is
-// also YES (dropdown open, delete/reset present), this slot sits
-// immediately to the LEFT of the delete button, per the spec ("right
-// next to the delete button ... on its left"); reset (if present) is
-// pushed one slot further left as a result. When showActions is NO,
-// this is simply the row's trailing-most control.
+// tap - and unlike Delete it isn't destructive, so there's no "protect
+// against a stray tap" reason to hide it. When showActions is also YES
+// (dropdown open, delete present), this slot sits immediately to the
+// LEFT of the delete button, per the spec ("right next to the delete
+// button ... on its left"). When showActions is NO, this is simply the
+// row's trailing-most control.
 //
 // NotDispatched/ReadyToDownload render a small glass capsule button
 // (gd_style_button_as_native_glass - same native-glass text-button API
@@ -2535,13 +2541,13 @@ static UIView *gd_make_mods_folder_row(NSString *folderName, BOOL expanded, id t
 //
 // dispatchAction/downloadAction/retryAction are only ever invoked with
 // `entry` already stashed on the control via the same "gd_modsEntry"
-// associated-object convention resetButton/deleteButton use above, so
-// the target's handler can look the entry up the same way.
+// associated-object convention deleteButton uses above, so the
+// target's handler can look the entry up the same way.
 static const CGFloat kGDModsDoctorCapsuleHeight = 18;    // matches the row's existing 18pt icon-button footprint
 static const CGFloat kGDModsDoctorCapsuleMinWidth = 54;  // enough for "dispatch"/"download"/"retry" at kGDModsDoctorCapsuleFontSize
 static const CGFloat kGDModsDoctorCapsuleFontSize = 9;
 
-static UIView *gd_make_mods_entry_row(ModAssetLibraryEntry *entry, id target, SEL tapAction, SEL resetAction,
+static UIView *gd_make_mods_entry_row(ModAssetLibraryEntry *entry, id target, SEL tapAction,
                                        SEL dispatchAction, SEL downloadAction, SEL retryAction, BOOL showActions,
                                        BOOL downloadInFlight) {
     UIView *row = [[UIView alloc] init];
@@ -2573,19 +2579,8 @@ static UIView *gd_make_mods_entry_row(ModAssetLibraryEntry *entry, id target, SE
     UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:target action:tapAction];
     [row addGestureRecognizer:tap];
 
-    UIButton *resetButton = nil;
     UIButton *deleteButton = nil;
     if (showActions) {
-        UIImageSymbolConfiguration *resetSymbolConfig = [UIImageSymbolConfiguration configurationWithPointSize:8 weight:UIImageSymbolWeightSemibold];
-        UIImage *resetImage = [UIImage systemImageNamed:@"arrow.uturn.backward" withConfiguration:resetSymbolConfig];
-        resetButton = [UIButton buttonWithType:UIButtonTypeSystem];
-        resetButton.translatesAutoresizingMaskIntoConstraints = NO;
-        gd_style_icon_button_as_native_glass(resetButton, resetImage, [UIColor colorWithWhite:1 alpha:0.6]);
-        [resetButton addTarget:target action:resetAction forControlEvents:UIControlEventTouchUpInside];
-        objc_setAssociatedObject(resetButton, "gd_modsEntry", entry, OBJC_ASSOCIATION_RETAIN);
-        [row addSubview:resetButton];
-        objc_setAssociatedObject(row, "gd_button_reset", resetButton, OBJC_ASSOCIATION_RETAIN);
-
         UIImageSymbolConfiguration *xSymbolConfig = [UIImageSymbolConfiguration configurationWithPointSize:6 weight:UIImageSymbolWeightSemibold];
         UIImage *xImage = [UIImage systemImageNamed:@"xmark" withConfiguration:xSymbolConfig];
         UIColor *xTint = [UIColor colorWithWhite:1 alpha:0.55];
@@ -2704,7 +2699,7 @@ static UIView *gd_make_mods_entry_row(ModAssetLibraryEntry *entry, id target, SE
         }
     }
 
-    UIView *labelTrailingNeighbor = doctorView ?: (resetButton ?: row);
+    UIView *labelTrailingNeighbor = doctorView ?: (deleteButton ?: row);
     [NSLayoutConstraint activateConstraints:@[
         [icon.leadingAnchor constraintEqualToAnchor:row.leadingAnchor constant:22], // indented under the folder icon above
         [icon.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
@@ -2718,17 +2713,12 @@ static UIView *gd_make_mods_entry_row(ModAssetLibraryEntry *entry, id target, SE
         [row.bottomAnchor constraintEqualToAnchor:label.bottomAnchor constant:3],
     ]];
 
-    if (deleteButton && resetButton) {
+    if (deleteButton) {
         [NSLayoutConstraint activateConstraints:@[
             [deleteButton.trailingAnchor constraintEqualToAnchor:row.trailingAnchor],
             [deleteButton.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
             [deleteButton.widthAnchor constraintEqualToConstant:18],
             [deleteButton.heightAnchor constraintEqualToConstant:18],
-
-            [resetButton.trailingAnchor constraintEqualToAnchor:(doctorView ?: deleteButton).leadingAnchor constant:-3],
-            [resetButton.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
-            [resetButton.widthAnchor constraintEqualToConstant:18],
-            [resetButton.heightAnchor constraintEqualToConstant:18],
         ]];
         if (doctorView) {
             [NSLayoutConstraint activateConstraints:@[
@@ -2736,7 +2726,7 @@ static UIView *gd_make_mods_entry_row(ModAssetLibraryEntry *entry, id target, SE
             ]];
         }
     } else if (doctorView) {
-        // No reset/delete this pass (row collapsed) - the doctor slot is
+        // No delete this pass (row collapsed) - the doctor slot is
         // simply the row's own trailing-most control.
         [NSLayoutConstraint activateConstraints:@[
             [doctorView.trailingAnchor constraintEqualToAnchor:row.trailingAnchor],
@@ -3061,6 +3051,7 @@ static UIView *gd_make_title_block(void) {
 // path - that's still a later checklist step.
 @property (nonatomic, strong) UITextField *authRepoLinkField;
 @property (nonatomic, strong) UITextField *authTokenField;
+@property (nonatomic, strong) UIButton *authVerifyButton; // "Verify" - see -gd_authVerifyTapped:
 
 // Load Mods is a single button that routes each picked file to its own
 // pipeline by kind (see -gd_handleLoadModsPickedURLs:intoFolder:): a
@@ -3940,23 +3931,37 @@ static const CGFloat kContentFadeHeight = 22;
     // with AssetsTools.NET and hands the doctored bundle back - see
     // BundleDoctorSettings.h/.m for the persistence side of this (JSON
     // file for repoOwner/repoName, Keychain for the token). Two stacked
-    // label-above-field rows, each using the exact same native Liquid
-    // Glass field surface as the Debug section's blacklist entry field
+    // rows, each using the exact same native Liquid Glass field surface
+    // as the Debug section's blacklist entry field
     // (gd_wrap_field_in_native_glass) via gd_make_labeled_glass_field_row
     // above, rather than gd_add_section_header's own full section-title
-    // sizing. Values are persisted via BundleDoctorSettings on blur (see
-    // -gd_persistAuthFields) and pre-filled from it below; the actual
-    // send/intercept wiring is still a later checklist step.
+    // sizing - the per-field "GitHub Repository Link"/"Personal Access
+    // Token" labels that used to sit above each of these two fields have
+    // been dropped, so the placeholder text is now the only thing
+    // identifying each field. Values are persisted via BundleDoctorSettings
+    // on blur (see -gd_persistAuthFields) and pre-filled from it below;
+    // the actual send/intercept wiring is still a later checklist step.
     gd_add_section_header(self.stack, @"Auth");
 
-    GDRow *repoLinkRow = gd_make_labeled_glass_field_row(@"GitHub Repository Link", @"owner/repo", NO);
+    GDRow *repoLinkRow = gd_make_labeled_glass_field_row(@"owner/repo", NO, nil);
     self.authRepoLinkField = objc_getAssociatedObject(repoLinkRow, "gd_textfield");
     self.authRepoLinkField.keyboardType = UIKeyboardTypeURL;
     self.authRepoLinkField.delegate = self;
     [self.stack addArrangedSubview:repoLinkRow];
     [self.stack setCustomSpacing:8 afterView:repoLinkRow];
 
-    GDRow *authTokenRow = gd_make_labeled_glass_field_row(@"Personal Access Token", @"ghp_xxxxxxxxxxxxxxxxxxxx", YES);
+    // PAT field is narrowed to make room for a "Verify" button
+    // alongside it (see -gd_authVerifyTapped:) - a quick round-trip to
+    // the GitHub API to confirm the repo link + token actually
+    // authenticate, without having to load/dispatch a mod bundle just
+    // to find out a stale token is the problem.
+    self.authVerifyButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.authVerifyButton.translatesAutoresizingMaskIntoConstraints = NO;
+    gd_style_button_as_native_glass(self.authVerifyButton, @"Verify", gd_accent_green_color());
+    self.authVerifyButton.titleLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightSemibold];
+    [self.authVerifyButton addTarget:self action:@selector(gd_authVerifyTapped:) forControlEvents:UIControlEventTouchUpInside];
+
+    GDRow *authTokenRow = gd_make_labeled_glass_field_row(@"ghp_xxxxxxxxxxxxxxxxxxxx", YES, self.authVerifyButton);
     self.authTokenField = objc_getAssociatedObject(authTokenRow, "gd_textfield");
     self.authTokenField.delegate = self;
     [self.stack addArrangedSubview:authTokenRow];
@@ -5039,7 +5044,7 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
     [self gd_recoverStaleDoctorStateForThisLaunch];
 
     for (UIView *view in self.modsLibraryStack.arrangedSubviews) {
-        // A row's delete/reset button's real-glass capsule (see
+        // A row's delete button's real-glass capsule (see
         // gd_attach_hold_to_confirm) lives in the shared
         // sliderGlassContent compositor, NOT as a subview of this row -
         // so tearing the row down here doesn't take it with it. Without
@@ -5104,20 +5109,16 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
 
         for (ModAssetLibraryEntry *entry in sortedEntries) {
             BOOL entryExpanded = [self.modsLibraryExpandedInfoEntries containsObject:entry.path];
-            // Reset/Delete are gated to only exist while the dropdown
-            // is open (entryExpanded), so neither is reachable until
-            // you've actually looked at the file's info first, and the
-            // capsule has the row's own free trailing space to expand
-            // into instead of overlapping the dropdown's Path/Size/
-            // Added text. The doctor-pipeline dispatch/upload/process/
-            // download slot (bundle-kind rows only) is NOT gated the
-            // same way - it renders regardless of entryExpanded, since
-            // it's non-destructive and is meant to be the row's normal
-            // at-rest affordance - see gd_make_mods_entry_row's own
-            // header comment.
+            // Delete is gated to only exist while the dropdown is open
+            // (entryExpanded), so it isn't reachable until you've
+            // actually looked at the file's info first. The doctor-
+            // pipeline dispatch/upload/process/download slot (bundle-
+            // kind rows only) is NOT gated the same way - it renders
+            // regardless of entryExpanded, since it's non-destructive
+            // and is meant to be the row's normal at-rest affordance -
+            // see gd_make_mods_entry_row's own header comment.
             UIView *entryRow = gd_make_mods_entry_row(entry, self,
                 @selector(gd_modsLibraryEntryInfoTapped:),
-                @selector(gd_modsLibraryEntryResetTapped:),
                 @selector(gd_modsLibraryEntryDispatchTapped:),
                 @selector(gd_modsLibraryEntryDownloadTapped:),
                 @selector(gd_modsLibraryEntryRetryTapped:),
@@ -5206,16 +5207,6 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
         [self.modsLibraryExpandedInfoEntries addObject:entry.path];
     }
     [self gd_rebuildModsLibrary];
-}
-
-// Wired to an entry row's Reset button (only present once that row's
-// info dropdown is open). There's no per-entry restore target anymore
-// now that CAB-based bundle matching is gone (see ModAssetLibrary.h) -
-// this just runs the panel's existing all-file -restoreOriginalsTapped,
-// same as every backed-up .bank would get from the Mods section's own
-// "Restore Originals" button.
-- (void)gd_modsLibraryEntryResetTapped:(UIButton *)sender {
-    [self restoreOriginalsTapped];
 }
 
 // --- Doctor-pipeline download handler (Section 3, second half) ---
@@ -6215,6 +6206,47 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
     if (![BundleDoctorSettings saveConfig:config error:&error]) {
         ZLog(@"[GraphicsDebugOverlay] Auth: failed to save BundleDoctor config: %@", error);
     }
+}
+
+// Wired to the PAT field's "Verify" button (see -buildPanel:'s Auth
+// section above). Persists whatever's currently in the fields first
+// (same as a blur would) so this always checks exactly what's actually
+// saved, then asks BundleDoctorService to confirm the repo link + token
+// authenticate against the GitHub API - see
+// +[BundleDoctorService verifyCredentialsForConfig:completion:]. Button
+// is disabled and relabeled for the duration of the check so a second
+// tap can't stack a duplicate request on top of the first.
+- (void)gd_authVerifyTapped:(UIButton *)sender {
+    [self gd_persistAuthFields];
+
+    BundleDoctorConfig *config = [BundleDoctorSettings loadConfig];
+    if (config.repoOwner.length == 0 || config.repoName.length == 0 || config.authToken.length == 0) {
+        [self gd_presentModsAlertWithTitle:@"Auth Not Configured"
+                                    message:@"Set a GitHub Repository Link and Personal Access Token above first."];
+        return;
+    }
+
+    sender.enabled = NO;
+    gd_style_button_as_native_glass(sender, @"Verifying\u2026", gd_accent_green_color());
+    sender.titleLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightSemibold];
+
+    __weak typeof(self) weakSelf = self;
+    [BundleDoctorService verifyCredentialsForConfig:config completion:^(BOOL valid, NSError *verifyError) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+
+        sender.enabled = YES;
+        gd_style_button_as_native_glass(sender, @"Verify", gd_accent_green_color());
+        sender.titleLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightSemibold];
+
+        if (valid) {
+            [strongSelf gd_presentModsAlertWithTitle:@"Credentials Verified"
+                                              message:@"The GitHub Repository Link and Personal Access Token are valid."];
+        } else {
+            [strongSelf gd_presentModsAlertWithTitle:@"Verification Failed"
+                                              message:verifyError.localizedDescription ?: @"Couldn't verify the repository link and token."];
+        }
+    }];
 }
 
 // Tracks the keyboard's current frame (window coordinates) at all times

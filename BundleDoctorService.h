@@ -298,6 +298,21 @@ typedef NS_ENUM(NSInteger, BundleDoctorRunStatus) {
                                 config:(BundleDoctorConfig *)config
                             completion:(void (^)(NSURL * _Nullable doctoredBundleURL, NSError * _Nullable error))completion;
 
+#pragma mark - Credential check
+
+// Confirms config.repoOwner/repoName/authToken actually authenticate
+// against the GitHub API and can see the target repo - a single
+// `GET /repos/{owner}/{repo}` call, not a dry run of any of the four
+// phases above. `valid` is YES only on a 2xx response; a bad/expired
+// token, a token that can't see the repo, or a repo that doesn't exist
+// all come back as `valid == NO` with `error` describing why (same
+// BundleDoctorServiceErrorAPIError/BundleDoctorServiceHTTPStatusKey
+// shape every other GET in this class already surfaces - see
+// +bds_getJSON:config:error: in the .m). Wired to the Auth section's
+// "Verify" button in GraphicsDebugOverlay.m.
++ (void)verifyCredentialsForConfig:(BundleDoctorConfig *)config
+                          completion:(void (^)(BOOL valid, NSError * _Nullable error))completion;
+
 @end
 
 NS_ASSUME_NONNULL_END

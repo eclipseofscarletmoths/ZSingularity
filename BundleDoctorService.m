@@ -495,6 +495,33 @@ didReceiveResponse:(NSURLResponse *)response
     });
 }
 
+#pragma mark - Credential check
+
++ (void)verifyCredentialsForConfig:(BundleDoctorConfig *)rawConfig
+                          completion:(void (^)(BOOL, NSError * _Nullable))completion {
+    void (^finish)(BOOL, NSError * _Nullable) = ^(BOOL valid, NSError * _Nullable error) {
+        dispatch_async(dispatch_get_main_queue(), ^{ completion(valid, error); });
+    };
+
+    BundleDoctorConfig *config = [rawConfig normalizedConfig];
+    if (config.repoOwner.length == 0 || config.repoName.length == 0 || config.authToken.length == 0) {
+        finish(NO, [self bds_errorWithCode:BundleDoctorServiceErrorInvalidConfig
+                                description:@"Set a GitHub repository link and Personal Access Token under Mods \u2192 Auth first."]);
+        return;
+    }
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        // Cheapest call that touches both the token (auth) and the repo
+        // (owner/name + the token's visibility into it) at once - the
+        // same repo-fetch every other phase above implicitly relies on
+        // being reachable before it ever gets to a release/workflow.
+        NSString *path = [NSString stringWithFormat:@"/repos/%@/%@", config.repoOwner, config.repoName];
+        NSError *error = nil;
+        id repo = [self bds_getJSON:path config:config error:&error];
+        finish(repo != nil, error);
+    });
+}
+
 #pragma mark - Git Data API steps
 
 + (BOOL)bds_resolveBaseCommitSHA:(NSString **)outCommitSHA
