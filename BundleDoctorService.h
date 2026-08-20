@@ -28,8 +28,13 @@
 //   3. Creates a GitHub Release tagged with that same scratch-branch
 //      string (repos/.../releases, non-draft so the tag actually gets
 //      cut - see BDS_INPUT_ASSET_NAME in the .m) and uploads the
-//      modded bundle's raw bytes to it as a binary release asset named
+//      modded bundle's bytes to it as a binary release asset named
 //      BDS_INPUT_ASSET_NAME (repos/.../releases/{id}/assets on
+//      uploads.github.com). Before that POST, an uncompressed or LZ4 UnityFS
+//      bundle is transport-recompressed as LZ4HC to reduce bandwidth; an
+//      already-LZ4HC bundle is uploaded unchanged. The workflow therefore
+//      always receives a valid UnityFS archive, just with a more compact
+//      transport representation when applicable.
 //      uploads.github.com, Content-Type: application/octet-stream).
 //      This used to go through the git Blob API instead (git/blobs,
 //      base64-encoded, committed into a tree/commit on the scratch

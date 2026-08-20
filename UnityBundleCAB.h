@@ -123,6 +123,18 @@ typedef NS_ENUM(NSInteger, UnityBundleCABErrorCode) {
 
 @interface UnityBundleCAB : NSObject
 
+// Returns the UnityFS archive-wide compression type from the header:
+// 0 = none, 2 = LZ4, 3 = LZ4HC. This only reads the small header and
+// does not decompress the bundle.
++ (uint8_t)compressionTypeForBundleAtPath:(NSString *)path error:(NSError **)error;
+
+// Rewrites a supported UnityFS bundle as a transport-optimized LZ4HC
+// archive. The payload is unchanged logically; only UnityFS block
+// framing/compression is changed. The returned NSData is ready to upload
+// as a release asset. LZMA/LZHAM input is rejected because this project
+// does not contain an on-device decoder for those formats.
++ (nullable NSData *)LZ4HCDataForBundleAtPath:(NSString *)path error:(NSError **)error;
+
 // Like +allNodePathsForBundleAtPath:error:, but decompresses every data
 // block (not just blocks-info) and hands back the whole thing as one
 // contiguous, memory-mapped `.data` plus each node's offset/size into
@@ -137,14 +149,11 @@ typedef NS_ENUM(NSInteger, UnityBundleCABErrorCode) {
 // writes it atomically. Always writes uncompressed (compression type 0)
 // blocks-info stored inline (not at EOF) as a single block covering the
 // whole of `archive.data` - this is deliberately the simplest valid
-// shape this format allows, not a byte-for-byte reproduction of
-// whatever compression/block-count the original had. Confirmed
-// on-device (see PatchManifestNetwork's own manifest-patching, and the
-// uncompressed-bundle test that preceded this file) that the mobile
-// client's UnityFS loader accepts fully uncompressed archives without
-// issue, so there's no reason to reimplement an LZ4 *encoder* (only
-// LZ4BlockDecoder.h's decoder exists in this project) just to preserve
-// the original's compression.
+// uncompressed shape this format allows, not a byte-for-byte reproduction
+// of whatever compression/block-count the original had. The upload path
+// has a separate LZ4HC transport writer below; this method remains the
+// existing uncompressed writer used by callers that explicitly need that
+// representation.
 + (BOOL)writeArchive:(UnityBundleArchive *)archive toPath:(NSString *)path error:(NSError **)error;
 
 // Same on-disk result as +writeArchive:toPath:error:, but for a caller

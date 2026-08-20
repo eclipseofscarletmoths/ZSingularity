@@ -1,5 +1,6 @@
 #import "BundleDoctorService.h"
 #import "ZTweakLog.h"
+#import "UnityBundleCAB.h"
 
 NSString * const BundleDoctorServiceErrorDomain = @"BundleDoctorServiceErrorDomain";
 NSString * const BundleDoctorServiceHTTPStatusKey = @"BundleDoctorServiceHTTPStatusKey";
@@ -27,6 +28,69 @@ static const NSTimeInterval kBDSRunDiscoveryTimeout = 30.0;   // waiting for the
 static const NSTimeInterval kBDSRunDiscoveryPollInterval = 2.0;
 static const NSTimeInterval kBDSRunCompletionTimeout = 600.0; // waiting for the run itself to finish - AssetsTools.NET re-encoding can be slow on a big bundle
 static const NSTimeInterval kBDSRunCompletionPollInterval = 5.0;
+
+static NSString *bds_compressionLabel(uint8_t type) {
+    switch (type) {
+        case 0: return @"none";
+        case 1: return @"LZMA";
+        case 2: return @"LZ4";
+        case 3: return @"LZ4HC";
+        case 4: return @"LZHAM";
+        default: return [NSString stringWithFormat:@"type-%u", type];
+    }
+}
+
+// Transport optimization only: GitHub sees a smaller release asset, while
+// the workflow still receives a completely normal UnityFS bundle. Bundles
+// already using LZ4HC are left byte-for-byte untouched; LZMA/LZHAM and other
+// unsupported formats are also left alone rather than risking a conversion
+// that this on-device parser cannot faithfully reproduce.
+static NSData *bds_prepareBundleDataForUpload(NSData *data, NSError **error) {
+    if (data.length == 0) return data;
+
+    NSString *tmpName = [NSString stringWithFormat:@"bds-upload-%@.bundle", NSUUID.UUID.UUIDString];
+    NSString *tmpPath = [NSTemporaryDirectory() stringByAppendingPathComponent:tmpName];
+    NSURL *tmpURL = [NSURL fileURLWithPath:tmpPath];
+
+    NSError *writeError = nil;
+    if (![data writeToURL:tmpURL options:NSDataWritingAtomic error:&writeError]) {
+        if (error) *error = writeError;
+        return nil;
+    }
+
+    NSError *compressionError = nil;
+    uint8_t type = [UnityBundleCAB compressionTypeForBundleAtPath:tmpPath error:&compressionError];
+    if (compressionError) {
+        [NSFileManager.defaultManager removeItemAtPath:tmpPath error:nil];
+        if (error) *error = compressionError;
+        return nil;
+    }
+
+    if (type != 0 && type != 2) {
+        ZLog(@"[BundleDoctorService] upload compression: leaving %@ bundle unchanged (%lu bytes)",
+             bds_compressionLabel(type), (unsigned long)data.length);
+        [NSFileManager.defaultManager removeItemAtPath:tmpPath error:nil];
+        return data;
+    }
+
+    ZLog(@"[BundleDoctorService] upload compression: source is %@ (%lu bytes), recompressing as LZ4HC…",
+         bds_compressionLabel(type), (unsigned long)data.length);
+
+    NSData *compressed = [UnityBundleCAB LZ4HCDataForBundleAtPath:tmpPath error:&compressionError];
+    [NSFileManager.defaultManager removeItemAtPath:tmpPath error:nil];
+    if (!compressed) {
+        if (error) *error = compressionError ?: [NSError errorWithDomain:BundleDoctorServiceErrorDomain
+                                                                       code:BundleDoctorServiceErrorRequestFailed
+                                                                   userInfo:@{NSLocalizedDescriptionKey: @"Couldn't recompress the bundle as LZ4HC for upload."}];
+        return nil;
+    }
+
+    ZLog(@"[BundleDoctorService] upload compression: %lu -> %lu bytes (%.1f%% of original)",
+         (unsigned long)data.length,
+         (unsigned long)compressed.length,
+         data.length ? (100.0 * (double)compressed.length / (double)data.length) : 0.0);
+    return compressed;
+}
 
 #pragma mark - BundleDoctorConfig
 
@@ -165,6 +229,13 @@ totalBytesExpectedToSend:(int64_t)totalBytesExpectedToSend {
             return;
         }
 
+        NSData *uploadData = bds_prepareBundleDataForUpload(moddedData, &error);
+        if (!uploadData) {
+            finish(nil, [self bds_errorWithCode:BundleDoctorServiceErrorRequestFailed
+                                     description:error.localizedDescription ?: @"Couldn't prepare the bundle for upload."]);
+            return;
+        }
+
         NSString *scratchBranch = [NSString stringWithFormat:@"bundle-doctor/%@", [NSUUID UUID].UUIDString];
         ZLog(@"[BundleDoctorService] starting run on %@/%@, scratch branch %@",
               config.repoOwner, config.repoName, scratchBranch);
@@ -191,7 +262,7 @@ totalBytesExpectedToSend:(int64_t)totalBytesExpectedToSend {
         }
 
         report(@"Uploading modded bundle\u2026");
-        if (![self bds_uploadReleaseAssetData:moddedData name:kBDSInputAssetName
+        if (![self bds_uploadReleaseAssetData:uploadData name:kBDSInputAssetName
                              uploadURLTemplate:uploadURLTemplate progress:nil
                                         config:config error:&error]) {
             [self bds_cleanupScratchSubmission:scratchBranch config:config];
@@ -284,6 +355,13 @@ totalBytesExpectedToSend:(int64_t)totalBytesExpectedToSend {
             return;
         }
 
+        NSData *uploadData = bds_prepareBundleDataForUpload(moddedData, &error);
+        if (!uploadData) {
+            finish(nil, [self bds_errorWithCode:BundleDoctorServiceErrorRequestFailed
+                                     description:error.localizedDescription ?: @"Couldn't prepare the bundle for upload."]);
+            return;
+        }
+
         NSString *scratchBranch = [NSString stringWithFormat:@"bundle-doctor/%@", [NSUUID UUID].UUIDString];
         ZLog(@"[BundleDoctorService] dispatching %@/%@, scratch branch %@",
               config.repoOwner, config.repoName, scratchBranch);
@@ -307,7 +385,7 @@ totalBytesExpectedToSend:(int64_t)totalBytesExpectedToSend {
             return;
         }
 
-        if (![self bds_uploadReleaseAssetData:moddedData name:kBDSInputAssetName
+        if (![self bds_uploadReleaseAssetData:uploadData name:kBDSInputAssetName
                              uploadURLTemplate:uploadURLTemplate progress:reportProgress
                                         config:config error:&error]) {
             [self bds_cleanupScratchSubmission:scratchBranch config:config];

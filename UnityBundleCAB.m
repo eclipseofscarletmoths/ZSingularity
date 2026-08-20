@@ -12,6 +12,8 @@
 #import "LZ4BlockDecoder.h"
 #import "ZTweakLog.h"
 #include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
 #include <objc/runtime.h>
 
 NSString * const UnityBundleCABErrorDomain = @"UnityBundleCABErrorDomain";
@@ -509,6 +511,169 @@ static void ubc_append_cstring(NSMutableData *d, NSString *s) {
     [d appendBytes:&nul length:1];
 }
 
+static uint32_t ubc_lz4_hash4(const uint8_t *p) {
+    uint32_t v;
+    memcpy(&v, p, sizeof(v));
+    return (v * 2654435761u) >> (32 - 20); // 1,048,576-entry table
+}
+
+static void ubc_lz4_emit_length(NSMutableData *out, size_t length) {
+    while (length >= 255) {
+        uint8_t v = 255;
+        [out appendBytes:&v length:1];
+        length -= 255;
+    }
+    uint8_t v = (uint8_t)length;
+    [out appendBytes:&v length:1];
+}
+
+// Produces a standard raw LZ4 block. UnityFS compression types 2 (LZ4) and
+// 3 (LZ4HC) use the same on-disk block bitstream; the archive flag records
+// which compressor family produced it. This encoder uses a large hash table
+// and greedy longest-match selection so the resulting block is substantially
+// better than literal-only/faster LZ4 encoding while keeping the injected
+// tweak free of a large third-party compressor dependency.
+static NSData *ubc_lz4hc_encode(NSData *input, NSError **error) {
+    const uint8_t *src = input.bytes;
+    size_t srcSize = input.length;
+    if (srcSize == 0) return [NSData data];
+    if (srcSize > UINT32_MAX) {
+        if (error) *error = [NSError errorWithDomain:UnityBundleCABErrorDomain
+                                                 code:UnityBundleCABErrorMalformedBlocksInfo
+                                             userInfo:@{NSLocalizedDescriptionKey: @"Bundle data exceeds UnityFS's 32-bit block-size limit."}];
+        return nil;
+    }
+
+    const uint32_t hashSize = 1u << 20;
+    uint32_t *hashTable = malloc((size_t)hashSize * sizeof(uint32_t));
+    if (!hashTable) {
+        if (error) *error = [NSError errorWithDomain:UnityBundleCABErrorDomain
+                                                 code:UnityBundleCABErrorCantReadFile
+                                             userInfo:@{NSLocalizedDescriptionKey: @"Couldn't allocate the LZ4HC hash table."}];
+        return nil;
+    }
+    for (uint32_t i = 0; i < hashSize; i++) hashTable[i] = UINT32_MAX;
+
+    NSMutableData *out = [NSMutableData dataWithCapacity:srcSize + srcSize / 255 + 16];
+    size_t literalStart = 0;
+    size_t i = 0;
+
+    while (i + 4 <= srcSize) {
+        uint32_t h = ubc_lz4_hash4(src + i);
+        uint32_t ref32 = hashTable[h];
+        hashTable[h] = (uint32_t)i;
+
+        if (ref32 != UINT32_MAX) {
+            size_t ref = ref32;
+            size_t distance = i - ref;
+            if (distance <= 65535 && memcmp(src + ref, src + i, 4) == 0) {
+                size_t matchLen = 4;
+                size_t maxMatch = srcSize - i;
+                while (matchLen < maxMatch && src[ref + matchLen] == src[i + matchLen]) matchLen++;
+
+                // Keep at least five literal bytes at the end of the block,
+                // matching the standard LZ4 end-of-block constraint used by
+                // Unity's decoder.
+                if (i + matchLen > srcSize - 5) {
+                    i++;
+                    continue;
+                }
+
+                size_t literalLen = i - literalStart;
+                uint8_t token = (uint8_t)(MIN(literalLen, (size_t)15) << 4);
+                token |= (uint8_t)MIN(matchLen - 4, (size_t)15);
+                [out appendBytes:&token length:1];
+
+                if (literalLen >= 15) ubc_lz4_emit_length(out, literalLen - 15);
+                if (literalLen) [out appendBytes:src + literalStart length:literalLen];
+
+                uint16_t offset = (uint16_t)distance;
+                uint8_t offBytes[2] = {(uint8_t)offset, (uint8_t)(offset >> 8)};
+                [out appendBytes:offBytes length:2];
+
+                if (matchLen - 4 >= 15) ubc_lz4_emit_length(out, matchLen - 4 - 15);
+
+                size_t matchEnd = i + matchLen;
+                // Seed only a small prefix of the consumed match. Seeding the
+                // entire match is needlessly expensive for highly repetitive
+                // blocks (e.g. large zeroed texture regions).
+                size_t seedEnd = MIN(matchEnd - 3, i + 4096);
+                for (size_t p = i + 1; p < seedEnd; p++) {
+                    hashTable[ubc_lz4_hash4(src + p)] = (uint32_t)p;
+                }
+                i = matchEnd;
+                literalStart = i;
+                continue;
+            }
+        }
+        i++;
+    }
+
+    // Final literal-only sequence. The LZ4 format permits the block to end
+    // here without an offset/match pair.
+    size_t finalLiteralLen = srcSize - literalStart;
+    uint8_t finalToken = (uint8_t)(MIN(finalLiteralLen, (size_t)15) << 4);
+    [out appendBytes:&finalToken length:1];
+    if (finalLiteralLen >= 15) ubc_lz4_emit_length(out, finalLiteralLen - 15);
+    if (finalLiteralLen) [out appendBytes:src + literalStart length:finalLiteralLen];
+
+    free(hashTable);
+    return out;
+}
+
+static BOOL ubc_write_lz4hc_archive(UnityBundleArchive *archive, NSData *compressedData,
+                                     NSData **outData, NSError **error) {
+    if (archive.data.length > UINT32_MAX || compressedData.length > UINT32_MAX ||
+        archive.nodes.count > UINT32_MAX) {
+        if (error) *error = [NSError errorWithDomain:UnityBundleCABErrorDomain
+                                                 code:UnityBundleCABErrorMalformedBlocksInfo
+                                             userInfo:@{NSLocalizedDescriptionKey: @"Bundle is too large for UnityFS's 32-bit size fields."}];
+        return NO;
+    }
+
+    NSMutableData *blocksInfo = [NSMutableData data];
+    uint8_t zeroHash[16] = {0};
+    [blocksInfo appendBytes:zeroHash length:16];
+    ubc_append_u32_be(blocksInfo, 1);
+    ubc_append_u32_be(blocksInfo, (uint32_t)archive.data.length);
+    ubc_append_u32_be(blocksInfo, (uint32_t)compressedData.length);
+    ubc_append_u16_be(blocksInfo, 3); // LZ4HC
+    ubc_append_u32_be(blocksInfo, (uint32_t)archive.nodes.count);
+    for (UnityBundleNode *node in archive.nodes) {
+        ubc_append_i64_be(blocksInfo, node.offset);
+        ubc_append_i64_be(blocksInfo, node.size);
+        ubc_append_u32_be(blocksInfo, node.flags);
+        ubc_append_cstring(blocksInfo, node.path);
+    }
+
+    NSData *finalCompressedBlocksInfo = ubc_lz4hc_encode(blocksInfo, error);
+    if (!finalCompressedBlocksInfo) return NO;
+
+    NSMutableData *out = [NSMutableData dataWithCapacity:64 + finalCompressedBlocksInfo.length + compressedData.length];
+    [out appendData:[@"UnityFS\0" dataUsingEncoding:NSUTF8StringEncoding]];
+    ubc_append_u32_be(out, 8);
+    ubc_append_cstring(out, archive.unityVersion ?: @"5.x.x");
+    ubc_append_cstring(out, archive.unityRevision ?: @"0.0.0");
+    NSUInteger archiveSizeOffset = out.length;
+    ubc_append_i64_be(out, 0);
+    ubc_append_u32_be(out, (uint32_t)finalCompressedBlocksInfo.length);
+    ubc_append_u32_be(out, (uint32_t)blocksInfo.length);
+    ubc_append_u32_be(out, 0x40 | 3); // combined + LZ4HC
+
+    while (out.length % 16 != 0) { uint8_t z = 0; [out appendBytes:&z length:1]; }
+    [out appendData:finalCompressedBlocksInfo];
+    while (out.length % 16 != 0) { uint8_t z = 0; [out appendBytes:&z length:1]; }
+    [out appendData:compressedData];
+
+    uint64_t archiveSize = out.length;
+    uint8_t sizeBytes[8];
+    for (int j = 0; j < 8; j++) sizeBytes[j] = (uint8_t)(archiveSize >> (8 * (7 - j)));
+    [out replaceBytesInRange:NSMakeRange(archiveSizeOffset, 8) withBytes:sizeBytes];
+
+    if (outData) *outData = out;
+    return YES;
+}
+
 #pragma mark - Public API
 
 @implementation UnityBundleNode
@@ -518,6 +683,37 @@ static void ubc_append_cstring(NSMutableData *d, NSString *s) {
 @end
 
 @implementation UnityBundleCAB
+
++ (uint8_t)compressionTypeForBundleAtPath:(NSString *)path error:(NSError **)error {
+    NSData *fileData = [NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:error];
+    if (!fileData) return UINT8_MAX;
+    UBCCursor c = { .base = fileData.bytes, .size = fileData.length, .pos = 0 };
+    UBCHeader header;
+    if (!ubc_parse_header(&c, &header, NULL, NULL, error)) return UINT8_MAX;
+    return header.compressionType;
+}
+
++ (nullable NSData *)LZ4HCDataForBundleAtPath:(NSString *)path error:(NSError **)error {
+    NSError *localError = nil;
+    UnityBundleArchive *archive = [self decompressedArchiveAtPath:path error:&localError];
+    if (!archive) {
+        if (error) *error = localError;
+        return nil;
+    }
+
+    NSData *compressedData = ubc_lz4hc_encode(archive.data, &localError);
+    if (!compressedData) {
+        if (error) *error = localError;
+        return nil;
+    }
+
+    NSData *out = nil;
+    if (!ubc_write_lz4hc_archive(archive, compressedData, &out, &localError)) {
+        if (error) *error = localError;
+        return nil;
+    }
+    return out;
+}
 
 + (nullable NSString *)primaryCABForBundleAtPath:(NSString *)path error:(NSError **)error {
     NSArray<NSString *> *paths = ubc_all_node_paths(path, error);
