@@ -27,6 +27,42 @@ jobs:
         id: sdk
         run: echo "path=$(xcrun --sdk iphoneos --show-sdk-path)" >> "$GITHUB_OUTPUT"
 
+      # Pulled at build time rather than committed, so the exact upstream
+      # bytes are always what actually got fetched from lz4/lz4 - not a
+      # manually-copied transcription that could silently drift from it.
+      # Pinned to a specific commit (not a moving branch/tag) for
+      # reproducible builds; the checksums pin the CONTENT at that commit,
+      # since a force-push could otherwise change what the pin resolves to
+      # without this failing. Only lz4hc.c goes into the compile step below
+      # - it #includes lz4.c itself for lz4's internal match-finding
+      # helpers, so compiling lz4.c as its own translation unit too would
+      # duplicate every symbol it defines. lz4.h/lz4.c still need to be
+      # present on disk (lz4hc.c's #include resolves against this
+      # directory), just not passed to clang directly.
+      #
+      # LZ4_REF is a commit hash, not "dev"/"master" - update deliberately,
+      # and update the checksums below in the same commit when you do.
+      - name: Fetch LZ4 reference library
+        run: |
+          set -euo pipefail
+          LZ4_REF=b4f544bf80583e749557efd76afda56317b6252d
+          BASE="https://raw.githubusercontent.com/lz4/lz4/${LZ4_REF}/lib"
+          for f in lz4.h lz4.c lz4hc.h lz4hc.c; do
+            curl -fsSL "${BASE}/${f}" -o "$f"
+          done
+          # TODO: replace with the real sha256 for each file at LZ4_REF
+          # (compute once via `shasum -a 256 lz4.h lz4.c lz4hc.h lz4hc.c`
+          # against a fetch you've verified by hand) before relying on this
+          # in CI - as committed, this only proves the four files exist,
+          # not that a compromised/redirected fetch didn't tamper with them.
+          cat <<'EOF' > lz4-checksums.txt
+          REPLACE_WITH_REAL_SHA256  lz4.h
+          REPLACE_WITH_REAL_SHA256  lz4.c
+          REPLACE_WITH_REAL_SHA256  lz4hc.h
+          REPLACE_WITH_REAL_SHA256  lz4hc.c
+          EOF
+          shasum -a 256 -c lz4-checksums.txt
+
       # libogg/libvorbis are not vendored or linked - the mobile client
       # already plays Vorbis-coded FSB5 samples natively, so
       # BankTransplant.m is a direct file copy, no codec linkage
@@ -110,6 +146,7 @@ jobs:
             BundleDoctorInstaller.m \
             ModAssetLibrary.m \
             LZ4BlockDecoder.m \
+            lz4hc.c \
             UnityBundleCAB.m \
             UnityCacheLocator.m \
             -o ZSingularity.dylib

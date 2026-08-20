@@ -16,6 +16,14 @@
 #include <string.h>
 #include <objc/runtime.h>
 
+// lz4hc.h is vendored at build time (see build.yml's "Fetch LZ4 reference
+// library" step) rather than committed to this repo, so it isn't present
+// for local/IDE indexing - only for the actual CI compile. It transitively
+// declares everything lz4.h does too. Only the encode side below uses it;
+// LZ4BlockDecoder.m's hand-rolled decoder is deliberately left as-is (see
+// that file's own header comment) since nothing has asked for it to change.
+#import "lz4hc.h"
+
 NSString * const UnityBundleCABErrorDomain = @"UnityBundleCABErrorDomain";
 
 #pragma mark - Bounds-checked cursor over an in-memory buffer
@@ -511,113 +519,50 @@ static void ubc_append_cstring(NSMutableData *d, NSString *s) {
     [d appendBytes:&nul length:1];
 }
 
-static uint32_t ubc_lz4_hash4(const uint8_t *p) {
-    uint32_t v;
-    memcpy(&v, p, sizeof(v));
-    return (v * 2654435761u) >> (32 - 20); // 1,048,576-entry table
-}
-
-static void ubc_lz4_emit_length(NSMutableData *out, size_t length) {
-    while (length >= 255) {
-        uint8_t v = 255;
-        [out appendBytes:&v length:1];
-        length -= 255;
-    }
-    uint8_t v = (uint8_t)length;
-    [out appendBytes:&v length:1];
-}
-
-// Produces a standard raw LZ4 block. UnityFS compression types 2 (LZ4) and
-// 3 (LZ4HC) use the same on-disk block bitstream; the archive flag records
-// which compressor family produced it. This encoder uses a large hash table
-// and greedy longest-match selection so the resulting block is substantially
-// better than literal-only/faster LZ4 encoding while keeping the injected
-// tweak free of a large third-party compressor dependency.
+// Produces a standard raw LZ4 block via the real reference encoder
+// (LZ4_compress_HC, from the vendored-at-build-time lz4hc.c - see
+// build.yml's "Fetch LZ4 reference library" step and this file's #import
+// above) rather than a hand-rolled matcher. UnityFS compression types 2
+// (LZ4) and 3 (LZ4HC) use the same on-disk block bitstream; the archive
+// flag records which compressor family produced it, which is why this
+// still slots into the exact same "type 3" framing in
+// ubc_write_lz4hc_archive below.
+//
+// This replaces a from-scratch greedy matcher that got the two-part
+// end-of-block safety rule half right (5-byte literal tail, but not the
+// 12-byte last-match-start margin real wildcopy()-based decoders rely on
+// - see this function's git history for the bug that caused). The
+// reference encoder has always implemented both correctly, so this isn't
+// swapping one implementation for an equally-fallible one; it's retiring
+// a redundant reimplementation of something already solved upstream.
 static NSData *ubc_lz4hc_encode(NSData *input, NSError **error) {
-    const uint8_t *src = input.bytes;
-    size_t srcSize = input.length;
+    int srcSize = (int)input.length;
     if (srcSize == 0) return [NSData data];
-    if (srcSize > UINT32_MAX) {
+    if ((NSUInteger)srcSize != input.length) { // truncated by the (int) cast above
         if (error) *error = [NSError errorWithDomain:UnityBundleCABErrorDomain
                                                  code:UnityBundleCABErrorMalformedBlocksInfo
                                              userInfo:@{NSLocalizedDescriptionKey: @"Bundle data exceeds UnityFS's 32-bit block-size limit."}];
         return nil;
     }
 
-    const uint32_t hashSize = 1u << 20;
-    uint32_t *hashTable = malloc((size_t)hashSize * sizeof(uint32_t));
-    if (!hashTable) {
+    int bound = LZ4_compressBound(srcSize);
+    if (bound <= 0) {
         if (error) *error = [NSError errorWithDomain:UnityBundleCABErrorDomain
-                                                 code:UnityBundleCABErrorCantReadFile
-                                             userInfo:@{NSLocalizedDescriptionKey: @"Couldn't allocate the LZ4HC hash table."}];
+                                                 code:UnityBundleCABErrorMalformedBlocksInfo
+                                             userInfo:@{NSLocalizedDescriptionKey: @"Bundle data exceeds LZ4's supported input size."}];
         return nil;
     }
-    for (uint32_t i = 0; i < hashSize; i++) hashTable[i] = UINT32_MAX;
 
-    NSMutableData *out = [NSMutableData dataWithCapacity:srcSize + srcSize / 255 + 16];
-    size_t literalStart = 0;
-    size_t i = 0;
-
-    while (i + 4 <= srcSize) {
-        uint32_t h = ubc_lz4_hash4(src + i);
-        uint32_t ref32 = hashTable[h];
-        hashTable[h] = (uint32_t)i;
-
-        if (ref32 != UINT32_MAX) {
-            size_t ref = ref32;
-            size_t distance = i - ref;
-            if (distance <= 65535 && memcmp(src + ref, src + i, 4) == 0) {
-                size_t matchLen = 4;
-                size_t maxMatch = srcSize - i;
-                while (matchLen < maxMatch && src[ref + matchLen] == src[i + matchLen]) matchLen++;
-
-                // Keep at least five literal bytes at the end of the block,
-                // matching the standard LZ4 end-of-block constraint used by
-                // Unity's decoder.
-                if (i + matchLen > srcSize - 5) {
-                    i++;
-                    continue;
-                }
-
-                size_t literalLen = i - literalStart;
-                uint8_t token = (uint8_t)(MIN(literalLen, (size_t)15) << 4);
-                token |= (uint8_t)MIN(matchLen - 4, (size_t)15);
-                [out appendBytes:&token length:1];
-
-                if (literalLen >= 15) ubc_lz4_emit_length(out, literalLen - 15);
-                if (literalLen) [out appendBytes:src + literalStart length:literalLen];
-
-                uint16_t offset = (uint16_t)distance;
-                uint8_t offBytes[2] = {(uint8_t)offset, (uint8_t)(offset >> 8)};
-                [out appendBytes:offBytes length:2];
-
-                if (matchLen - 4 >= 15) ubc_lz4_emit_length(out, matchLen - 4 - 15);
-
-                size_t matchEnd = i + matchLen;
-                // Seed only a small prefix of the consumed match. Seeding the
-                // entire match is needlessly expensive for highly repetitive
-                // blocks (e.g. large zeroed texture regions).
-                size_t seedEnd = MIN(matchEnd - 3, i + 4096);
-                for (size_t p = i + 1; p < seedEnd; p++) {
-                    hashTable[ubc_lz4_hash4(src + p)] = (uint32_t)p;
-                }
-                i = matchEnd;
-                literalStart = i;
-                continue;
-            }
-        }
-        i++;
+    NSMutableData *out = [NSMutableData dataWithLength:(NSUInteger)bound];
+    int written = LZ4_compress_HC((const char *)input.bytes, (char *)out.mutableBytes,
+                                   srcSize, bound, LZ4HC_CLEVEL_DEFAULT);
+    if (written <= 0) {
+        if (error) *error = [NSError errorWithDomain:UnityBundleCABErrorDomain
+                                                 code:UnityBundleCABErrorCantReadFile
+                                             userInfo:@{NSLocalizedDescriptionKey: @"LZ4HC compression failed."}];
+        return nil;
     }
-
-    // Final literal-only sequence. The LZ4 format permits the block to end
-    // here without an offset/match pair.
-    size_t finalLiteralLen = srcSize - literalStart;
-    uint8_t finalToken = (uint8_t)(MIN(finalLiteralLen, (size_t)15) << 4);
-    [out appendBytes:&finalToken length:1];
-    if (finalLiteralLen >= 15) ubc_lz4_emit_length(out, finalLiteralLen - 15);
-    if (finalLiteralLen) [out appendBytes:src + literalStart length:finalLiteralLen];
-
-    free(hashTable);
+    out.length = (NSUInteger)written;
     return out;
 }
 
