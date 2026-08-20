@@ -17,53 +17,71 @@
 // arbitrary binary payload (a Unity bundle can be tens of MB) to a
 // dispatch call directly. So this class doesn't try to; instead it:
 //
-//   1. Reads the base commit for `config.ref` (git/ref) and its tree
-//      (git/commits/{sha}).
-//   2. Uploads the modded bundle's raw bytes as a git blob
-//      (git/blobs, base64-encoded).
-//   3. Builds a new tree on top of the base tree that adds/replaces
-//      exactly one path: BDS_INPUT_PATH (see the .m for the literal
-//      string) with that blob.
-//   4. Commits that tree (git/commits) and points a brand-new scratch
-//      branch at it (git/refs) - "bundle-doctor/<uuid>", never reused.
-//   5. Dispatches config.workflowFile on that scratch branch
+//   1. Reads the base commit for `config.ref` (git/ref).
+//   2. Points a brand-new scratch branch at that same commit (git/refs)
+//      - "bundle-doctor/<uuid>", never reused. No new tree/commit is
+//      built - the branch exists only to give this submission a unique
+//      `ref` to dispatch the workflow on and to filter the runs list
+//      by (see step 5), the same way it always has; it no longer
+//      carries the bundle's bytes itself (see step 3 for why that
+//      moved).
+//   3. Creates a GitHub Release tagged with that same scratch-branch
+//      string (repos/.../releases, non-draft so the tag actually gets
+//      cut - see BDS_INPUT_ASSET_NAME in the .m) and uploads the
+//      modded bundle's raw bytes to it as a binary release asset named
+//      BDS_INPUT_ASSET_NAME (repos/.../releases/{id}/assets on
+//      uploads.github.com, Content-Type: application/octet-stream).
+//      This used to go through the git Blob API instead (git/blobs,
+//      base64-encoded, committed into a tree/commit on the scratch
+//      branch) - that path both inflates the payload ~1.33x for
+//      base64 and runs into the Blob/Contents APIs' much lower
+//      practical size ceiling. Release assets are uploaded as raw
+//      bytes and support up to 2GB each, which is the actual
+//      constraint a modded desktop Unity bundle can threaten to hit.
+//   4. Dispatches config.workflowFile on that scratch branch
 //      (actions/workflows/{file}/dispatches), passing
-//      `{"output_format": config.outputFormat}` as the one input.
-//   6. Polls actions/workflows/{file}/runs?branch=<scratch>&event=
+//      `{"release_tag": <scratch branch string>, "output_format":
+//      config.outputFormat}` as inputs - the workflow downloads
+//      BDS_INPUT_ASSET_NAME off that release by tag (`gh release
+//      download`) rather than checking out a committed file.
+//   5. Polls actions/workflows/{file}/runs?branch=<scratch>&event=
 //      workflow_dispatch for the run this dispatch created (the
 //      dispatch endpoint itself returns no run id - this is a known
 //      GitHub API gap, not a bug here), then polls that run's own
 //      status until it reports "completed".
-//   7. On a successful run, reads the doctored bundle back out via
-//      the Contents API from BDS_OUTPUT_PATH (see .m) on that same
-//      scratch branch - i.e. the workflow is expected to COMMIT its
-//      output back onto the scratch branch at that fixed path, not
-//      upload it as a run artifact. (An artifact would need this
-//      class to parse a zip container on-device with no library for
-//      that on hand; a second git-committed file is one more Contents
-//      API GET with nothing new to implement.)
-//   8. Deletes the scratch branch (best-effort - a failure here is
-//      logged, not surfaced to the caller, since the doctored bundle
-//      has already been safely read out by that point).
+//   6. On a successful run, downloads the doctored bundle back out as
+//      the BDS_OUTPUT_ASSET_NAME asset on that same release (looked up
+//      by tag, repos/.../releases/tags/{tag}) - i.e. the workflow is
+//      expected to `gh release upload` its output back onto the same
+//      release under that fixed asset name, not hand it back as a run
+//      artifact. (An artifact would need this class to parse a zip
+//      container on-device with no library for that on hand; a second
+//      release asset is one more authenticated GET with nothing new to
+//      implement.)
+//   7. Deletes the release and its underlying tag ref, then the scratch
+//      branch (all best-effort - a failure here is logged, not
+//      surfaced to the caller, since the doctored bundle has already
+//      been safely read out by that point).
 //
-// BDS_INPUT_PATH/BDS_OUTPUT_PATH and the "output_format" input name
-// are a CONVENTION THIS CLASS ASSUMES THE WORKFLOW YAML FOLLOWS - they
-// are not discoverable from the GitHub API. If the actual doctor-bundle
-// workflow uses different paths/input names, update the #define's at
-// the top of the .m to match it (or vice versa) - the two have to
-// agree exactly, the same way PatchManifestNetwork.m's kTargetHostSuffix/
-// kTargetPathSuffix have to match whatever the game's CDN actually
-// serves.
+// BDS_INPUT_ASSET_NAME/BDS_OUTPUT_ASSET_NAME, the "release_tag" input
+// name, and the "output_format" input name are a CONVENTION THIS CLASS
+// ASSUMES THE WORKFLOW YAML FOLLOWS - they are not discoverable from
+// the GitHub API. If the actual doctor-bundle workflow uses different
+// asset/input names, update the #define's at the top of the .m to
+// match it (or vice versa) - the two have to agree exactly, the same
+// way PatchManifestNetwork.m's kTargetHostSuffix/kTargetPathSuffix have
+// to match whatever the game's CDN actually serves.
 //
 // AUTH: config.authToken is a GitHub Personal Access Token sent as
 // `Authorization: Bearer <token>` on every request below. It needs, at
-// minimum: repo contents read/write (steps 1-4, 7) and `actions:write`
-// (step 5) / `actions:read` (step 6) on the target repo - i.e. a
-// fine-grained PAT scoped to just that repo with Contents (read/write)
-// and Actions (read/write) permissions, or a classic PAT with the
-// `repo` and `workflow` scopes. See BundleDoctorSettings.h for where
-// this token is actually stored (Keychain) and that file's own caveat
-// about Keychain access from this tweak's injected-dylib position.
+// minimum: repo contents read/write (steps 1-3, 6-7 - releases live
+// under the Contents permission) and `actions:write` (step 4) /
+// `actions:read` (step 5) on the target repo - i.e. a fine-grained PAT
+// scoped to just that repo with Contents (read/write) and Actions
+// (read/write) permissions, or a classic PAT with the `repo` and
+// `workflow` scopes. See BundleDoctorSettings.h for where this token
+// is actually stored (Keychain) and that file's own caveat about
+// Keychain access from this tweak's injected-dylib position.
 //
 // THREADING: +doctorBundleAtURL:config:progress:completion: does all of
 // the above synchronously (blocking dispatch_semaphore waits between
@@ -84,13 +102,15 @@
 // own state machine (see ModAssetLibrary.h's ModAssetLibraryDoctorStatus,
 // which mirrors these phases 1:1) instead of one blocking call:
 //
-//   1. +dispatchBundleAtURL:config:uploadProgress:completion: - upload
-//      + commit + branch + workflow_dispatch. Real byte-level progress
-//      (0.0-1.0) via uploadProgress, since this is the only phase with
-//      an actual multi-second body to send. Returns a BundleDoctorHandle
-//      the caller persists (ModAssetLibrary's doctorScratchBranch/
-//      doctorRunID/doctorRunURL fields exist specifically to round-trip
-//      this across app relaunches).
+//   1. +dispatchBundleAtURL:config:uploadProgress:completion: - branch
+//      + release + asset upload + workflow_dispatch. Real byte-level
+//      progress (0.0-1.0) via uploadProgress, since the release-asset
+//      upload is the only phase with an actual multi-second body to
+//      send. Returns a BundleDoctorHandle the caller persists
+//      (ModAssetLibrary's doctorScratchBranch/doctorRunID/doctorRunURL
+//      fields exist specifically to round-trip this across app
+//      relaunches; scratchBranch doubles as the release's tag name -
+//      see this header's transport note above).
 //
 //   2. +resolveRunForHandle:config:completion: - single-shot lookup of
 //      the run the dispatch in step 1 created (the dispatch endpoint
@@ -106,8 +126,8 @@
 //
 //   4. +fetchDoctoredBundleForHandle:config:completion: - call once
 //      phase 3 reports BundleDoctorRunStatusSucceeded. Downloads the
-//      doctored bundle via the Contents API and best-effort deletes the
-//      scratch branch, same as the old method's tail end.
+//      doctored bundle as a release asset and best-effort deletes the
+//      release/tag/scratch branch, same as the old method's tail end.
 //
 // None of these four take a `progress:` status-string block the way the
 // old method did - phases 2-4 are each one cheap JSON request with a
@@ -127,7 +147,7 @@ typedef NS_ENUM(NSInteger, BundleDoctorServiceErrorCode) {
     BundleDoctorServiceErrorRunNotFound,         // dispatched but the corresponding run never showed up in the runs list before the timeout
     BundleDoctorServiceErrorRunFailed,           // run completed but conclusion != "success" - see userInfo[BundleDoctorServiceRunURLKey]
     BundleDoctorServiceErrorTimedOut,
-    BundleDoctorServiceErrorOutputMissing,       // run succeeded but BDS_OUTPUT_PATH wasn't there afterward - workflow/path convention mismatch, see this file's header
+    BundleDoctorServiceErrorOutputMissing,       // run succeeded but BDS_OUTPUT_ASSET_NAME wasn't on the release afterward - workflow/asset-name convention mismatch, see this file's header
 };
 
 extern NSString * const BundleDoctorServiceHTTPStatusKey;   // NSNumber (NSInteger)
@@ -173,7 +193,7 @@ typedef NS_ENUM(NSInteger, BundleDoctorRunStatus) {
 // doctorRunURL fields, which are exactly this object's own fields
 // flattened for manifest.json storage).
 @interface BundleDoctorHandle : NSObject
-@property (nonatomic, copy, readonly) NSString *scratchBranch;   // the never-reused "bundle-doctor/<uuid>" branch this submission lives on
+@property (nonatomic, copy, readonly) NSString *scratchBranch;   // the never-reused "bundle-doctor/<uuid>" string this submission lives on - both the scratch git branch dispatched against and the tag name of the release carrying its input/output bundle assets (see this header's transport note)
 @property (nonatomic, copy, nullable) NSString *runID;           // nil until +resolveRunForHandle:config:completion: fills it in
 @property (nonatomic, copy, nullable) NSString *runURL;          // nil until the same call fills it in - the run's html_url, for surfacing on failure
 
@@ -218,15 +238,17 @@ typedef NS_ENUM(NSInteger, BundleDoctorRunStatus) {
 
 #pragma mark - Decoupled phase API (see this file's header)
 
-// Phase 1: reads moddedBundleURL, uploads it as a git blob (with real
-// byte-level progress via uploadProgress - every other phase below is a
-// single small JSON request with nothing meaningful to report mid-flight),
-// commits it onto a brand-new scratch branch, and dispatches the
-// doctor-bundle workflow on that branch. uploadProgress is called on the
-// main queue zero or more times with a 0.0-1.0 fraction as the blob's
-// body is sent; completion is called exactly once, also on the main
-// queue. On success, the returned handle's runID/runURL are still nil -
-// call +resolveRunForHandle:config:completion: next.
+// Phase 1: reads moddedBundleURL, creates a brand-new scratch branch and
+// a same-named GitHub Release, uploads the bundle to that release as a
+// binary asset (with real byte-level progress via uploadProgress - every
+// other phase below is a single small JSON request with nothing
+// meaningful to report mid-flight), and dispatches the doctor-bundle
+// workflow on the scratch branch with that release's tag as an input.
+// uploadProgress is called on the main queue zero or more times with a
+// 0.0-1.0 fraction as the asset's body is sent; completion is called
+// exactly once, also on the main queue. On success, the returned
+// handle's runID/runURL are still nil - call
+// +resolveRunForHandle:config:completion: next.
 + (void)dispatchBundleAtURL:(NSURL *)moddedBundleURL
                        config:(BundleDoctorConfig *)config
                uploadProgress:(nullable void (^)(double fractionComplete))uploadProgress
@@ -264,14 +286,14 @@ typedef NS_ENUM(NSInteger, BundleDoctorRunStatus) {
                        completion:(void (^)(BundleDoctorRunStatus status, double percentComplete, NSError * _Nullable error))completion;
 
 // Phase 4: call once phase 3 reports BundleDoctorRunStatusSucceeded.
-// Reads the doctored bundle back from handle.scratchBranch via the
-// Contents API, writes it to a temp file the caller owns (same
-// ownership convention as the deprecated one-shot method's
-// doctoredBundleURL), and best-effort deletes the scratch branch
-// (logged, not surfaced, same as before). Safe to call more than once if
-// the caller's own download step needs retrying - the scratch branch is
-// only deleted after a successful fetch, and deleting an
-// already-deleted branch is itself best-effort/silent.
+// Downloads the doctored bundle as a release asset from the release
+// tagged handle.scratchBranch, writes it to a temp file the caller owns
+// (same ownership convention as the deprecated one-shot method's
+// doctoredBundleURL), and best-effort deletes the release/tag and the
+// scratch branch (logged, not surfaced, same as before). Safe to call
+// more than once if the caller's own download step needs retrying - the
+// release/branch are only deleted after a successful fetch, and deleting
+// an already-deleted release/branch is itself best-effort/silent.
 + (void)fetchDoctoredBundleForHandle:(BundleDoctorHandle *)handle
                                 config:(BundleDoctorConfig *)config
                             completion:(void (^)(NSURL * _Nullable doctoredBundleURL, NSError * _Nullable error))completion;
