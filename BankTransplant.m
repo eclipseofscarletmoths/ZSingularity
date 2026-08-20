@@ -18,7 +18,8 @@ static NSError *BTError(BankTransplantErrorCode code, NSString *message) {
 static NSString * const kBTBackupSuffix = @".orig-bak";
 
 @interface BankTransplant ()
-+ (BOOL)bt_restoreOneBackupEntry:(NSString *)backupEntryName inBackupDir:(NSString *)backupDir mobileDir:(NSString *)mobileDir;
++ (BOOL)bt_restoreOneBackupEntry:(NSString *)backupEntryName inBackupDir:(NSString *)backupDir mobileDir:(NSString *)mobileDir force:(BOOL)force;
++ (BOOL)bt_fileAtPath:(NSString *)pathA hasIdenticalBytesToFileAtPath:(NSString *)pathB;
 @end
 
 @implementation BankTransplant
@@ -132,18 +133,50 @@ static NSString * const kBTBackupSuffix = @".orig-bak";
     return YES;
 }
 
-// Shared by +restoreAllBackedUpBanksWithError: and
+// Byte-for-byte comparison (not just size) between a live file and its
+// backup - used so a restore doesn't overwrite a live file that's
+// already identical to what it would be restored to. Size is checked
+// first as a cheap short-circuit before either file is read in full.
+// Either path missing/unreadable counts as "not identical" so a real
+// restore attempt still happens rather than silently no-op'ing.
++ (BOOL)bt_fileAtPath:(NSString *)pathA hasIdenticalBytesToFileAtPath:(NSString *)pathB {
+    NSFileManager *fm = NSFileManager.defaultManager;
+    if (![fm fileExistsAtPath:pathA] || ![fm fileExistsAtPath:pathB]) return NO;
+
+    NSDictionary<NSFileAttributeKey, id> *attrsA = [fm attributesOfItemAtPath:pathA error:nil];
+    NSDictionary<NSFileAttributeKey, id> *attrsB = [fm attributesOfItemAtPath:pathB error:nil];
+    unsigned long long sizeA = [attrsA[NSFileSize] unsignedLongLongValue];
+    unsigned long long sizeB = [attrsB[NSFileSize] unsignedLongLongValue];
+    if (sizeA != sizeB) return NO;
+
+    NSData *dataA = [NSData dataWithContentsOfFile:pathA];
+    NSData *dataB = [NSData dataWithContentsOfFile:pathB];
+    if (!dataA || !dataB) return NO;
+    return [dataA isEqualToData:dataB];
+}
+
+// Shared by +restoreAllBackedUpBanksForce:error: and
 // +restoreBackedUpBankNamed:error: below - restores one <name>.bank
 // from its <name>.bank.orig-bak backup, leaving the backup in place.
-// Returns YES/NO for that one file; doesn't fill `error` on a simple
-// "couldn't stage/swap this one" failure (logged via ZLog instead,
-// same as the old inline loop body did), since the all-banks caller
-// wants to keep going past a single bad entry rather than abort.
-+ (BOOL)bt_restoreOneBackupEntry:(NSString *)backupEntryName inBackupDir:(NSString *)backupDir mobileDir:(NSString *)mobileDir {
+// Unless `force` is YES, first checks the live file against the backup
+// byte-for-byte (+bt_fileAtPath:hasIdenticalBytesToFileAtPath:) and
+// skips the write entirely if they already match - there's nothing to
+// restore in that case, and skipping avoids a pointless replace of an
+// already-correct file. Returns YES only if the live file was actually
+// (re)written - NO for both a skipped-identical match and a real
+// failure, which is all either caller needs to tell "restored" apart
+// from "not restored" for its own count; a real failure is still
+// logged via ZLog either way (skips are not, since skipping is the
+// expected/successful outcome of the byte check, not a problem).
++ (BOOL)bt_restoreOneBackupEntry:(NSString *)backupEntryName inBackupDir:(NSString *)backupDir mobileDir:(NSString *)mobileDir force:(BOOL)force {
     NSFileManager *fm = NSFileManager.defaultManager;
     NSString *backupPath = [backupDir stringByAppendingPathComponent:backupEntryName];
     NSString *fileName = [backupEntryName substringToIndex:backupEntryName.length - kBTBackupSuffix.length];
     NSString *originalPath = [mobileDir stringByAppendingPathComponent:fileName];
+
+    if (!force && [self bt_fileAtPath:originalPath hasIdenticalBytesToFileAtPath:backupPath]) {
+        return NO; // already matches the backup - nothing to restore
+    }
 
     NSString *tmpPath = [NSTemporaryDirectory() stringByAppendingPathComponent:[NSUUID UUID].UUIDString];
     NSError *copyErr = nil;
@@ -165,7 +198,7 @@ static NSString * const kBTBackupSuffix = @".orig-bak";
     return ok;
 }
 
-+ (NSInteger)restoreAllBackedUpBanksWithError:(NSError **)error {
++ (NSInteger)restoreAllBackedUpBanksForce:(BOOL)force error:(NSError **)error {
     NSString *mobileDir = [self mobileFMODBuildsDirectory];
     NSString *backupDir = [self bankBackupDirectory];
     NSFileManager *fm = NSFileManager.defaultManager;
@@ -184,10 +217,60 @@ static NSString * const kBTBackupSuffix = @".orig-bak";
     NSInteger restored = 0;
     for (NSString *entry in entries) {
         if (![entry hasSuffix:kBTBackupSuffix]) continue;
-        if ([self bt_restoreOneBackupEntry:entry inBackupDir:backupDir mobileDir:mobileDir]) restored++;
+        if ([self bt_restoreOneBackupEntry:entry inBackupDir:backupDir mobileDir:mobileDir force:force]) restored++;
     }
 
     return restored;
+}
+
++ (NSInteger)restoreAllBackedUpBanksWithError:(NSError **)error {
+    return [self restoreAllBackedUpBanksForce:NO error:error];
+}
+
+// Same backup-directory walk as +restoreAllBackedUpBanksWithError:, but
+// deletes the live file at mobileDir/<name> instead of overwriting it
+// with the backup's bytes, then deletes backupDir itself (the whole
+// directory - every .orig-bak in it, and the directory entry) once the
+// walk is done. See this method's header comment for why - this is the
+// "forget it ever happened" lever, not a restore.
++ (NSInteger)deleteAllTrackedBanksAndBackupsWithError:(NSError **)error {
+    NSString *mobileDir = [self mobileFMODBuildsDirectory];
+    NSString *backupDir = [self bankBackupDirectory];
+    NSFileManager *fm = NSFileManager.defaultManager;
+
+    if (!backupDir || ![fm fileExistsAtPath:backupDir]) {
+        return 0; // nothing has ever been backed up - not an error
+    }
+
+    NSError *listErr = nil;
+    NSArray<NSString *> *entries = [fm contentsOfDirectoryAtPath:backupDir error:&listErr];
+    if (!entries) {
+        if (error) *error = listErr ?: BTError(BankTransplantErrorOriginalNotFound, @"Couldn't list the bank backup directory.");
+        return -1;
+    }
+
+    NSInteger deleted = 0;
+    for (NSString *entry in entries) {
+        if (![entry hasSuffix:kBTBackupSuffix]) continue;
+        NSString *fileName = [entry substringToIndex:entry.length - kBTBackupSuffix.length];
+        NSString *livePath = mobileDir ? [mobileDir stringByAppendingPathComponent:fileName] : nil;
+        if (!livePath || ![fm fileExistsAtPath:livePath]) continue;
+
+        NSError *removeErr = nil;
+        if ([fm removeItemAtPath:livePath error:&removeErr]) {
+            deleted++;
+        } else {
+            ZLog(@"[BankTransplant] hard reset: couldn't delete live bank %@: %@", livePath, removeErr.localizedDescription);
+        }
+    }
+
+    // Backups have done their job (or there was nothing left to restore
+    // from anyway) - clear the whole directory, manifest-equivalent
+    // .orig-bak files included, so a stray backup can't outlive the
+    // reset it was supposed to be part of.
+    [fm removeItemAtPath:backupDir error:nil];
+
+    return deleted;
 }
 
 + (NSInteger)restoreBackedUpBankNamed:(NSString *)name error:(NSError **)error {
@@ -205,7 +288,7 @@ static NSString * const kBTBackupSuffix = @".orig-bak";
         return 0; // no backup for this bank specifically - not an error
     }
 
-    return [self bt_restoreOneBackupEntry:backupEntryName inBackupDir:backupDir mobileDir:mobileDir] ? 1 : 0;
+    return [self bt_restoreOneBackupEntry:backupEntryName inBackupDir:backupDir mobileDir:mobileDir force:NO] ? 1 : 0;
 }
 
 @end

@@ -75,9 +75,21 @@ typedef NS_ENUM(NSInteger, BankTransplantErrorCode) {
 // Restores every <name>.bank under +mobileFMODBuildsDirectory that has a
 // matching <name>.bank.orig-bak under +bankBackupDirectory, leaving the
 // backups in place (so this is safe to run more than once / after further
-// swaps). Returns the number of files restored, or -1 with error filled
-// on a filesystem-level failure walking the backup directory.
+// swaps). A bank whose live bytes already match its backup byte-for-byte
+// is left untouched and NOT counted as restored - see
+// +restoreAllBackedUpBanksForce:error: for the force-through variant.
+// Returns the number of files actually (re)written, or -1 with error
+// filled on a filesystem-level failure walking the backup directory.
 + (NSInteger)restoreAllBackedUpBanksWithError:(NSError **)error;
+
+// Same as +restoreAllBackedUpBanksWithError: above, but with an explicit
+// `force` switch: force:NO is exactly that method's own behavior
+// (byte-identical banks are skipped, not counted); force:YES skips the
+// byte check entirely and rewrites every backed-up bank unconditionally,
+// matching-or-not. Meant for a "Force Restore" fallback offered after a
+// plain restore reports nothing to do - see GraphicsDebugOverlay.m's
+// -restoreOriginalsTapped / -gd_forceRestoreOriginalsTapped.
++ (NSInteger)restoreAllBackedUpBanksForce:(BOOL)force error:(NSError **)error;
 
 // Scoped counterpart to the method above: restores only the single
 // <name>.bank (name should include the extension, e.g. "music.bank")
@@ -86,6 +98,19 @@ typedef NS_ENUM(NSInteger, BankTransplantErrorCode) {
 // there's no backup for this name at all, or -1 with error filled on a
 // filesystem-level failure.
 + (NSInteger)restoreBackedUpBankNamed:(NSString *)name error:(NSError **)error;
+
+// The nuclear option, for the Config section's "Hard Assets Reset" (see
+// GraphicsDebugOverlay.m): unlike +restoreAllBackedUpBanksWithError:,
+// this does NOT put the stock bytes back. It deletes, outright, every
+// live <name>.bank under +mobileFMODBuildsDirectory that has a matching
+// backup under +bankBackupDirectory - i.e. every bank this class has
+// ever logged the location of by touching it - then removes
+// +bankBackupDirectory itself, backups and all. A deleted bank is a
+// bank the game has to fetch fresh next time it's needed; that's the
+// point. Returns the number of live files deleted (0 if nothing was
+// ever backed up - not an error), or -1 with error filled on a
+// filesystem-level failure listing the backup directory.
++ (NSInteger)deleteAllTrackedBanksAndBackupsWithError:(NSError **)error;
 
 @end
 

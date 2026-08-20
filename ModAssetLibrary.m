@@ -371,4 +371,18 @@ static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
     return YES;
 }
 
++ (BOOL)deleteAllFoldersWithError:(NSError **)error {
+    NSString *root = [self modLibraryRootDirectory];
+    NSFileManager *fm = NSFileManager.defaultManager;
+    if (!root || ![fm fileExistsAtPath:root]) return YES; // already-clean is success
+
+    NSError *removeErr = nil;
+    if (![fm removeItemAtPath:root error:&removeErr]) {
+        if (error) *error = removeErr ?: MALError(ModAssetLibraryErrorDeleteFailed,
+            @"Couldn't delete the Mod Asset Library.");
+        return NO;
+    }
+    return YES;
+}
+
 @end

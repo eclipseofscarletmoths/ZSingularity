@@ -120,6 +120,20 @@ typedef NS_ENUM(NSInteger, ModAssetLibraryErrorCode) {
 // different existing folder.
 + (BOOL)renameFolderNamed:(NSString *)folderName to:(NSString *)newName error:(NSError **)error;
 
+// Deletes +modLibraryRootDirectory entirely - every folder, manifest,
+// and tracked file the library has ever recorded, root directory
+// included. Same "library bookkeeping only" scope as
+// +deleteFolderNamed:error: (does not touch anything under
+// +unityCacheSharedDirectory/+mobileFMODBuildsDirectory or either
+// backup directory) - this is the Config section's "Hard Assets Reset"
+// clearing its own bookkeeping, not the game-file deletion side of that
+// action (see +[BankTransplant deleteAllTrackedBanksAndBackupsWithError:]
+// / +[BundleDoctorInstaller deleteAllTrackedBundlesAndBackupsWithError:]
+// for that). Same "already-clean is success, not failure" convention as
+// +[BundleDoctorSettings clearAllWithError:] - returns YES if the end
+// state is "nothing stored", even if the root directory never existed.
++ (BOOL)deleteAllFoldersWithError:(NSError **)error;
+
 @end
 
 NS_ASSUME_NONNULL_END

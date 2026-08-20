@@ -1,6 +1,8 @@
-# 120F
+# ZSingularity
 
 an iOS tweak that's capable of arbitrarily modifying graphical related settings in Limbus Company by leveraging public classes found in Assembly CSharp.
+
+It also possesses a cosmetic mod loader, a feature exclusive to desktop, now brought to the iPhone. It works by sending over the bundles into a private repo with AssetTools.NET running, the workflow re-encodes and re-targets the bundle for us, then returns it for us to load it in
 
 the sole purpose of this tweak is to give more flexibility and fine-tuning capabilities regarding graphical settings targeting performance.
 
@@ -21,11 +23,11 @@ None of this touches `LocalGameOptionData` or the save system - values are live/
 - `BankTransplant.h` / `.m` - imports a modded FMOD `.bank` by directly replacing the matching stock `.bank` under `Documents/Assets/Sound/FMODBuilds/Mobile` with the modded file's bytes as-is - no decoding, re-encoding, or header rebuilding, since the mobile client already plays Vorbis-coded FSB5 samples natively. The original stock bank is backed up once before modification. `GraphicsDebugOverlay.m`'s Mods section (Import Bank Mod / Restore Originals) is the only caller.
 
 - `PatchManifestNetwork.h` / `.m` - hooks the game's own `NSURLSession` delegate to intercept its FMOD manifest fetch (`FmodPatchInfo.json`) in flight and zero out every entry's Hash/Size in the response's `Files` dictionary before it reaches the game, so locally-swapped assets don't fail its integrity check. Deactivates itself for the rest of the session once it's patched a manifest once. It works passively at the network layer whenever the game itself fetches the manifest - it isn't called directly by `BankTransplant.m`.
+- `LZ4BlockDecoder.h` / `.m` - from-scratch decoder for raw LZ4/LZ4HC blocks (the format UnityFS bundles actually contain, not the `.lz4` frame format). Only used by `UnityBundleCAB.m`, to decompress a bundle's blocks-info blob.
+- `UnityBundleCAB.h` / `.m` - reads a UnityFS archive's own directory table to recover its real identity: the `CAB-<hash>` name stored as node[0], which is the one reliable way to tell a bundle's own name apart from the many other CAB strings referenced inside it (shared dependencies). Back in this build after being retired along with the old `BundleTransplant.m` - see `UnityCacheLocator.h` for its new caller.
+- `UnityCacheLocator.h` / `.m` - the CAB-based bundle lookup this project used to have, reimplemented as its own class: reads the CAB off a modded/doctored bundle, then searches `Library/UnityCache/Shared` for a cached file that reports the same CAB as its own identity. Lets the doctor pipeline (`BundleDoctorService.h`/`BundleDoctorInstaller.h`) skip the manual "pick the stock bundle" file-picker step when a match is found, falling back to that picker otherwise.
 
 `GameEngineControl.h`/`.m` doesn't exist - earlier versions of this README described it as the intended home for the engine calls above, but it was never actually built. `GDScripts.h`/`.m` is that file, under a different name.
 
-## Visual (bundle/texture) mod support - removed
-
-The whole-bundle Texture2D visual-mod pipeline (rewrite a desktop bundle's `m_TargetPlatform` from Windows Standalone x64 (19) to iOS (9), re-encode desktop-compressed `Texture2D` pixel payloads to RGBA32, and swap the doctored bundle in place of a cached one) and everything it depended on - `BundleTransplant`, `TextureAtlasTransplant`, `UnityBundleCAB`, `SerializedObjectTable`, `Texture2DFields`, `Texture2DPixelDecoder`, `CrunchTextureDecoder`, `LZ4BlockDecoder`, and the `ModAssetLibrary` mods-folder accordion built to organize multi-file bundle mods - has been removed from this tweak entirely, along with the never-finished `PlatformBundleRetarget`/`RawPixelPacker` replacement work described in `Rework.txt`. None of it is coming back into this repo; a separate out-of-process pipeline (desktop-side, via AssetsTools.NET) is being explored instead for anyone who wants that capability. Picking a non-`.bank` file in the Mods panel is now reported as "not a recognized bank" rather than run through any of the above.
 
 Bank-kind mods (`BankTransplant.h`/`.m`, a direct FMOD `.bank` byte swap with no Unity object parsing involved) and the network manifest patch (`PatchManifestNetwork.h`/`.m`) are unaffected and still work.

@@ -120,7 +120,32 @@ static NSString * const kManifestFileName = @"manifest.json";
     return YES;
 }
 
-+ (NSInteger)restoreAllBackedUpBundlesWithError:(NSError **)error {
+// Byte-for-byte comparison (not just size) between a live file and its
+// backup - used so a restore doesn't overwrite a live bundle that's
+// already identical to what it would be restored to. Size is checked
+// first as a cheap short-circuit before either file is read in full.
+// Either path missing/unreadable counts as "not identical" so a real
+// restore attempt still happens rather than silently no-op'ing. Same
+// helper shape as BankTransplant's own +bt_fileAtPath:hasIdenticalBytesToFileAtPath:
+// - not shared between the two classes since it's a few lines and
+// neither has (nor needs) a common base class.
++ (BOOL)bds_fileAtPath:(NSString *)pathA hasIdenticalBytesToFileAtPath:(NSString *)pathB {
+    NSFileManager *fm = NSFileManager.defaultManager;
+    if (![fm fileExistsAtPath:pathA] || ![fm fileExistsAtPath:pathB]) return NO;
+
+    NSDictionary<NSFileAttributeKey, id> *attrsA = [fm attributesOfItemAtPath:pathA error:nil];
+    NSDictionary<NSFileAttributeKey, id> *attrsB = [fm attributesOfItemAtPath:pathB error:nil];
+    unsigned long long sizeA = [attrsA[NSFileSize] unsignedLongLongValue];
+    unsigned long long sizeB = [attrsB[NSFileSize] unsignedLongLongValue];
+    if (sizeA != sizeB) return NO;
+
+    NSData *dataA = [NSData dataWithContentsOfFile:pathA];
+    NSData *dataB = [NSData dataWithContentsOfFile:pathB];
+    if (!dataA || !dataB) return NO;
+    return [dataA isEqualToData:dataB];
+}
+
++ (NSInteger)restoreAllBackedUpBundlesForce:(BOOL)force error:(NSError **)error {
     NSString *dir = [self bundleBackupDirectory];
     if (!dir || ![[NSFileManager defaultManager] fileExistsAtPath:dir]) return 0;
 
@@ -135,6 +160,10 @@ static NSString * const kManifestFileName = @"manifest.json";
         NSString *backupPath = [dir stringByAppendingPathComponent:[name stringByAppendingString:kBackupSuffix]];
         if (![fm fileExistsAtPath:backupPath] || originalPath.length == 0) continue;
 
+        if (!force && [self bds_fileAtPath:originalPath hasIdenticalBytesToFileAtPath:backupPath]) {
+            continue; // already matches the backup - nothing to restore
+        }
+
         NSData *backupData = [NSData dataWithContentsOfFile:backupPath];
         if (!backupData) continue;
 
@@ -147,6 +176,44 @@ static NSString * const kManifestFileName = @"manifest.json";
     }
 
     return restored;
+}
+
++ (NSInteger)restoreAllBackedUpBundlesWithError:(NSError **)error {
+    return [self restoreAllBackedUpBundlesForce:NO error:error];
+}
+
+// Same manifest walk as +restoreAllBackedUpBundlesWithError:, but
+// deletes the live file at each logged originalPath instead of
+// overwriting it with the backup's bytes, then deletes bundleBackupDirectory
+// itself (manifest.json and every .orig-bak in it) once the walk is
+// done - see this method's header comment for why this is "forget it
+// ever happened", not a restore.
++ (NSInteger)deleteAllTrackedBundlesAndBackupsWithError:(NSError **)error {
+    NSString *dir = [self bundleBackupDirectory];
+    if (!dir || ![[NSFileManager defaultManager] fileExistsAtPath:dir]) return 0;
+
+    NSDictionary<NSString *, NSString *> *manifest = [self bds_loadManifest];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSInteger deleted = 0;
+
+    for (NSString *name in manifest) {
+        NSString *originalPath = manifest[name];
+        if (originalPath.length == 0 || ![fm fileExistsAtPath:originalPath]) continue;
+
+        NSError *removeErr = nil;
+        if ([fm removeItemAtPath:originalPath error:&removeErr]) {
+            deleted++;
+        } else {
+            ZLog(@"[BundleDoctorInstaller] hard reset: couldn't delete live bundle %@: %@", originalPath, removeErr.localizedDescription);
+        }
+    }
+
+    // Backups (and the manifest logging where they came from) have done
+    // their job - clear the whole directory so nothing outlives the
+    // reset it was supposed to be part of.
+    [fm removeItemAtPath:dir error:nil];
+
+    return deleted;
 }
 
 @end

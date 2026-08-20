@@ -190,6 +190,7 @@
 #import "BundleDoctorSettings.h" // BundleDoctorSettings/BundleDoctorConfig - Auth section load/save, see -gd_loadAuthFields/-gd_persistAuthFields below
 #import "BundleDoctorService.h"     // send-and-intercept: GitHub Actions doctor-bundle pipeline, see -loadModsTapped below
 #import "BundleDoctorInstaller.h"   // backup+swap of the doctored bundle into place, mirrors BankTransplant's own pattern
+#import "UnityCacheLocator.h"       // CAB-based auto-match for the doctor pipeline's target bundle, see -gd_doctorQueueItemAtURL:
 #import "ModAssetLibrary.h"         // Mods Library accordion (organizational only) - see that file's header
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h> // UTType-based UIDocumentPickerViewController init, for the Mods section's "Import Bank Mod" button
 
@@ -710,6 +711,16 @@ static void gd_attach_hold_to_confirm(UIButton *button, id target, UIView *glass
 static void * const kGDPillHoldConfirmBlockKey = (void *)&kGDPillHoldConfirmBlockKey;
 static void * const kGDPillHoldConfirmFillLayerKey = (void *)&kGDPillHoldConfirmFillLayerKey;
 
+// Per-button hold duration override (NSNumber, seconds), read by
+// -gd_pillHoldConfirmTick:. Absent for every button attached via the
+// plain gd_attach_pill_hold_to_confirm below, which keeps them all on
+// that method's own hardcoded kGDPillHoldConfirmDuration (1.5s) exactly
+// as before - this key only ever gets set by
+// gd_attach_pill_hold_to_confirm_duration, currently just "Hard Assets
+// Reset" (3s, deliberately longer given how much more that one throws
+// away - see -hardAssetsResetTapped).
+static void * const kGDPillHoldConfirmDurationKey = (void *)&kGDPillHoldConfirmDurationKey;
+
 // Wide-button counterpart to gd_attach_hold_to_confirm above - wires up
 // `button` so that holding it for 1.5s runs `onConfirm`, with a red
 // fill sweeping left-to-right across the whole button as visual
@@ -728,6 +739,17 @@ static void gd_attach_pill_hold_to_confirm(UIButton *button, id target, void (^o
     press.cancelsTouchesInView = NO;
     [button addGestureRecognizer:press];
     objc_setAssociatedObject(button, kGDPillHoldConfirmBlockKey, [onConfirm copy], OBJC_ASSOCIATION_COPY);
+}
+
+// Same wide-button hold-to-confirm as gd_attach_pill_hold_to_confirm
+// above, but with a caller-specified hold duration instead of that
+// method's hardcoded 1.5s - see kGDPillHoldConfirmDurationKey. Delegates
+// to gd_attach_pill_hold_to_confirm for the actual gesture/block wiring
+// so the two never drift apart, then stamps the duration override on
+// top of it.
+static void gd_attach_pill_hold_to_confirm_duration(UIButton *button, id target, NSTimeInterval duration, void (^onConfirm)(void)) {
+    gd_attach_pill_hold_to_confirm(button, target, onConfirm);
+    objc_setAssociatedObject(button, kGDPillHoldConfirmDurationKey, @(duration), OBJC_ASSOCIATION_RETAIN);
 }
 
 #pragma mark - Engine scripts
@@ -3623,7 +3645,10 @@ static const CGFloat kContentFadeHeight = 22;
     // submitted file is also imported into the named folder in the
     // Mod Asset Library right below this row, regardless of which
     // pipeline (if any) it routed to. Restore Originals reverts every
-    // backed-up .bank to its stock bytes.
+    // backed-up .bank/bundle to its stock bytes, skipping (and not
+    // counting) anything whose live bytes already match its backup
+    // byte-for-byte - see -restoreOriginalsTapped /
+    // -gd_performRestoreOriginalsForce:.
     gd_add_section_header(self.stack, @"Mods");
     GDRow *modsRow = gd_make_button_pair_row(
         @"Load Mods", [UIColor colorWithRed:0.55 green:0.42 blue:1.0 alpha:1.0],
@@ -3710,7 +3735,12 @@ static const CGFloat kContentFadeHeight = 22;
     // any of them - the same manual escape hatch as the isRunningLoad
     // poll in GDScripts.m, for a load the poll missed or a value that
     // got stomped by opening the game's own settings menu (see this
-    // file's header caveat on that).
+    // file's header caveat on that). Hard Assets Reset (see below) is a
+    // third, unrelated one-shot action tacked onto the same section
+    // rather than getting a section of its own - it's still config-ish
+    // ("housekeeping for this tweak's own state"), just a different
+    // scope of action from Reset/Reapply's graphics-settings-only
+    // scope.
     gd_add_section_header(self.stack, @"Config");
     GDRow *configRow = gd_make_button_pair_row(
         @"Reset Settings", [UIColor colorWithRed:1.0 green:0.42 blue:0.42 alpha:1.0],
@@ -3720,6 +3750,26 @@ static const CGFloat kContentFadeHeight = 22;
     UIButton *reapplyButton = objc_getAssociatedObject(configRow, "gd_button_right");
     [reapplyButton addTarget:self action:@selector(reapplySettingsTapped) forControlEvents:UIControlEventTouchUpInside];
     [self.stack addArrangedSubview:configRow];
+
+    // Hard Assets Reset - full-width, below the Reset/Reapply pair
+    // (gd_make_single_button_row, same as Load Mods used to be) rather
+    // than sharing a pair row with either of them, since it's a
+    // different scope of action entirely (mods/game-files bookkeeping,
+    // not graphics settings) and deserves its own visual weight. Deep
+    // red rather than the softer red Reset Settings/Restore Originals
+    // use - this is the most destructive single action in the panel:
+    // it deletes, outright, every asset this tweak ever swapped into
+    // the game's own files (not a restore - see -hardAssetsResetTapped),
+    // plus every backup and the entire Mod Asset Library. Gated behind
+    // a 3s hold instead of the usual 1.5s (gd_attach_pill_hold_to_confirm_duration)
+    // for exactly that reason. Still `weakSelf` from above, same scope
+    // as restoreOriginalsButton's own hold-to-confirm block.
+    GDRow *hardResetRow = gd_make_single_button_row(@"Hard Assets Reset", [UIColor colorWithRed:0.85 green:0.08 blue:0.08 alpha:1.0]);
+    UIButton *hardResetButton = objc_getAssociatedObject(hardResetRow, "gd_button");
+    gd_attach_pill_hold_to_confirm_duration(hardResetButton, self, 3.0, ^{
+        [weakSelf hardAssetsResetTapped];
+    });
+    [self.stack addArrangedSubview:hardResetRow];
 
     [self layoutPanelForWindow:window];
 
@@ -3804,6 +3854,75 @@ static const CGFloat kContentFadeHeight = 22;
 
     UIImpactFeedbackGenerator *haptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
     [haptic impactOccurred];
+}
+
+#pragma mark Config (Hard Assets Reset)
+//
+// The nuclear option - NOT a restore. Every live asset this tweak has
+// ever swapped into the game's own files is deleted outright (forcing
+// a fresh fetch next time the game needs it), every backup this tweak
+// has ever made is cleared, and the entire Mod Asset Library is wiped.
+// Three separate classes each own the piece of this that matches what
+// they already track, same "each class owns its own directory" split
+// this project already uses everywhere else:
+//   - BankTransplant: deletes every live .bank under
+//     +mobileFMODBuildsDirectory that has a backup under
+//     +bankBackupDirectory (that backup's existence IS the log of
+//     "this bank's live path was touched"), then clears
+//     +bankBackupDirectory itself.
+//   - BundleDoctorInstaller: same idea, but the log is explicit -
+//     its manifest.json under +bundleBackupDirectory maps a doctored
+//     bundle's name to the exact original path it was installed over
+//     (see that class's header on why an explicit manifest is needed
+//     there and not for banks). Deletes the live file at every logged
+//     path, then clears +bundleBackupDirectory itself.
+//   - ModAssetLibrary: wipes +modLibraryRootDirectory entirely - this
+//     is bookkeeping only and was never a "live" game file to begin
+//     with, but it's still one of the four things this button promises
+//     to clear.
+// Gated behind a 3s hold (gd_attach_pill_hold_to_confirm_duration, see
+// where hardResetButton is wired up in -buildPanel:) rather than the
+// 1.5s every other hold-to-confirm control in this panel uses - this
+// single action can throw away more than any other button here, so it
+// gets a longer, more deliberate hold.
+- (void)hardAssetsResetTapped {
+    NSError *bankError = nil;
+    NSInteger banksDeleted = [BankTransplant deleteAllTrackedBanksAndBackupsWithError:&bankError];
+
+    NSError *bundleError = nil;
+    NSInteger bundlesDeleted = [BundleDoctorInstaller deleteAllTrackedBundlesAndBackupsWithError:&bundleError];
+
+    NSError *libraryError = nil;
+    BOOL libraryCleared = [ModAssetLibrary deleteAllFoldersWithError:&libraryError];
+
+    // The library's own accordion needs to reflect the wipe regardless
+    // of how the rest of this went - it's rebuilt from whatever's on
+    // disk, and that's now empty (or unaffected, if libraryCleared
+    // failed and nothing actually changed).
+    [self gd_rebuildModsLibrary];
+
+    UINotificationFeedbackGenerator *haptic = [UINotificationFeedbackGenerator new];
+
+    if (banksDeleted < 0 || bundlesDeleted < 0 || !libraryCleared) {
+        [haptic notificationOccurred:UINotificationFeedbackTypeError];
+        NSString *reason = bankError.localizedDescription ?: bundleError.localizedDescription ?: libraryError.localizedDescription ?: @"Unknown error.";
+        [self gd_presentModsAlertWithTitle:@"Hard Reset Failed" message:reason];
+        return;
+    }
+
+    if (banksDeleted == 0 && bundlesDeleted == 0) {
+        [haptic notificationOccurred:UINotificationFeedbackTypeWarning];
+        [self gd_presentModsAlertWithTitle:@"Nothing to Reset"
+                                    message:@"No tracked banks or bundles were found. The Mod Asset Library has been cleared regardless."];
+        return;
+    }
+
+    [haptic notificationOccurred:UINotificationFeedbackTypeSuccess];
+    NSString *message = [NSString stringWithFormat:
+        @"Deleted %ld bank%@ and %ld bundle%@ from the game's own files, cleared every backup, and emptied the Mod Asset Library. Restart the game for it to take effect.",
+        (long)banksDeleted, banksDeleted == 1 ? @"" : @"s",
+        (long)bundlesDeleted, bundlesDeleted == 1 ? @"" : @"s"];
+    [self gd_presentModsAlertWithTitle:@"Hard Assets Reset" message:message];
 }
 
 #pragma mark Mods (Load Mods - single entry point, routes by file kind)
@@ -4010,30 +4129,96 @@ static const CGFloat kContentFadeHeight = 22;
     });
 }
 
-// Restores every backed-up .bank to its original state.
+// Restores every backed-up .bank/bundle to its original state - see
+// +[BankTransplant restoreAllBackedUpBanksForce:error:] and
+// +[BundleDoctorInstaller restoreAllBackedUpBundlesForce:error:]. A
+// plain tap uses force:NO, so a bank/bundle whose live bytes already
+// match its backup byte-for-byte is left alone and not counted -
+// see -gd_performRestoreOriginalsForce: for what happens when that
+// leaves nothing to restore.
 - (void)restoreOriginalsTapped {
+    [self gd_performRestoreOriginalsForce:NO];
+}
+
+// Bypasses the byte-identical check entirely - the "Force Restore"
+// action offered on the "Nothing to Restore" alert (see
+// -gd_presentRestoreNothingToRestoreAlertWithForceOption), for rewriting
+// every backed-up bank/bundle regardless of whether it currently
+// matches its backup already.
+- (void)gd_forceRestoreOriginalsTapped {
+    [self gd_performRestoreOriginalsForce:YES];
+}
+
+// Shared by both of the above - `force` is forwarded straight through
+// to BankTransplant/BundleDoctorInstaller's own force switch on each
+// class's restore-all method. See those methods' header comments for
+// exactly what force:YES skips (only the byte-for-byte identical
+// check - backup lookup/selection is unaffected either way).
+- (void)gd_performRestoreOriginalsForce:(BOOL)force {
     NSError *bankError = nil;
-    NSInteger banksRestored = [BankTransplant restoreAllBackedUpBanksWithError:&bankError];
+    NSInteger banksRestored = [BankTransplant restoreAllBackedUpBanksForce:force error:&bankError];
+
+    NSError *bundleError = nil;
+    NSInteger bundlesRestored = [BundleDoctorInstaller restoreAllBackedUpBundlesForce:force error:&bundleError];
 
     UINotificationFeedbackGenerator *haptic = [UINotificationFeedbackGenerator new];
 
-    if (banksRestored < 0) {
+    if (banksRestored < 0 || bundlesRestored < 0) {
         [haptic notificationOccurred:UINotificationFeedbackTypeError];
-        [self gd_presentModsAlertWithTitle:@"Restore Failed" message:bankError.localizedDescription ?: @"Unknown error."];
+        NSString *reason = bankError.localizedDescription ?: bundleError.localizedDescription ?: @"Unknown error.";
+        [self gd_presentModsAlertWithTitle:@"Restore Failed" message:reason];
         return;
     }
 
-    if (banksRestored == 0) {
+    if (banksRestored == 0 && bundlesRestored == 0) {
         [haptic notificationOccurred:UINotificationFeedbackTypeWarning];
-        [self gd_presentModsAlertWithTitle:@"Nothing to Restore" message:@"No backed-up banks found."];
+        if (force) {
+            // Already forced through once and still nothing came back -
+            // there's genuinely no backup for either kind, not just
+            // everything already matching. Nothing further to offer.
+            [self gd_presentModsAlertWithTitle:@"Nothing to Restore" message:@"No backed-up banks or bundles found."];
+        } else {
+            [self gd_presentRestoreNothingToRestoreAlertWithForceOption];
+        }
         return;
     }
 
     [haptic notificationOccurred:UINotificationFeedbackTypeSuccess];
+    NSMutableArray<NSString *> *parts = [NSMutableArray array];
+    if (banksRestored > 0) {
+        [parts addObject:[NSString stringWithFormat:@"%ld bank%@", (long)banksRestored, banksRestored == 1 ? @"" : @"s"]];
+    }
+    if (bundlesRestored > 0) {
+        [parts addObject:[NSString stringWithFormat:@"%ld bundle%@", (long)bundlesRestored, bundlesRestored == 1 ? @"" : @"s"]];
+    }
     NSString *message = [NSString stringWithFormat:
-        @"Restored %ld bank%@ to their original state. Restart the game for it to take effect.",
-        (long)banksRestored, banksRestored == 1 ? @"" : @"s"];
+        @"Restored %@ to their original state. Restart the game for it to take effect.",
+        [parts componentsJoinedByString:@" and "]];
     [self gd_presentModsAlertWithTitle:@"Restore Originals" message:message];
+}
+
+// "Nothing to Restore" outcome of a plain (non-forced) restore - every
+// backed-up bank/bundle's live bytes already matched its backup
+// byte-for-byte, so nothing was actually rewritten. Offers "Force
+// Restore" as an explicit escape hatch to rewrite them anyway, just in
+// case something's still wrong in-game despite the bytes matching on
+// disk (a "just in case" lever, not something a plain restore should
+// ever need on its own).
+- (void)gd_presentRestoreNothingToRestoreAlertWithForceOption {
+    UIViewController *presenter = gd_key_window().rootViewController;
+    if (!presenter) {
+        ZLog(@"[BankTransplant] Nothing to Restore: every backed-up bank/bundle already matches its backup.");
+        return;
+    }
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"Nothing to Restore"
+                                                                     message:@"Every backed-up bank/bundle already matches its backup byte-for-byte. Force Restore rewrites them anyway, just in case."
+                                                              preferredStyle:UIAlertControllerStyleAlert];
+    __weak typeof(self) weakSelf = self;
+    [alert addAction:[UIAlertAction actionWithTitle:@"Force Restore" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
+        [weakSelf gd_forceRestoreOriginalsTapped];
+    }]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleCancel handler:nil]];
+    [presenter presentViewController:alert animated:YES completion:nil];
 }
 
 #pragma mark Mods (doctor pipeline)
@@ -4131,10 +4316,12 @@ static const CGFloat kContentFadeHeight = 22;
                 return;
             }
 
-            // Bundle's doctored and sitting in a temp file - now pick
-            // where it actually goes.
+            // Bundle's doctored and sitting in a temp file - try to place
+            // it automatically before falling back to the manual picker.
+            // See -gd_attemptCABAutoInstallForDoctoredURL:sourceURL: for
+            // the CAB read + UnityCache/Shared search this does.
             strongSelf.pendingDoctoredBundleURL = doctoredBundleURL;
-            [strongSelf gd_presentDoctorTargetPicker];
+            [strongSelf gd_attemptCABAutoInstallForDoctoredURL:doctoredBundleURL sourceURL:moddedURL];
         };
 
         if (working.presentingViewController) {
@@ -4143,6 +4330,64 @@ static const CGFloat kContentFadeHeight = 22;
             afterDismiss();
         }
     }];
+}
+
+// Reintroduces the CAB-based auto-match this project used to have (see
+// BundleDoctorInstaller.h's own header on why it doesn't guess a stock
+// bundle's location itself) as the FIRST thing tried once a bundle comes
+// back from BundleDoctorService, before falling back to the manual
+// target picker: read the CAB baked into the just-doctored bundle's own
+// directory table (doctoring only re-encodes Texture2D/TextAsset object
+// bytes, not that identity string - see UnityCacheLocator.h), then
+// search every UnityCache/Shared root this app can find for a cached
+// file that reports the SAME CAB as ITS OWN identity. A hit means "this
+// is the same logical asset" regardless of which cache subfolder it's
+// sitting in, so it can be installed straight away with no picker at
+// all. A miss (CAB unreadable, no UnityCache/Shared found, or nothing
+// under it matches - all three logged via ZLog for diagnosis) falls
+// back to exactly the manual flow this project already had.
+- (void)gd_attemptCABAutoInstallForDoctoredURL:(NSURL *)doctoredURL sourceURL:(NSURL *)sourceURL {
+    BOOL scoped = [sourceURL startAccessingSecurityScopedResource];
+    NSError *cabError = nil;
+    NSString *cab = [UnityCacheLocator cabForBundleAtPath:sourceURL.path error:&cabError];
+    if (scoped) [sourceURL stopAccessingSecurityScopedResource];
+
+    if (!cab) {
+        ZLog(@"[UnityCacheLocator] couldn't read a CAB off %@, falling back to manual target picker: %@",
+             sourceURL.lastPathComponent, cabError.localizedDescription);
+        [self gd_presentDoctorTargetPicker];
+        return;
+    }
+
+    NSError *locateError = nil;
+    NSString *matchedPath = [UnityCacheLocator locateBundlePathForCAB:cab error:&locateError];
+    if (!matchedPath) {
+        ZLog(@"[UnityCacheLocator] no auto-match for CAB %@ (from %@), falling back to manual target picker: %@",
+             cab, sourceURL.lastPathComponent, locateError.localizedDescription);
+        [self gd_presentDoctorTargetPicker];
+        return;
+    }
+
+    // Same install + bookkeeping -gd_handlePickedDoctorTargetURL: does
+    // for the manual path, just without a picker round-trip.
+    self.pendingDoctoredBundleURL = nil;
+    NSString *sourceName = self.loadModsCurrentDoctorSourceURL.lastPathComponent ?: sourceURL.lastPathComponent;
+    self.loadModsCurrentDoctorSourceURL = nil;
+
+    NSURL *stockURL = [NSURL fileURLWithPath:matchedPath];
+    NSError *installError = nil;
+    BOOL ok = [BundleDoctorInstaller installDoctoredBundleAtURL:doctoredURL toStockBundleURL:stockURL error:&installError];
+    [[NSFileManager defaultManager] removeItemAtURL:doctoredURL error:nil]; // done with the temp file either way
+
+    if (ok) {
+        [self.loadModsSummaryLines addObject:
+            [NSString stringWithFormat:@"%@: installed, replacing %@ (auto-matched by CAB %@)",
+                sourceName, stockURL.lastPathComponent, cab]];
+    } else {
+        [self.loadModsSummaryLines addObject:
+            [NSString stringWithFormat:@"%@: %@", sourceName, installError.localizedDescription ?: @"install failed"]];
+    }
+    [self gd_startNextLoadModsDoctorQueueItem];
 }
 
 - (void)gd_presentDoctorTargetPicker {
@@ -4733,8 +4978,15 @@ static const CGFloat kContentFadeHeight = 22;
         return;
     }
 
+    // Per-button override (see kGDPillHoldConfirmDurationKey /
+    // gd_attach_pill_hold_to_confirm_duration) - falls back to this
+    // method's own 1.5s default for every button that never set one,
+    // so this is a no-op change for every existing caller.
+    NSNumber *durationOverride = objc_getAssociatedObject(button, kGDPillHoldConfirmDurationKey);
+    NSTimeInterval duration = durationOverride ? durationOverride.doubleValue : kGDPillHoldConfirmDuration;
+
     NSTimeInterval elapsed = CACurrentMediaTime() - self.pillHoldConfirmStartTime;
-    CGFloat pct = (CGFloat)MIN(1.0, elapsed / kGDPillHoldConfirmDuration);
+    CGFloat pct = (CGFloat)MIN(1.0, elapsed / duration);
 
     CALayer *fill = objc_getAssociatedObject(button, kGDPillHoldConfirmFillLayerKey);
     CGRect bounds = button.bounds;

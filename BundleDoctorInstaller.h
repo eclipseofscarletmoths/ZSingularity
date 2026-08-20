@@ -59,9 +59,33 @@ typedef NS_ENUM(NSInteger, BundleDoctorInstallerErrorCode) {
 
 // Restores every backed-up bundle under +bundleBackupDirectory to its
 // original location, leaving the backups in place (safe to run more
-// than once). Returns the number of files restored, or -1 with error
+// than once). A bundle whose live bytes already match its backup
+// byte-for-byte is left untouched and NOT counted as restored - see
+// +restoreAllBackedUpBundlesForce:error: for the force-through variant.
+// Returns the number of files actually (re)written, or -1 with error
 // filled on a filesystem-level failure walking the backup directory.
 + (NSInteger)restoreAllBackedUpBundlesWithError:(NSError **)error;
+
+// Same as +restoreAllBackedUpBundlesWithError: above, but with an
+// explicit `force` switch: force:NO is exactly that method's own
+// behavior (byte-identical bundles are skipped, not counted); force:YES
+// skips the byte check entirely and rewrites every backed-up bundle
+// unconditionally, matching-or-not. Meant for a "Force Restore" fallback
+// offered after a plain restore reports nothing to do - see
+// GraphicsDebugOverlay.m's -restoreOriginalsTapped /
+// -gd_forceRestoreOriginalsTapped.
++ (NSInteger)restoreAllBackedUpBundlesForce:(BOOL)force error:(NSError **)error;
+
+// The nuclear option, for the Config section's "Hard Assets Reset" (see
+// GraphicsDebugOverlay.m). Unlike +restoreAllBackedUpBundlesWithError:,
+// this does NOT put the stock bytes back - it deletes, outright, the
+// live file at every original path recorded in the manifest under
+// +bundleBackupDirectory (the only place a swapped bundle's game-side
+// location is ever logged, per this class's header note on why that
+// manifest exists at all), then removes +bundleBackupDirectory itself,
+// manifest and backups included. Returns the number of live files
+// deleted (0 if nothing was ever installed - not an error).
++ (NSInteger)deleteAllTrackedBundlesAndBackupsWithError:(NSError **)error;
 
 @end
 
