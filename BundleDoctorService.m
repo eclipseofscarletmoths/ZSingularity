@@ -88,10 +88,29 @@ static const NSTimeInterval kBDSRunCompletionPollInterval = 5.0;
 // bytes). Nothing else in this file needs this - every other request is
 // a small JSON body/response, over before a progress callback would
 // mean anything.
-@interface BDSUploadProgressDelegate : NSObject <NSURLSessionTaskDelegate, NSURLSessionDataDelegate>
+//
+// PROGRESS ONLY - do not add response/data capture back onto this
+// class. When a task is created via the block-based
+// -uploadTaskWithRequest:fromData:completionHandler:, UIKit/Foundation
+// does NOT invoke the session's own data-delegate methods
+// (-URLSession:dataTask:didReceiveResponse:completionHandler:,
+// -URLSession:dataTask:didReceiveData:) for that task - only delegate
+// methods with no completion-handler equivalent still fire, which is
+// exactly -URLSession:task:didSendBodyData:...: (upload progress) and
+// nothing else. This class used to also implement
+// didReceiveResponse:/didReceiveData: and +bds_uploadReleaseAssetData:...
+// read the response/status back off THIS delegate instead of off its
+// own completion handler's response/data parameters - since those
+// delegate methods are never called in this configuration, that read
+// -[NSHTTPURLResponse statusCode] off a permanently-nil httpResponse,
+// silently returning 0 as "the" GitHub API status on every upload
+// regardless of the real response (independent of whether the
+// configured credentials/repo were actually valid). The real
+// response/data are the completion handler's own parameters - see
+// +bds_uploadReleaseAssetData:... below, which reads them from there
+// now instead.
+@interface BDSUploadProgressDelegate : NSObject <NSURLSessionTaskDelegate>
 @property (nonatomic, copy, nullable) void (^onProgress)(double fractionComplete);
-@property (nonatomic, strong, nullable) NSMutableData *collectedData;
-@property (nonatomic, strong, nullable) NSHTTPURLResponse *httpResponse;
 @end
 
 @implementation BDSUploadProgressDelegate
@@ -104,19 +123,6 @@ totalBytesExpectedToSend:(int64_t)totalBytesExpectedToSend {
     if (!self.onProgress || totalBytesExpectedToSend <= 0) return;
     double fraction = (double)totalBytesSent / (double)totalBytesExpectedToSend;
     self.onProgress(MIN(MAX(fraction, 0.0), 1.0));
-}
-
-- (void)URLSession:(NSURLSession *)session dataTask:(NSURLSessionDataTask *)dataTask didReceiveData:(NSData *)data {
-    if (!self.collectedData) self.collectedData = [NSMutableData data];
-    [self.collectedData appendData:data];
-}
-
-- (void)URLSession:(NSURLSession *)session
-          dataTask:(NSURLSessionDataTask *)dataTask
-didReceiveResponse:(NSURLResponse *)response
- completionHandler:(void (^)(NSURLSessionResponseDisposition))completionHandler {
-    if ([response isKindOfClass:NSHTTPURLResponse.class]) self.httpResponse = (NSHTTPURLResponse *)response;
-    completionHandler(NSURLSessionResponseAllow);
 }
 
 @end
@@ -646,15 +652,19 @@ didReceiveResponse:(NSURLResponse *)response
                                                              delegate:delegate
                                                         delegateQueue:nil];
 
+    __block NSData *responseData = nil;
+    __block NSHTTPURLResponse *httpResponse = nil;
     __block NSError *transportError = nil;
     dispatch_semaphore_t sema = dispatch_semaphore_create(0);
     NSURLSessionUploadTask *task = [session uploadTaskWithRequest:request fromData:data
-                                                  completionHandler:^(NSData *ignoredData, NSURLResponse *ignoredResponse, NSError *taskError) {
-        // Real response body/status come from the delegate
-        // (didReceiveResponse:/didReceiveData:) since this session has
-        // one - the completion handler's own data/response are not
-        // populated when a delegate is set. Only the transport error is
-        // read from here.
+                                                  completionHandler:^(NSData *taskData, NSURLResponse *taskResponse, NSError *taskError) {
+        // The real response/body/status - see BDSUploadProgressDelegate's
+        // own header comment above on why these have to come from here
+        // (the completion handler) rather than from the delegate's own
+        // didReceiveResponse:/didReceiveData: methods, which are never
+        // invoked for a task created with a completion handler.
+        responseData = taskData;
+        httpResponse = [taskResponse isKindOfClass:NSHTTPURLResponse.class] ? (NSHTTPURLResponse *)taskResponse : nil;
         transportError = taskError;
         dispatch_semaphore_signal(sema);
     }];
@@ -674,8 +684,7 @@ didReceiveResponse:(NSURLResponse *)response
         return NO;
     }
 
-    NSInteger status = delegate.httpResponse.statusCode;
-    NSData *responseData = delegate.collectedData;
+    NSInteger status = httpResponse.statusCode;
     if (status < 200 || status >= 300) {
         NSString *bodyString = responseData ? [[NSString alloc] initWithData:responseData encoding:NSUTF8StringEncoding] : @"";
         if (bodyString.length > 500) bodyString = [bodyString substringToIndex:500];
