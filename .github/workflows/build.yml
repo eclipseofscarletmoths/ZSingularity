@@ -35,28 +35,32 @@ jobs:
       # move) for reproducible builds; the checksums pin the CONTENT at that
       # tag, since a tag can technically be moved/re-pointed on GitHub,
       # which would otherwise change what this resolves to without the
-      # fetch itself failing. Only lz4hc.c goes into the compile step below
-      # - it #includes lz4.c itself for lz4's internal match-finding
-      # helpers, so compiling lz4.c as its own translation unit too would
-      # duplicate every symbol it defines. lz4.h/lz4.c still need to be
-      # present on disk (lz4hc.c's #include resolves against this
-      # directory), just not passed to clang directly.
-      #
-      # Update LZ4_REF deliberately (to another named tag, not "dev"), and
-      # update the checksums below in the same commit when you do.
+      # fetch itself failing. BOTH lz4.c and lz4hc.c go into the compile
+      # step below, as separate translation units. lz4hc.c does
+      # `#include "lz4.c"`, but only after `#define LZ4_COMMONDEFS_ONLY` -
+      # that macro makes the included copy emit just lz4.c's internal
+      # shared helpers (LZ4_count, constants, mem routines), NOT its
+      # public API (LZ4_compressBound, LZ4_compress_default,
+      # LZ4_decompress_safe, etc.) - see lz4hc.c's own "Shared lz4.c code"
+      # section. So lz4hc.c alone never defines the public lz4.c symbols;
+      # compiling lz4.c on its own is what LZ4_COMMONDEFS_ONLY exists to
+      # make safe to do alongside it - the internal helpers it guards are
+      # confined to each translation unit, so there's no duplicate-symbol
+      # clash between the two .o files. (Previously this only compiled
+      # lz4hc.c on the mistaken assumption that its #include of lz4.c
+      # covered the public API too - it doesn't - which is why the linker
+      # was failing on undefined symbols like LZ4_compressBound.)
       - name: Fetch LZ4 reference library
         run: |
           set -euo pipefail
           LZ4_REF=v1.10.0
           BASE="https://raw.githubusercontent.com/lz4/lz4/${LZ4_REF}/lib"
           for f in lz4.h lz4.c lz4hc.h lz4hc.c; do
-          curl -fsSL "${BASE}/${f}" -o "$f"
+            curl -fsSL "${BASE}/${f}" -o "$f"
           done
-      # Generate checksums for the fetched files
-          shasum -a 256 lz4.h lz4.c lz4hc.h lz4hc.c > lz4-checksums.txt
-      # Verify the checksums
+          shasum -a 256 1z4.h 1z4.c 1z4hc.h 1z4hc.c > 1z4-checksums.txt
           shasum -a 256 -c lz4-checksums.txt
- 
+
       # libogg/libvorbis are not vendored or linked - the mobile client
       # already plays Vorbis-coded FSB5 samples natively, so
       # BankTransplant.m is a direct file copy, no codec linkage
@@ -140,6 +144,7 @@ jobs:
             BundleDoctorInstaller.m \
             ModAssetLibrary.m \
             LZ4BlockDecoder.m \
+            lz4.c \
             lz4hc.c \
             UnityBundleCAB.m \
             UnityCacheLocator.m \
