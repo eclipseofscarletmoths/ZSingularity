@@ -603,7 +603,19 @@ static BOOL ubc_write_lz4hc_archive(UnityBundleArchive *archive, NSData *compres
     ubc_append_i64_be(out, 0);
     ubc_append_u32_be(out, (uint32_t)finalCompressedBlocksInfo.length);
     ubc_append_u32_be(out, (uint32_t)blocksInfo.length);
-    ubc_append_u32_be(out, 0x40 | 3); // combined + LZ4HC
+    // 0x40 = BlocksAndDirectoryInfoCombined, 0x200 = BlockInfoNeedPaddingAtStart.
+    // The 16-byte padding inserted below (before finalCompressedBlocksInfo)
+    // is real - we always emit it - but until now this flags field never
+    // said so. This app's own reader ignores the flag and aligns
+    // unconditionally (see ubc_parse_header), so round-tripping through
+    // ourselves always worked and masked this. A spec-following external
+    // reader (AssetsTools.NET on the private repo) gates alignment on this
+    // exact bit: without it set, it reads the compressed blocks-info blob
+    // starting right after this field with no skip, ingesting our padding
+    // as if it were LZ4 stream bytes - which is exactly the "not a
+    // readable SerializedFile / AssetsFileInstance was null" failure
+    // reported server-side.
+    ubc_append_u32_be(out, 0x40 | 0x200 | 3); // combined + needsPaddingAtStart + LZ4HC
 
     while (out.length % 16 != 0) { uint8_t z = 0; [out appendBytes:&z length:1]; }
     [out appendData:finalCompressedBlocksInfo];
