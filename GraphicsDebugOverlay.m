@@ -192,6 +192,7 @@
 #import "BundleDoctorInstaller.h"   // backup+swap of the doctored bundle into place, mirrors BankTransplant's own pattern
 #import "UnityCacheLocator.h"       // CAB-based auto-match for the doctor pipeline's download/install target - see -gd_doctorLocateInstallTargetForDoctoredURL:entryPath:inFolder:
 #import "ModAssetLibrary.h"         // Mods Library accordion (organizational only) - see that file's header
+#import "UnityBundleCAB.h"          // isUnityFSBundleAtPath: - content-based bundle detection for Load Mods' picker handler, see -gd_handleLoadModsPickedURLs:intoFolder:
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h> // UTType-based UIDocumentPickerViewController init, for the Mods section's "Import Bank Mod" button
 
 #import "GDEmbeddedFont.h" // kExcelsiorSansTTF / kExcelsiorSansTTFLength - see that file's header
@@ -493,6 +494,35 @@ static void gd_style_icon_button_as_native_glass(UIButton *button, UIImage *imag
     button.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.18].CGColor;
     button.clipsToBounds = YES;
     button.contentHorizontalAlignment = UIControlContentHorizontalAlignmentCenter;
+}
+
+// Same 6pt radius as the Auth section's own text fields
+// (gd_wrap_field_in_native_glass's own cornerRadius argument at its two
+// call sites) - kept as a named constant so the Verify button below and
+// the fields it sits next to can't drift apart.
+static const CGFloat kGDAuthFieldCornerRadius = 6;
+
+// Auth section's "Verify" button - gd_style_button_as_native_glass on
+// its own gives every button iOS 26's default fully-rounded glass pill,
+// which reads as a mismatched shape sitting directly against the
+// square-ish (6pt corner) PAT field beside it. Per the person's spec,
+// this reapplies that same 6pt radius on top, via the identical
+// gd_configure_glass_corners call the fields themselves use - and does
+// it every time the button's glass configuration gets rebuilt, since
+// restyling (see -gd_authVerifyTapped:'s "Verifying…"/"Verify" swap)
+// replaces the configuration and would otherwise silently revert to
+// the pill. Pre-iOS-26, gd_style_button_as_native_glass's own fallback
+// never sets a cornerRadius at all (defaults to a plain square corner),
+// so the explicit 6pt there is just for consistency across OS versions
+// rather than fixing a visible mismatch.
+static void gd_style_auth_verify_button(UIButton *button, NSString *title) {
+    gd_style_button_as_native_glass(button, title, gd_accent_green_color());
+    button.titleLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightSemibold];
+    gd_configure_glass_corners(button, kGDAuthFieldCornerRadius, NO);
+    if (!gd_has_liquid_glass()) {
+        button.layer.cornerRadius = kGDAuthFieldCornerRadius;
+        button.clipsToBounds = YES;
+    }
 }
 
 // Associated-object key backing the generic hold-to-confirm gesture
@@ -2545,7 +2575,10 @@ static UIView *gd_make_mods_folder_row(NSString *folderName, BOOL expanded, id t
 // target's handler can look the entry up the same way.
 static const CGFloat kGDModsDoctorCapsuleHeight = 18;    // matches the row's existing 18pt icon-button footprint
 static const CGFloat kGDModsDoctorCapsuleMinWidth = 54;  // enough for "dispatch"/"download"/"retry" at kGDModsDoctorCapsuleFontSize
-static const CGFloat kGDModsDoctorCapsuleFontSize = 9;
+// 40% smaller than the original 9pt, per the person's spec - the
+// capsule's own kGDModsDoctorCapsuleMinWidth/Height aren't shrunk to
+// match, so the text just sits smaller inside the same-size capsule.
+static const CGFloat kGDModsDoctorCapsuleFontSize = 9 * 0.6;
 
 static UIView *gd_make_mods_entry_row(ModAssetLibraryEntry *entry, id target, SEL tapAction,
                                        SEL dispatchAction, SEL downloadAction, SEL retryAction, BOOL showActions,
@@ -2555,11 +2588,14 @@ static UIView *gd_make_mods_entry_row(ModAssetLibraryEntry *entry, id target, SE
     objc_setAssociatedObject(row, "gd_modsEntry", entry, OBJC_ASSOCIATION_RETAIN);
 
     BOOL isBank = ([entry.fileName.pathExtension caseInsensitiveCompare:@"bank"] == NSOrderedSame);
-    // Same file-kind check -gd_handleLoadModsPickedURLs: already uses to
-    // decide which picked files get queued into the doctor pipeline in
-    // the first place - mirrored here rather than re-derived, per this
-    // function's own header comment above.
-    BOOL isDoctorEligible = ([entry.fileName caseInsensitiveCompare:@"__data"] == NSOrderedSame);
+    // entry.isAssetBundle is set once, at import time, from the file's
+    // own UnityFS header bytes (see +[ModAssetLibrary
+    // importFileURLs:intoFolder:error:]) - not re-derived from
+    // entry.fileName here. A bundle-kind entry's fileName is always
+    // literally "__data" (Unity's own loader requires that exact name),
+    // but that's a consequence of being a bundle, not what identifies
+    // one - see UnityBundleCAB.h's isUnityFSBundleAtPath: header comment.
+    BOOL isDoctorEligible = entry.isAssetBundle;
     UIImageSymbolConfiguration *iconConfig = [UIImageSymbolConfiguration configurationWithPointSize:12 weight:UIImageSymbolWeightRegular];
     UIImageView *icon = [[UIImageView alloc] initWithImage:
         [UIImage systemImageNamed:(isBank ? @"waveform" : @"doc.fill") withConfiguration:iconConfig]];
@@ -2600,6 +2636,25 @@ static UIView *gd_make_mods_entry_row(ModAssetLibraryEntry *entry, id target, SE
     if (isDoctorEligible) {
         switch (entry.doctorStatus) {
             case ModAssetLibraryDoctorStatusNotDispatched: {
+                // downloadInFlight doubles as "an iOS(9)-targeted
+                // bundle's direct-to-disk install is running" here (see
+                // -gd_doctorStartOrInstallForEntry:folderName:) - that
+                // path never moves doctorStatus off NotDispatched (there's
+                // no upload/process to track), so this is the only signal
+                // this state has that something's actually in flight.
+                // Same non-interactive subtext style Uploading/Processing/
+                // downloading already use, for the same reason.
+                if (downloadInFlight) {
+                    UILabel *progressLabel = [[UILabel alloc] init];
+                    progressLabel.translatesAutoresizingMaskIntoConstraints = NO;
+                    progressLabel.text = @"installing…";
+                    progressLabel.font = [UIFont systemFontOfSize:10 weight:UIFontWeightMedium];
+                    progressLabel.textColor = gd_accent_green_color();
+                    progressLabel.textAlignment = NSTextAlignmentRight;
+                    objc_setAssociatedObject(row, "gd_label_doctorProgress", progressLabel, OBJC_ASSOCIATION_RETAIN);
+                    doctorView = progressLabel;
+                    break;
+                }
                 doctorButton = [UIButton buttonWithType:UIButtonTypeSystem];
                 doctorButton.translatesAutoresizingMaskIntoConstraints = NO;
                 gd_style_button_as_native_glass(doctorButton, @"dispatch", gd_accent_green_color());
@@ -2665,19 +2720,12 @@ static UIView *gd_make_mods_entry_row(ModAssetLibraryEntry *entry, id target, SE
                 break;
             }
             case ModAssetLibraryDoctorStatusInstalled: {
-                // Terminal, non-interactive - see ModAssetLibrary.h's own
-                // comment on why this case was appended after Failed
-                // rather than inserted after ReadyToDownload. No button,
-                // no SEL wired; matches the Uploading/Processing subtext
-                // shape since it's informational only.
-                UILabel *installedLabel = [[UILabel alloc] init];
-                installedLabel.translatesAutoresizingMaskIntoConstraints = NO;
-                installedLabel.text = @"installed";
-                installedLabel.font = [UIFont systemFontOfSize:10 weight:UIFontWeightMedium];
-                installedLabel.textColor = [UIColor colorWithWhite:1 alpha:0.4];
-                installedLabel.textAlignment = NSTextAlignmentRight;
-                objc_setAssociatedObject(row, "gd_label_doctorProgress", installedLabel, OBJC_ASSOCIATION_RETAIN);
-                doctorView = installedLabel;
+                // No row-level capsule/subtext for this state anymore -
+                // "installed" now surfaces as this entry's own Status
+                // line in the Info dropdown instead (see
+                // gd_make_mods_entry_info_panel), so there's nothing to
+                // render in the dispatch slot itself. Terminal state,
+                // same as before - just no view for it here.
                 break;
             }
             case ModAssetLibraryDoctorStatusFailed: {
@@ -2746,13 +2794,14 @@ static UIView *gd_make_mods_entry_row(ModAssetLibraryEntry *entry, id target, SE
     return row;
 }
 
-// Expandable "Info" panel for one entry - path (where it lives WITHIN
-// THE GAME's own files, if resolvable at all - see
-// ModAssetLibraryEntry.livePathDescription; only ever resolvable for a
-// .bank file now that CAB-based bundle matching is gone), human-
-// readable size, and date added. Path uses GDMarqueeLabel so a long
-// value scrolls into view instead of getting truncated.
-static UIView *gd_make_mods_entry_info_panel(ModAssetLibraryEntry *entry) {
+// Expandable "Info" panel for one entry - full on-disk library path,
+// bundle identity/platform (bundle-kind entries only), doctor-pipeline
+// install status (bundle-kind entries only - see isDoctorEligible's own
+// note in gd_make_mods_entry_row on why this class doesn't gate itself
+// on file kind but this panel does), human-readable size, and date
+// added. Path uses GDMarqueeLabel so a long value scrolls into view
+// instead of getting truncated.
+static UIView *gd_make_mods_entry_info_panel(ModAssetLibraryEntry *entry, BOOL downloadInFlight) {
     UIView *container = [[UIView alloc] init];
     container.translatesAutoresizingMaskIntoConstraints = NO;
     objc_setAssociatedObject(container, "gd_modsEntry", entry, OBJC_ASSOCIATION_RETAIN);
@@ -2768,13 +2817,14 @@ static UIView *gd_make_mods_entry_info_panel(ModAssetLibraryEntry *entry) {
     UIFont *subtextFont = [UIFont systemFontOfSize:9.5 weight:UIFontWeightRegular];
     UIColor *subtextColor = [UIColor colorWithWhite:1 alpha:0.4];
 
-    // livePathDescription is resolved ONCE, at import time (see
-    // +[ModAssetLibrary importFileURLs:intoFolder:error:]) - not
-    // recomputed here, and nil for anything that isn't a .bank file.
-    NSString *pathText = entry.livePathDescription ?: @"Not automatically routed - use Import Bank Mod / Load Mods to install";
-
+    // entry.path is this file's own on-disk library copy - shown as-is,
+    // whether or not it's ever been swapped into the game. (This used to
+    // show entry.livePathDescription - "where this would live within the
+    // game's own files" - with a "not automatically routed" placeholder
+    // for anything that field couldn't resolve; that's gone in favor of
+    // always showing the one path this class actually knows for certain.)
     GDMarqueeLabel *pathLabel = [[GDMarqueeLabel alloc] init];
-    pathLabel.text = [NSString stringWithFormat:@"Path: %@", pathText];
+    pathLabel.text = [NSString stringWithFormat:@"Filepath: %@", entry.path];
     pathLabel.font = subtextFont;
     pathLabel.textColor = subtextColor;
     // Keyed by entry path so this marquee's scroll phase survives a
@@ -2783,6 +2833,71 @@ static UIView *gd_make_mods_entry_info_panel(ModAssetLibraryEntry *entry) {
     pathLabel.marqueeKey = [entry.path stringByAppendingString:@"|path"];
     [panel addArrangedSubview:pathLabel];
 
+    // Bundle-only fields - a .bank entry has no CAB id, no Unity target
+    // platform, and no doctor-pipeline install status (see
+    // ModAssetLibraryDoctorStatus's own header on that last one being
+    // meaningless for anything that never enters the doctor pipeline).
+    if (entry.isAssetBundle) {
+        if (entry.cabIdentifier.length > 0) {
+            UILabel *identifierLabel = [[UILabel alloc] init];
+            identifierLabel.text = [NSString stringWithFormat:@"Identifier: %@", entry.cabIdentifier];
+            identifierLabel.font = subtextFont;
+            identifierLabel.textColor = subtextColor;
+            [panel addArrangedSubview:identifierLabel];
+        }
+
+        if (entry.targetPlatform) {
+            int32_t platform = entry.targetPlatform.intValue;
+            UILabel *platformLabel = [[UILabel alloc] init];
+            platformLabel.text = [NSString stringWithFormat:@"Target Platform: %@(%d)", [UnityBundleCAB nameForTargetPlatform:platform], platform];
+            platformLabel.font = subtextFont;
+            platformLabel.textColor = subtextColor;
+            [panel addArrangedSubview:platformLabel];
+        }
+
+        // Uploading/Processing show their live percent right in this
+        // Status line now, instead of just a static "Not installed" -
+        // same underlying doctorUploadProgress/doctorProcessProgress
+        // the compact row capsule already reads (see
+        // gd_make_mods_entry_row), just surfaced here too per the
+        // person's spec. ReadyToDownload/NotDispatched-in-flight have no
+        // byte-level percent to show (a single Contents API GET and a
+        // direct on-disk install respectively - see
+        // -gd_modsLibraryEntryDownloadTapped:'s and
+        // -gd_doctorStartOrInstallForEntry:folderName:'s own headers), so
+        // those just say what's happening instead of a percentage.
+        NSString *statusText;
+        switch (entry.doctorStatus) {
+            case ModAssetLibraryDoctorStatusUploading: {
+                NSInteger percent = (NSInteger)round(MAX(0.0, MIN(1.0, entry.doctorUploadProgress)) * 100.0);
+                statusText = [NSString stringWithFormat:@"%ld%% Uploaded", (long)percent];
+                break;
+            }
+            case ModAssetLibraryDoctorStatusProcessing: {
+                NSInteger percent = (NSInteger)round(MAX(0.0, MIN(1.0, entry.doctorProcessProgress)) * 100.0);
+                statusText = [NSString stringWithFormat:@"%ld%% Processed", (long)percent];
+                break;
+            }
+            case ModAssetLibraryDoctorStatusReadyToDownload:
+                statusText = downloadInFlight ? @"Downloading…" : @"Not installed";
+                break;
+            case ModAssetLibraryDoctorStatusNotDispatched:
+                statusText = downloadInFlight ? @"Installing…" : @"Not installed";
+                break;
+            case ModAssetLibraryDoctorStatusInstalled:
+                statusText = @"Installed";
+                break;
+            case ModAssetLibraryDoctorStatusFailed:
+                statusText = @"Not installed";
+                break;
+        }
+        UILabel *statusLabel = [[UILabel alloc] init];
+        statusLabel.text = [NSString stringWithFormat:@"Status: %@", statusText];
+        statusLabel.font = subtextFont;
+        statusLabel.textColor = subtextColor;
+        [panel addArrangedSubview:statusLabel];
+    }
+
     UILabel *sizeLabel = [[UILabel alloc] init];
     sizeLabel.text = [NSString stringWithFormat:@"Size: %@", [NSByteCountFormatter stringFromByteCount:(long long)entry.byteSize countStyle:NSByteCountFormatterCountStyleFile]];
     sizeLabel.font = subtextFont;
@@ -2790,7 +2905,7 @@ static UIView *gd_make_mods_entry_info_panel(ModAssetLibraryEntry *entry) {
     [panel addArrangedSubview:sizeLabel]; // short enough it never needs to scroll - plain UILabel is fine
 
     UILabel *dateLabel = [[UILabel alloc] init];
-    dateLabel.text = [NSString stringWithFormat:@"Added: %@", entry.dateAdded.length ? entry.dateAdded : @"unknown"];
+    dateLabel.text = [NSString stringWithFormat:@"Date Added: %@", entry.dateAdded.length ? entry.dateAdded : @"unknown"];
     dateLabel.font = subtextFont;
     dateLabel.textColor = subtextColor;
     [panel addArrangedSubview:dateLabel];
@@ -3957,8 +4072,7 @@ static const CGFloat kContentFadeHeight = 22;
     // to find out a stale token is the problem.
     self.authVerifyButton = [UIButton buttonWithType:UIButtonTypeSystem];
     self.authVerifyButton.translatesAutoresizingMaskIntoConstraints = NO;
-    gd_style_button_as_native_glass(self.authVerifyButton, @"Verify", gd_accent_green_color());
-    self.authVerifyButton.titleLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightSemibold];
+    gd_style_auth_verify_button(self.authVerifyButton, @"Verify");
     [self.authVerifyButton addTarget:self action:@selector(gd_authVerifyTapped:) forControlEvents:UIControlEventTouchUpInside];
 
     GDRow *authTokenRow = gd_make_labeled_glass_field_row(@"ghp_xxxxxxxxxxxxxxxxxxxx", YES, self.authVerifyButton);
@@ -4314,7 +4428,14 @@ static const CGFloat kContentFadeHeight = 22;
     for (NSURL *url in urls) {
         if ([url.pathExtension caseInsensitiveCompare:@"bank"] == NSOrderedSame) {
             [bankURLs addObject:url];
-        } else if ([url.lastPathComponent caseInsensitiveCompare:@"__data"] == NSOrderedSame) {
+        } else if ([UnityBundleCAB isUnityFSBundleAtPath:url.path]) {
+            // Identified by the file's own UnityFS header bytes, not its
+            // name - any file can be handed to this picker regardless of
+            // what it's called, and this project no longer requires an
+            // asset bundle to specifically be named "__data" to be
+            // recognized as one (see ModAssetLibrary.m's importer, which
+            // uses the same check and gives each bundle its own
+            // CAB-named subfolder).
             [summaryLines addObject:[NSString stringWithFormat:@"%@: added to Mods Library - tap Dispatch when ready to send it for processing", url.lastPathComponent]];
         } else {
             [summaryLines addObject:[NSString stringWithFormat:@"%@: not a recognized bank or bundle", url.lastPathComponent]];
@@ -4508,13 +4629,27 @@ static const CGFloat kContentFadeHeight = 22;
 // +updateDoctorStateForEntry:inFolder:applyBlock:error: below needs
 // one, and a tap handler only ever gets the entry back (via the
 // "gd_modsEntry" associated object - see gd_make_mods_entry_row).
-// entry.path is always root/folderName/fileName (see
-// +[ModAssetLibrary importFileURLs:intoFolder:error:]), so the owning
-// folder is just its path's parent directory's last component - no
-// extra bookkeeping needed to thread a folder name through every call
-// site here.
+// entry.path is always root/folderName/fileName for a flat (e.g. .bank)
+// entry, but root/folderName/<CAB id>/__data for a bundle-kind one (see
+// +[ModAssetLibrary importFileURLs:intoFolder:error:]) - so the owning
+// folder is NOT reliably just the path's parent directory's last
+// component anymore (that would return the CAB id for a bundle entry).
+// Instead, strip +[ModAssetLibrary modLibraryRootDirectory] off the
+// front and take the first remaining path component, which is
+// folderName regardless of how many components follow it.
 static NSString *gd_mods_folder_name_for_entry(ModAssetLibraryEntry *entry) {
-    return entry.path.stringByDeletingLastPathComponent.lastPathComponent;
+    NSString *root = [ModAssetLibrary modLibraryRootDirectory];
+    NSString *path = entry.path;
+    if (root.length > 0 && [path hasPrefix:root]) {
+        NSString *relative = [path substringFromIndex:root.length];
+        if ([relative hasPrefix:@"/"]) relative = [relative substringFromIndex:1];
+        NSString *first = relative.pathComponents.firstObject;
+        if (first.length > 0) return first;
+    }
+    // Shouldn't normally happen (every entry's path is rooted under
+    // modLibraryRootDirectory) - fall back to the old assumption rather
+    // than returning nil.
+    return path.stringByDeletingLastPathComponent.lastPathComponent;
 }
 
 // Lightweight stand-in for +updateDoctorStateForEntry:inFolder:
@@ -4541,6 +4676,9 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
 // hammering both on every callback, which can fire many times a
 // second per BundleDoctorService's own header.
 - (void)gd_modsLibraryEntryDispatchTapped:(UIButton *)sender {
+    UIImpactFeedbackGenerator *haptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+    [haptic impactOccurred];
+
     ModAssetLibraryEntry *entry = objc_getAssociatedObject(sender, "gd_modsEntry");
     if (!entry) return;
     NSString *folderName = gd_mods_folder_name_for_entry(entry);
@@ -4549,6 +4687,55 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
         return;
     }
 
+    [self gd_doctorStartOrInstallForEntry:entry folderName:folderName];
+}
+
+// Shared by Dispatch (NotDispatched state) and Retry (once it's reset
+// an entry back to NotDispatched, below) - the actual "start moving
+// this bundle toward Installed" decision, so both capsules go through
+// exactly one place instead of Retry re-deriving it.
+//
+// An iOS(9)-targeted bundle (entry.targetPlatform - already sniffed at
+// import time and shown in this entry's own info dropdown, see
+// gd_make_mods_entry_info_panel) is already the platform the game
+// itself expects, so the doctor pipeline's whole upload/re-platform/
+// download round trip is pointless for it - there's nothing to
+// re-target. Per the person's spec, that case skips straight to an
+// on-disk install: no GitHub repo/token needed at all, just steps 2-3
+// of the normal download flow (CAB-match-then-picker, then the actual
+// swap - see -gd_modsLibraryEntryDownloadTapped:'s own header),
+// treating the library's own already-iOS(9) file as the "doctored"
+// source the exact same way a .bank mod is a direct file swap with no
+// re-encoding (see BankTransplant.m). doctorDownloadInFlightPaths is
+// reused as this path's in-flight marker too, since
+// gd_doctorLocateInstallTargetForDoctoredURL:.../gd_doctorInstallDoctoredURL:...
+// already add/remove from it on completion - see
+// gd_make_mods_entry_row's NotDispatched case for how that reflects in
+// the row itself ("installing…" instead of the dispatch capsule).
+//
+// Anything else goes through the normal pipeline via
+// -gd_doctorBeginDispatchForEntry:folderName:.
+- (void)gd_doctorStartOrInstallForEntry:(ModAssetLibraryEntry *)entry folderName:(NSString *)folderName {
+    if (entry.targetPlatform && entry.targetPlatform.intValue == 9) {
+        if (!self.doctorDownloadInFlightPaths) self.doctorDownloadInFlightPaths = [NSMutableSet set];
+        if ([self.doctorDownloadInFlightPaths containsObject:entry.path]) return; // already installing - ignore the double-tap
+        [self.doctorDownloadInFlightPaths addObject:entry.path];
+        [self gd_rebuildModsLibrary];
+        [self gd_doctorLocateInstallTargetForDoctoredURL:[NSURL fileURLWithPath:entry.path]
+                                                entryPath:entry.path
+                                                 inFolder:folderName];
+        return;
+    }
+
+    [self gd_doctorBeginDispatchForEntry:entry folderName:folderName];
+}
+
+// The pipeline's actual phase-1 kickoff (upload + commit + branch +
+// workflow_dispatch) - pulled out of -gd_modsLibraryEntryDispatchTapped:
+// unchanged so -gd_modsLibraryEntryRetryTapped: can call the exact same
+// thing once it's reset the entry, instead of just dropping back to the
+// dispatch capsule and waiting for a second tap.
+- (void)gd_doctorBeginDispatchForEntry:(ModAssetLibraryEntry *)entry folderName:(NSString *)folderName {
     BundleDoctorConfig *config = [BundleDoctorSettings loadConfig];
     if (config.repoOwner.length == 0 || config.repoName.length == 0 || config.authToken.length == 0) {
         [self gd_presentModsAlertWithTitle:@"Auth Not Configured"
@@ -4589,13 +4776,17 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
 }
 
 // Wired to an entry row's "retry" capsule (Failed state only - see
-// gd_make_mods_entry_row). Stops any poll timer still (incorrectly)
-// armed for this entry, clears the throttle bookkeeping, and resets
-// every doctor-pipeline field back to its NotDispatched default so the
-// row falls back to showing the dispatch capsule - the "obvious tap =
-// start over" behavior progress.md flagged as the likely choice here
-// but not yet confirmed by the person.
+// gd_make_mods_entry_row). Resets every doctor-pipeline field back to
+// its NotDispatched default, same as before, but no longer stops
+// there waiting for a second tap on a dispatch capsule that would then
+// reappear - it immediately restarts the pipeline itself (or, for an
+// iOS(9)-targeted bundle, goes straight to on-disk install) via
+// -gd_doctorStartOrInstallForEntry:folderName:, the same routing
+// Dispatch itself uses.
 - (void)gd_modsLibraryEntryRetryTapped:(UIButton *)sender {
+    UIImpactFeedbackGenerator *haptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+    [haptic impactOccurred];
+
     ModAssetLibraryEntry *entry = objc_getAssociatedObject(sender, "gd_modsEntry");
     if (!entry) return;
     NSString *folderName = gd_mods_folder_name_for_entry(entry);
@@ -4622,7 +4813,8 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
         ZLog(@"[Mods Library] couldn't reset %@ back to NotDispatched: %@", entry.fileName, error);
         return;
     }
-    [self gd_rebuildModsLibrary];
+
+    [self gd_doctorStartOrInstallForEntry:updated folderName:folderName];
 }
 
 // Throttled write-back for phase 1's uploadProgress callback - skips
@@ -5134,7 +5326,8 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
                     [weakSelf gd_deleteModEntryConfirmed:entryForDelete inFolder:folderNameForEntry];
                 });
 
-                UIView *infoPanel = gd_make_mods_entry_info_panel(entry);
+                UIView *infoPanel = gd_make_mods_entry_info_panel(entry,
+                    [self.doctorDownloadInFlightPaths containsObject:entry.path]);
                 [self.modsLibraryStack addArrangedSubview:infoPanel];
             }
         }
@@ -5233,6 +5426,9 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
 //      target is known - auto-match or manual pick, either one goes
 //      straight to install.
 - (void)gd_modsLibraryEntryDownloadTapped:(UIButton *)sender {
+    UIImpactFeedbackGenerator *haptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+    [haptic impactOccurred];
+
     ModAssetLibraryEntry *entry = objc_getAssociatedObject(sender, "gd_modsEntry");
     if (!entry) return;
     NSString *folderName = gd_mods_folder_name_for_entry(entry);
@@ -6227,8 +6423,7 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
     }
 
     sender.enabled = NO;
-    gd_style_button_as_native_glass(sender, @"Verifying\u2026", gd_accent_green_color());
-    sender.titleLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightSemibold];
+    gd_style_auth_verify_button(sender, @"Verifying\u2026");
 
     __weak typeof(self) weakSelf = self;
     [BundleDoctorService verifyCredentialsForConfig:config completion:^(BOOL valid, NSError *verifyError) {
@@ -6236,8 +6431,7 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
         if (!strongSelf) return;
 
         sender.enabled = YES;
-        gd_style_button_as_native_glass(sender, @"Verify", gd_accent_green_color());
-        sender.titleLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightSemibold];
+        gd_style_auth_verify_button(sender, @"Verify");
 
         if (valid) {
             [strongSelf gd_presentModsAlertWithTitle:@"Credentials Verified"

@@ -2,6 +2,7 @@
 
 #import "ModAssetLibrary.h"
 #import "BankTransplant.h"
+#import "UnityBundleCAB.h" // isUnityFSBundleAtPath: / primaryCABForBundleAtPath:error: - see +importFileURLs:intoFolder:error: below
 #import "ZTweakLog.h"
 
 NSString * const ModAssetLibraryErrorDomain = @"ModAssetLibraryErrorDomain";
@@ -22,6 +23,9 @@ static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
     d[@"byteSize"] = @(self.byteSize);
     d[@"dateAdded"] = self.dateAdded;
     if (self.livePathDescription) d[@"livePathDescription"] = self.livePathDescription;
+    if (self.isAssetBundle) d[@"isAssetBundle"] = @YES; // only written when true, same "stay compact" convention as the doctor-state fields below
+    if (self.cabIdentifier) d[@"cabIdentifier"] = self.cabIdentifier;
+    if (self.targetPlatform) d[@"targetPlatform"] = self.targetPlatform;
 
     // Doctor-pipeline state - only written when non-default, so a
     // manifest touched entirely by pre-dispatch-flow code (or an entry
@@ -45,6 +49,16 @@ static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
     e.byteSize = [d[@"byteSize"] unsignedLongLongValue];
     e.dateAdded = [d[@"dateAdded"] isKindOfClass:NSString.class] ? d[@"dateAdded"] : @"";
     e.livePathDescription = [d[@"livePathDescription"] isKindOfClass:NSString.class] ? d[@"livePathDescription"] : nil;
+    // Absent entirely on any manifest row written before this field
+    // existed - defaults to NO, same as a non-bundle entry, which is
+    // the safest read for a row this class no longer has a way to
+    // re-sniff (the file's own path is still known, but re-opening
+    // every entry on every manifest read just to backfill this flag
+    // isn't worth it for what's cosmetic-only until the file is
+    // re-imported).
+    e.isAssetBundle = [d[@"isAssetBundle"] isKindOfClass:NSNumber.class] && [d[@"isAssetBundle"] boolValue];
+    e.cabIdentifier = [d[@"cabIdentifier"] isKindOfClass:NSString.class] ? d[@"cabIdentifier"] : nil;
+    e.targetPlatform = [d[@"targetPlatform"] isKindOfClass:NSNumber.class] ? d[@"targetPlatform"] : nil;
     // Older manifests may still carry a "cab" key from before CAB
     // matching was retired - just ignored on read, nothing to migrate.
 
@@ -211,6 +225,24 @@ static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
     return candidate;
 }
 
+// Same idea as +mal_uniqueFileNameFor:inFolder: above, but for a
+// directory name under parentPath rather than a file name within one -
+// "CAB-xxxx" -> "CAB-xxxx 2" -> "CAB-xxxx 3", etc. Used when a bundle's
+// own CAB id is already taken by a previously-imported subfolder (e.g.
+// re-importing the exact same bundle into the same mod folder), so the
+// new one still gets its own directory rather than colliding with (or
+// silently reusing) the existing one.
++ (NSString *)mal_uniqueFolderNameFor:(NSString *)desired inParentFolder:(NSString *)parentPath {
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSString *candidate = desired;
+    NSInteger n = 2;
+    while ([fm fileExistsAtPath:[parentPath stringByAppendingPathComponent:candidate]]) {
+        candidate = [NSString stringWithFormat:@"%@ %ld", desired, (long)n];
+        n++;
+    }
+    return candidate;
+}
+
 // Rewrites an on-disk path under this app's own Library directory into
 // one starting at "Library/..." instead of the full sandbox path
 // ("/var/mobile/Containers/Data/Application/<UUID>/Library/...").
@@ -292,8 +324,60 @@ static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
     NSInteger importedCount = 0;
     for (NSURL *url in moddedURLs) {
         BOOL accessing = [url startAccessingSecurityScopedResource];
-        NSString *destName = [self mal_uniqueFileNameFor:url.lastPathComponent inFolder:folderPath];
-        NSString *destPath = [folderPath stringByAppendingPathComponent:destName];
+
+        // Identified by the file's own header bytes, not its name/
+        // extension - see +[UnityBundleCAB isUnityFSBundleAtPath:]'s own
+        // header comment for why a name-based check (what this used to
+        // be) is unreliable here.
+        BOOL isBundle = [UnityBundleCAB isUnityFSBundleAtPath:url.path];
+
+        // Resolved once, up front, for any detected bundle - used below
+        // both to pick the CAB-named subfolder (when available) and to
+        // populate the entry's own cabIdentifier/targetPlatform either
+        // way, even on the flat-placement fallback path.
+        NSString *cabID = nil;
+        NSNumber *targetPlatformNumber = nil;
+        if (isBundle) {
+            NSError *cabErr = nil;
+            cabID = [UnityBundleCAB primaryCABForBundleAtPath:url.path error:&cabErr];
+            if (cabID.length == 0) {
+                cabID = nil;
+                ZLog(@"[ModAssetLibrary] %@ has a UnityFS header but its CAB id couldn't be read (%@).",
+                     url.lastPathComponent, cabErr.localizedDescription);
+            }
+            int32_t platform = 0;
+            NSError *platformErr = nil;
+            if ([UnityBundleCAB targetPlatform:&platform forBundleAtPath:url.path error:&platformErr]) {
+                targetPlatformNumber = @(platform);
+            } else {
+                ZLog(@"[ModAssetLibrary] couldn't read a target platform for %@: %@",
+                     url.lastPathComponent, platformErr.localizedDescription);
+            }
+        }
+
+        NSString *destPath = nil;
+        NSString *destName = nil;
+        if (cabID) {
+            // Two bundles can't both be named "__data" in one flat
+            // folder - Unity's own loader requires that exact literal
+            // name, so (unlike an ordinary collision) it can't just be
+            // renamed away. Give each bundle its own subfolder, named
+            // after its own CAB id, instead: folderName/<CAB id>/__data.
+            NSString *cabFolderName = [self mal_uniqueFolderNameFor:cabID inParentFolder:folderPath];
+            NSString *cabFolderPath = [folderPath stringByAppendingPathComponent:cabFolderName];
+            NSError *mkdirErr = nil;
+            if ([fm createDirectoryAtPath:cabFolderPath withIntermediateDirectories:YES attributes:nil error:&mkdirErr]) {
+                destName = @"__data";
+                destPath = [cabFolderPath stringByAppendingPathComponent:destName];
+            } else {
+                ZLog(@"[ModAssetLibrary] couldn't create CAB subfolder \"%@\" for %@: %@ - importing flat instead.",
+                     cabFolderName, url.lastPathComponent, mkdirErr.localizedDescription);
+            }
+        }
+        if (!destPath) {
+            destName = [self mal_uniqueFileNameFor:url.lastPathComponent inFolder:folderPath];
+            destPath = [folderPath stringByAppendingPathComponent:destName];
+        }
 
         NSError *copyErr = nil;
         BOOL copied = [fm copyItemAtPath:url.path toPath:destPath error:&copyErr];
@@ -310,6 +394,9 @@ static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
         entry.path = destPath;
         entry.byteSize = attrs.fileSize;
         entry.dateAdded = now;
+        entry.isAssetBundle = isBundle;
+        entry.cabIdentifier = cabID;
+        entry.targetPlatform = targetPlatformNumber;
         // Resolved here, once, and never again - see ModAssetLibrary.h's
         // own comment on livePathDescription.
         entry.livePathDescription = [self mal_livePathDescriptionForFileName:destName];
@@ -338,7 +425,26 @@ static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
         if (![e.path isEqualToString:entry.path]) [remaining addObject:e];
     }
 
-    [NSFileManager.defaultManager removeItemAtPath:entry.path error:nil]; // best-effort - manifest is the source of truth for the UI either way
+    NSFileManager *fm = NSFileManager.defaultManager;
+    [fm removeItemAtPath:entry.path error:nil]; // best-effort - manifest is the source of truth for the UI either way
+
+    // Bundle-kind entries live in their own CAB-named subfolder (see
+    // +importFileURLs:intoFolder:error:) - clean that up too once it's
+    // empty, so removing the entry doesn't leave a stray empty
+    // CAB-<hash> directory behind. Not gated on entry.isAssetBundle:
+    // just checking "is this directory (still) empty" is simpler than
+    // threading that flag through, and is a no-op for a flat entry
+    // whose parent is folderPath itself (never removed here).
+    NSString *root = [self modLibraryRootDirectory];
+    NSString *folderPath = root ? [root stringByAppendingPathComponent:folderName] : nil;
+    NSString *entryDir = entry.path.stringByDeletingLastPathComponent;
+    if (folderPath && ![entryDir isEqualToString:folderPath]) {
+        NSArray<NSString *> *remainingInDir = [fm contentsOfDirectoryAtPath:entryDir error:nil];
+        if (remainingInDir.count == 0) {
+            [fm removeItemAtPath:entryDir error:nil];
+        }
+    }
+
     return [self mal_writeEntries:remaining toFolder:folderName error:error];
 }
 

@@ -619,6 +619,109 @@ static BOOL ubc_write_lz4hc_archive(UnityBundleArchive *archive, NSData *compres
     return YES;
 }
 
+#pragma mark - SerializedFile header parsing (target platform only)
+//
+// See UnityBundleCAB.h's own comment on +targetPlatform:forBundleAtPath:
+// error: for the format this walks. Unlike the UnityFS header above,
+// only the fixed leading fields (through m_Endianess/m_Reserved, and
+// the wider re-read for version >= 22) are guaranteed big-endian -
+// everything after that point in the file is encoded per m_Endianess,
+// which is why this needs its own little-endian u32 reader alongside
+// the cursor's existing (always-big-endian) one.
+static BOOL ubc_read_u32_le(UBCCursor *c, uint32_t *out) {
+    if (!ubc_need(c, 4)) return NO;
+    *out = (uint32_t)c->base[c->pos] | ((uint32_t)c->base[c->pos + 1] << 8) |
+           ((uint32_t)c->base[c->pos + 2] << 16) | ((uint32_t)c->base[c->pos + 3] << 24);
+    c->pos += 4;
+    return YES;
+}
+
+static BOOL ubc_read_serialized_file_target_platform(const uint8_t *base, size_t totalSize,
+                                                       int64_t nodeOffset, int64_t nodeSize,
+                                                       int32_t *outPlatform) {
+    if (nodeOffset < 0 || nodeSize < 0 || (uint64_t)nodeOffset > (uint64_t)totalSize) return NO;
+    size_t available = totalSize - (size_t)nodeOffset;
+    size_t clippedSize = ((uint64_t)nodeSize <= (uint64_t)available) ? (size_t)nodeSize : available;
+    UBCCursor c = { .base = base + nodeOffset, .size = clippedSize, .pos = 0 };
+
+    uint32_t metadataSize, fileSize32, version, dataOffset32;
+    if (!ubc_read_u32_be(&c, &metadataSize) ||
+        !ubc_read_u32_be(&c, &fileSize32) ||
+        !ubc_read_u32_be(&c, &version) ||
+        !ubc_read_u32_be(&c, &dataOffset32)) {
+        return NO;
+    }
+    (void)metadataSize; (void)fileSize32; (void)dataOffset32; // not needed past here for target platform
+
+    uint8_t endianess;
+    if (version >= 9) {
+        if (!ubc_read_u8(&c, &endianess)) return NO;
+        if (!ubc_skip(&c, 3)) return NO; // m_Reserved
+    } else {
+        // Pre-9 files put the endianess byte at (m_FileSize -
+        // m_MetadataSize) instead of right here - not worth chasing for
+        // a field (m_TargetPlatform) that only exists from version 8
+        // onward in the first place; every real bundle this project has
+        // seen is far newer than either version anyway.
+        return NO;
+    }
+
+    if (version >= 22) {
+        uint32_t metadataSize64;
+        int64_t fileSize64, dataOffset64, unknown64;
+        if (!ubc_read_u32_be(&c, &metadataSize64) ||
+            !ubc_read_i64_be(&c, &fileSize64) ||
+            !ubc_read_i64_be(&c, &dataOffset64) ||
+            !ubc_read_i64_be(&c, &unknown64)) {
+            return NO;
+        }
+        (void)metadataSize64; (void)fileSize64; (void)dataOffset64; (void)unknown64;
+    }
+
+    // Metadata section starts here, encoded per `endianess` (0 = little,
+    // matching every real bundle this project has seen so far; anything
+    // else is treated as big-endian rather than guessed at further).
+    if (version < 7) return NO; // no unityVersion string at this position yet
+    NSString *unityVersion;
+    if (!ubc_read_cstring(&c, &unityVersion)) return NO;
+
+    if (version < 8) return NO; // m_TargetPlatform doesn't exist on this version
+
+    uint32_t raw;
+    BOOL ok = (endianess == 0) ? ubc_read_u32_le(&c, &raw) : ubc_read_u32_be(&c, &raw);
+    if (!ok) return NO;
+
+    if (outPlatform) *outPlatform = (int32_t)raw;
+    return YES;
+}
+
+// name -> BuildTarget int, the common/well-documented subset of Unity's
+// public BuildTarget enum. Deliberately not exhaustive - see
+// +nameForTargetPlatform:'s own header comment.
+static NSDictionary<NSNumber *, NSString *> *ubc_target_platform_names(void) {
+    static NSDictionary<NSNumber *, NSString *> *names;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        names = @{
+            @2:  @"StandaloneOSX",
+            @5:  @"StandaloneWindows",
+            @9:  @"iOS",
+            @13: @"Android",
+            @19: @"StandaloneWindows64",
+            @20: @"WebGL",
+            @21: @"WSAPlayer",
+            @24: @"StandaloneLinux64",
+            @31: @"PS4",
+            @33: @"XboxOne",
+            @37: @"tvOS",
+            @38: @"Switch",
+            @40: @"Stadia",
+            @45: @"PS5",
+        };
+    });
+    return names;
+}
+
 #pragma mark - Public API
 
 @implementation UnityBundleNode
@@ -628,6 +731,16 @@ static BOOL ubc_write_lz4hc_archive(UnityBundleArchive *archive, NSData *compres
 @end
 
 @implementation UnityBundleCAB
+
++ (BOOL)isUnityFSBundleAtPath:(NSString *)path {
+    static const char kSig[] = "UnityFS"; // sizeof includes the trailing NUL, which the format also has on disk
+    NSFileHandle *fh = [NSFileHandle fileHandleForReadingAtPath:path];
+    if (!fh) return NO;
+    NSData *sigData = [fh readDataOfLength:sizeof(kSig)];
+    [fh closeFile];
+    if (sigData.length < sizeof(kSig)) return NO;
+    return memcmp(sigData.bytes, kSig, sizeof(kSig)) == 0;
+}
 
 + (uint8_t)compressionTypeForBundleAtPath:(NSString *)path error:(NSError **)error {
     NSData *fileData = [NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:error];
@@ -667,6 +780,36 @@ static BOOL ubc_write_lz4hc_archive(UnityBundleArchive *archive, NSData *compres
 
 + (nullable NSArray<NSString *> *)allNodePathsForBundleAtPath:(NSString *)path error:(NSError **)error {
     return ubc_all_node_paths(path, error);
+}
+
++ (BOOL)targetPlatform:(int32_t *)outPlatform forBundleAtPath:(NSString *)path error:(NSError **)error {
+    NSError *localError = nil;
+    UnityBundleArchive *archive = [self decompressedArchiveAtPath:path error:&localError];
+    if (!archive) {
+        if (error) *error = localError;
+        return NO;
+    }
+    if (archive.nodes.count == 0) {
+        if (error) *error = [NSError errorWithDomain:UnityBundleCABErrorDomain code:UnityBundleCABErrorNoNodes userInfo:nil];
+        return NO;
+    }
+
+    UnityBundleNode *primary = archive.nodes.firstObject; // node[0] - see this header's own top comment on why
+    int32_t platform = 0;
+    BOOL ok = ubc_read_serialized_file_target_platform((const uint8_t *)archive.data.bytes, archive.data.length,
+                                                         primary.offset, primary.size, &platform);
+    if (!ok) {
+        if (error) *error = [NSError errorWithDomain:UnityBundleCABErrorDomain
+                                                 code:UnityBundleCABErrorMalformedSerializedFileHeader
+                                             userInfo:@{NSLocalizedDescriptionKey: @"Couldn't read a target platform out of the bundle's primary SerializedFile header."}];
+        return NO;
+    }
+    if (outPlatform) *outPlatform = platform;
+    return YES;
+}
+
++ (NSString *)nameForTargetPlatform:(int32_t)platform {
+    return ubc_target_platform_names()[@(platform)] ?: @"Unknown";
 }
 
 + (nullable UnityBundleArchive *)decompressedArchiveAtPath:(NSString *)path error:(NSError **)error {

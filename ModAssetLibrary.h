@@ -76,9 +76,40 @@ typedef NS_ENUM(NSInteger, ModAssetLibraryDoctorStatus) {
 // for what each field means and where it comes from.
 @interface ModAssetLibraryEntry : NSObject
 @property (nonatomic, copy) NSString *fileName;
-@property (nonatomic, copy) NSString *path;               // full on-disk path, under the owning folder
+@property (nonatomic, copy) NSString *path;               // full on-disk path, under the owning folder - see +importFileURLs:intoFolder:error: for the CAB-subfolder case
 @property (nonatomic, assign) unsigned long long byteSize;
 @property (nonatomic, copy) NSString *dateAdded;           // ISO 8601, UTC
+
+// Whether +importFileURLs:intoFolder:error: identified this file as a
+// UnityFS asset bundle by its actual header bytes (see
+// +[UnityBundleCAB isUnityFSBundleAtPath:]) at import time - NOT a
+// re-derived check against fileName, which for a bundle-kind entry is
+// always literally "__data" (see the CAB-subfolder note on `path`
+// above) precisely because that's the one name Unity's own loader
+// requires it to have, not because the name is what identifies it as
+// a bundle. Persisted so callers (the doctor-pipeline dispatch slot in
+// GraphicsDebugOverlay.m's row builder, in particular) don't need to
+// re-open and re-sniff the file on every rebuild just to decide
+// whether a row gets a dispatch capsule.
+@property (nonatomic, assign) BOOL isAssetBundle;
+
+// The bundle's own CAB id (e.g. @"CAB-3832197875c1bd4d48da9ab24c88e996"),
+// resolved once at import time the same way the CAB-named subfolder
+// itself is (+[UnityBundleCAB primaryCABForBundleAtPath:error:]) - see
+// +importFileURLs:intoFolder:error:. nil for a non-bundle entry, and
+// also nil (rather than guessed) for a bundle whose CAB id couldn't be
+// read at import time (see that method's own comment on the flat-
+// placement fallback).
+@property (nonatomic, copy, nullable) NSString *cabIdentifier;
+
+// The Unity BuildTarget integer read out of the bundle's own primary
+// SerializedFile header at import time (+[UnityBundleCAB
+// targetPlatform:forBundleAtPath:error:]) - e.g. 19 for
+// StandaloneWindows64. nil for a non-bundle entry, or for a bundle this
+// couldn't be read from (unsupported compression, malformed header,
+// etc.) - never a guessed/default value. +[UnityBundleCAB
+// nameForTargetPlatform:] turns this into a human-readable name.
+@property (nonatomic, copy, nullable) NSNumber *targetPlatform;
 
 // Human-readable description of where this file lives (or would live)
 // WITHIN THE GAME's own files - i.e. wherever it was/would be swapped
@@ -127,12 +158,29 @@ typedef NS_ENUM(NSInteger, ModAssetLibraryDoctorStatus) {
 // folder itself doesn't exist.
 + (nullable NSArray<ModAssetLibraryEntry *> *)entriesInFolder:(NSString *)folderName error:(NSError **)error;
 
-// Copies each URL into folderName (renaming on collision by appending
-// " 2", " 3", ... before the extension - never silently overwrites an
-// existing tracked file) and appends one entry per file to that
-// folder's manifest.json. moddedURLs are handled the same
+// Copies each URL into folderName and appends one entry per file to
+// that folder's manifest.json. moddedURLs are handled the same
 // security-scoped-resource way BankTransplant already does for picker
 // URLs.
+//
+// Each file's own bytes (not its name/extension) decide where it lands,
+// via +[UnityBundleCAB isUnityFSBundleAtPath:]:
+//   - A file whose header actually starts with the UnityFS signature is
+//     a bundle. Two bundles cannot both be named "__data" in the same
+//     folder (Unity's loader requires that exact literal name, so it
+//     can't be renamed away like an ordinary collision), so each one
+//     gets its own subfolder instead, named after the bundle's own CAB
+//     id (+[UnityBundleCAB primaryCABForBundleAtPath:error:]):
+//     folderName/<CAB id>/__data. If that CAB id is already taken
+//     (re-importing the same bundle) the subfolder name gets a
+//     " 2"/" 3"/... suffix, same collision policy as below, just at the
+//     folder level instead of the file level. entry.isAssetBundle is
+//     set YES for these, and entry.cabIdentifier/entry.targetPlatform
+//     are populated where readable (see those properties' own comments
+//     for when either can come back nil instead).
+//   - Anything else is placed directly under folderName as before,
+//     renamed on collision by appending " 2", " 3", ... before the
+//     extension - never silently overwrites an existing tracked file.
 //
 // Partial success is possible (some files copy, one doesn't) - this
 // still returns YES if at least one file made it in, with the failures
@@ -141,10 +189,13 @@ typedef NS_ENUM(NSInteger, ModAssetLibraryDoctorStatus) {
 // manifest couldn't be written back at all.
 + (BOOL)importFileURLs:(NSArray<NSURL *> *)moddedURLs intoFolder:(NSString *)folderName error:(NSError **)error;
 
-// Removes one entry's on-disk file and its manifest.json record. Does
-// NOT touch anything under +unityCacheSharedDirectory/
-// +mobileFMODBuildsDirectory or either backup directory - this only
-// forgets the library's own tracked copy.
+// Removes one entry's on-disk file and its manifest.json record. For a
+// bundle-kind entry (see +importFileURLs:intoFolder:error:) whose file
+// sits in its own CAB-named subfolder, also removes that subfolder once
+// it's empty - so deleting the entry doesn't leave a stray, empty
+// CAB-<hash> directory sitting in the folder. Does NOT touch anything
+// under +unityCacheSharedDirectory/+mobileFMODBuildsDirectory or either
+// backup directory - this only forgets the library's own tracked copy.
 + (BOOL)removeEntry:(ModAssetLibraryEntry *)entry fromFolder:(NSString *)folderName error:(NSError **)error;
 
 // Reads folderName's manifest, finds the row matching entry.path,

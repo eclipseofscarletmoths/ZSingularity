@@ -72,6 +72,7 @@ typedef NS_ENUM(NSInteger, UnityBundleCABErrorCode) {
     UnityBundleCABErrorDecompressFailed,        // LZ4BlockDecompress rejected the blocks-info blob
     UnityBundleCABErrorMalformedBlocksInfo,     // decompressed, but the node table didn't parse cleanly
     UnityBundleCABErrorNoNodes,                 // parsed fine, but the directory table is empty
+    UnityBundleCABErrorMalformedSerializedFileHeader, // +targetPlatform:forBundleAtPath:error: couldn't walk the primary node's SerializedFile header far enough to reach m_TargetPlatform
 };
 
 // One directory-table entry, WITH its offset/size (not just its name -
@@ -122,6 +123,18 @@ typedef NS_ENUM(NSInteger, UnityBundleCABErrorCode) {
 @end
 
 @interface UnityBundleCAB : NSObject
+
+// Cheap content-based identity check: does this file actually start with
+// the 8-byte "UnityFS\0" signature every UnityFS asset bundle has at the
+// very top of its header? Reads only those 8 bytes - no blocks-info
+// decompression, no CAB resolution, and no dependency on the file's name
+// or extension. This is the right check for "is this file an asset
+// bundle at all" (a file's name is user-controlled and easily wrong -
+// see ModAssetLibrary.m's importer and GraphicsDebugOverlay.m's Load
+// Mods picker handler, both of which classify by this instead of by
+// name); once a file has passed this check and its own CAB id is
+// actually needed, use +primaryCABForBundleAtPath:error: separately.
++ (BOOL)isUnityFSBundleAtPath:(NSString *)path;
 
 // Returns the UnityFS archive-wide compression type from the header:
 // 0 = none, 2 = LZ4, 3 = LZ4HC. This only reads the small header and
@@ -202,6 +215,47 @@ typedef NS_ENUM(NSInteger, UnityBundleCABErrorCode) {
 // primary name above, not this list, since only index 0 is the archive's
 // own identity.
 + (nullable NSArray<NSString *> *)allNodePathsForBundleAtPath:(NSString *)path error:(NSError **)error;
+
+// The Unity BuildTarget integer (e.g. 19 for StandaloneWindows64, 9 for
+// iOS) stored in the bundle's own primary SerializedFile header -
+// node[0], the same node +primaryCABForBundleAtPath:error: names (see
+// this header's top comment on why node[0] specifically is the
+// archive's own identity, not just any CAB string found in it).
+//
+// FORMAT (SerializedFile header, walked just far enough to reach
+// m_TargetPlatform - see AssetStudio/UnityPy's public documentation of
+// this format for independent confirmation of this layout, same as the
+// UnityFS layout note above):
+//   uint32 BE    m_MetadataSize
+//   uint32 BE    m_FileSize
+//   uint32 BE    m_Version
+//   uint32 BE    m_DataOffset
+//   uint8        m_Endianess           (only present, version >= 9)
+//   uint8[3]     m_Reserved            (only present, version >= 9)
+//   [version >= 22: m_MetadataSize re-read as uint32 BE, then m_FileSize/
+//    m_DataOffset/an unknown field re-read as int64 BE in place of the
+//    32-bit ones above - a wider header some newer Editor versions use]
+//   -- everything from here on is encoded per m_Endianess, NOT the
+//      header's own fixed big-endian --
+//   cstring      unityVersion          (only present, version >= 7)
+//   int32        m_TargetPlatform      (only present, version >= 8 -
+//                                        this is the value returned)
+//
+// Requires fully decompressing the archive (unlike
+// +primaryCABForBundleAtPath:error:, which only needs the much smaller
+// blocks-info blob) since the SerializedFile header lives in the
+// bundle's compressed DATA blocks - see +decompressedArchiveAtPath:
+// error:'s own MEMORY note for why this is still disk-backed rather
+// than a full in-RAM copy.
++ (BOOL)targetPlatform:(int32_t *)outPlatform forBundleAtPath:(NSString *)path error:(NSError **)error;
+
+// Best-effort human-readable name for a Unity BuildTarget integer, e.g.
+// 19 -> @"StandaloneWindows64". This project's lookup table only covers
+// the more common values; anything not in it comes back as @"Unknown" -
+// callers pair this with the raw integer in their own display (e.g.
+// "StandaloneWindows64(19)") so an unrecognized platform is never
+// presented as if it silently didn't have one.
++ (NSString *)nameForTargetPlatform:(int32_t)platform;
 
 @end
 
