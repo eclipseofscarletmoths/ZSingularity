@@ -2363,6 +2363,26 @@ static UIImage *gd_make_dropdown_chevron_image(void) {
 // gd_configure_glass_button_fixed_corner_radius's own header comment
 // warns resets an unprotected corner style back to the capsule default.
 static void gd_apply_reencode_format_selection(UIButton *button, NSString *format, void (^onSelect)(NSString *format)) {
+    // Root cause of the vanishing dropdown: UIButton's own
+    // -updateConfiguration pass runs automatically on every state change
+    // (touch-down => highlighted) whenever the button has a non-nil
+    // .configuration, REGARDLESS of whether a call site installs its own
+    // configurationUpdateHandler - that part of the "Verify button" theory
+    // in this function's header comment is wrong, it's not opt-in. That
+    // automatic pass rebuilds this button's UIButtonConfiguration-owned
+    // subviews on the same touch-down that showsMenuAsPrimaryAction uses to
+    // kick off the menu presentation, tearing the pending presentation down
+    // before it appears - the touch itself still lands (hence "interactable,
+    // but nothing opens"). automaticallyUpdatesConfiguration = NO is the
+    // documented opt-out for exactly this: it stops UIKit from touching
+    // .configuration on state changes at all, so the menu's own touch-down
+    // handling is never raced by a system-driven rebuild. Safe to set on
+    // every call here (idempotent) since this function is the single place
+    // that owns this button's full setup/refresh.
+    if ([button respondsToSelector:@selector(setAutomaticallyUpdatesConfiguration:)]) {
+        button.automaticallyUpdatesConfiguration = NO;
+    }
+
     // Explicit white (not nil) so this matches every other glass field's
     // plain white text on pre-iOS-26 too - gd_style_button_as_native_glass's
     // own fallback only sets a titleColor when it's given a non-nil tint,
@@ -2406,32 +2426,28 @@ static void gd_apply_reencode_format_selection(UIButton *button, NSString *forma
         button.clipsToBounds = YES;
     }
 
-    // NOT doing the Verify button's defensive configurationUpdateHandler
-    // reassertion here (see gd_style_auth_verify_button) - this button
-    // gave itself away as "tappable but the menu never opens", and that
-    // handler is why. showsMenuAsPrimaryAction presents its UIMenu off
-    // the same touch-down that also fires a configuration-update pass
-    // for the highlight state; a handler that turns around and calls
-    // -setConfiguration: on the button *during* that pass tears down and
-    // rebuilds the button's internal configuration-driven subviews
-    // mid-gesture, which cancels the pending menu presentation before it
-    // ever appears - the tap still registers (the button visibly
-    // highlights), there's just no dropdown left to show by the time the
-    // rebuild finishes. The Verify button doesn't have this problem
-    // because it isn't a menu button; it can afford to rebuild its
-    // configuration on every touch.
-    // It also isn't needed here the way it was for Verify: Verify's
-    // handler exists because gd_style_auth_verify_button swaps in an
-    // entirely fresh glassButtonConfiguration on every restyle (title
-    // change), which resets cornerStyle back to the capsule default each
-    // time. This button never does that after its initial build - the
-    // cornerStyle/background.cornerRadius set via
-    // gd_configure_glass_button_fixed_corner_radius just above are
-    // mutations of the button's existing configuration object, and
-    // UIKit's own automatic per-state configuration updates (the ones
-    // that would otherwise fire this handler) only touch background/
-    // foreground tint, not cornerStyle - so the corner radius already
-    // survives every tap without reasserting it.
+    // CORRECTION (this is what was actually wrong - see the previous "NOT
+    // doing the Verify button's defensive configurationUpdateHandler..."
+    // reasoning this replaced): the earlier theory was that the vanishing
+    // menu was caused by a call site's OWN configurationUpdateHandler
+    // rebuilding .configuration mid-touch, and that this button was safe
+    // because it never installed one. That's backwards - UIKit runs
+    // -updateConfiguration automatically on every UIControlState change
+    // (touch-down => highlighted) for ANY button with a non-nil
+    // .configuration, whether or not the call site ever hooks
+    // configurationUpdateHandler itself. That automatic pass is exactly
+    // what was tearing down this button's configuration-driven subviews on
+    // the same touch-down showsMenuAsPrimaryAction uses to start presenting
+    // the menu, cancelling the presentation before it ever appeared - the
+    // tap still registered (the button visibly highlighted), there was just
+    // no dropdown left to show by the time the rebuild finished. Fixed at
+    // the top of this function with automaticallyUpdatesConfiguration = NO,
+    // which stops UIKit from touching .configuration on state changes at
+    // all, so nothing races the menu's own touch handling anymore. Corner
+    // radius surviving every tap (see gd_configure_glass_button_fixed_corner_radius
+    // above) was never actually evidence the automatic pass was harmless -
+    // it only shows the automatic pass doesn't touch cornerStyle, not that
+    // it doesn't touch anything.
     button.menu = gd_build_reencode_format_menu(format, onSelect);
     button.showsMenuAsPrimaryAction = YES; // tap opens the menu directly - no long-press/context-menu gesture needed
 }
