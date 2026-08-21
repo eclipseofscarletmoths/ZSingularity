@@ -104,58 +104,23 @@ static NSData *bds_prepareBundleDataForUpload(NSData *data, NSError **error) {
     return compressed;
 }
 
-// Mirror of bds_prepareBundleDataForUpload, on the way back down: the
-// workflow's own output (AssetsTools.NET re-encoding) can hand back a
-// bundle using any of Unity's compression types, and confirmed on-device
-// testing found compressed doctored bundles fail to load in-game - so
-// unlike the upload side (transport-only, reversible, doesn't touch
-// what's actually loaded), this is NOT optional/toggleable and always
-// runs on every doctored bundle before BundleDoctorInstaller ever sees
-// it. Rewrites `path` in place as an uncompressed UnityFS archive via
-// UnityBundleCAB's own decompress/rewrite pair - same disk-backed,
-// one-block-at-a-time approach +decompressedArchiveAtPath:error: already
-// uses (see that method's MEMORY note), so this doesn't hold the whole
-// bundle in RAM even for a large Texture2D-heavy bundle. A bundle
-// already uncompressed (type 0) is left untouched - both the read and
-// the rewrite are skipped entirely, not just made into a no-op copy.
-// Failure here is treated as fatal to the whole fetch (returns NO) rather
-// than falling back to installing the still-compressed bytes, since that
-// fallback is exactly the broken state this exists to prevent.
-static BOOL bds_decompressDoctoredBundleAtPath(NSString *path, NSError **error) {
-    NSError *typeError = nil;
-    uint8_t type = [UnityBundleCAB compressionTypeForBundleAtPath:path error:&typeError];
-    if (typeError) {
-        if (error) *error = typeError;
-        return NO;
-    }
-
-    if (type == 0) {
-        ZLog(@"[BundleDoctorService] doctored bundle already uncompressed - nothing to decompress");
-        return YES;
-    }
-
-    ZLog(@"[BundleDoctorService] doctored bundle is %@ - decompressing before install…", bds_compressionLabel(type));
-
-    NSError *decompressError = nil;
-    UnityBundleArchive *archive = [UnityBundleCAB decompressedArchiveAtPath:path error:&decompressError];
-    if (!archive) {
-        if (error) *error = decompressError ?: [NSError errorWithDomain:BundleDoctorServiceErrorDomain
-                                                                       code:BundleDoctorServiceErrorRequestFailed
-                                                                   userInfo:@{NSLocalizedDescriptionKey: @"Couldn't decompress the doctored bundle."}];
-        return NO;
-    }
-
-    NSError *writeError = nil;
-    if (![UnityBundleCAB writeArchive:archive toPath:path error:&writeError]) {
-        if (error) *error = writeError ?: [NSError errorWithDomain:BundleDoctorServiceErrorDomain
-                                                                  code:BundleDoctorServiceErrorRequestFailed
-                                                              userInfo:@{NSLocalizedDescriptionKey: @"Couldn't write the decompressed bundle back out."}];
-        return NO;
-    }
-
-    ZLog(@"[BundleDoctorService] doctored bundle decompressed and rewritten uncompressed at %@", path);
-    return YES;
-}
+// Post-download decompression used to be mandatory here: the re-encoder
+// workflow's compressed output was being produced with a broken LZ4HC
+// encode (see UnityBundleCAB.m's write-side flags fix), and on top of
+// that this step's own "always realign 16 bytes" read logic could
+// mis-decompress bundles that didn't actually need it - so this was
+// masking one bug by risking a second one, and the on-device "compressed
+// doctored bundles fail to load" testing that justified making it
+// mandatory was almost certainly observing fallout from the encode bug,
+// not anything about compression itself. Now that the doctor-bundle
+// workflow emits genuine standard LZ4 (see BundleDoctor/
+// UnityFsLz4Packer.cs) instead of LZ4HC, Limbus Company's own Unity
+// runtime decompresses that at load time the same as it does for every
+// other LZ4 bundle Unity ships - there's nothing left for this tweak to
+// do to the bytes before handing them to BundleDoctorInstaller. Removed
+// rather than left as a disabled no-op, since a step that silently
+// mangled bundles once is not something to leave lying around for a
+// future regression to quietly re-enable.
 
 #pragma mark - BundleDoctorConfig
 
@@ -396,13 +361,6 @@ totalBytesExpectedToSend:(int64_t)totalBytesExpectedToSend {
 
         ZLog(@"[BundleDoctorService] doctored bundle ready at %@ (%lu bytes)",
               tempURL.path, (unsigned long)doctoredData.length);
-
-        NSError *decompressError = nil;
-        if (!bds_decompressDoctoredBundleAtPath(tempURL.path, &decompressError)) {
-            [NSFileManager.defaultManager removeItemAtPath:tempURL.path error:nil];
-            finish(nil, decompressError);
-            return;
-        }
 
         finish(tempURL, nil);
     });
@@ -661,13 +619,6 @@ totalBytesExpectedToSend:(int64_t)totalBytesExpectedToSend {
         }
 
         ZLog(@"[BundleDoctorService] doctored bundle ready at %@ (%lu bytes)", tempURL.path, (unsigned long)doctoredData.length);
-
-        NSError *decompressError = nil;
-        if (!bds_decompressDoctoredBundleAtPath(tempURL.path, &decompressError)) {
-            [NSFileManager.defaultManager removeItemAtPath:tempURL.path error:nil];
-            finish(nil, decompressError);
-            return;
-        }
 
         finish(tempURL, nil);
     });
