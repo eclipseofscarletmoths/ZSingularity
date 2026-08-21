@@ -62,7 +62,13 @@
 //      artifact. (An artifact would need this class to parse a zip
 //      container on-device with no library for that on hand; a second
 //      release asset is one more authenticated GET with nothing new to
-//      implement.)
+//      implement.) Before this class ever hands the downloaded bundle
+//      back to a caller, it's unconditionally decompressed in place to
+//      plain UnityFS (no LZ4/LZ4HC/LZMA framing) via UnityBundleCAB -
+//      confirmed on-device that a compressed doctored bundle fails to
+//      load once swapped in, so this step isn't gated behind any
+//      Config switch the way the upload-side LZ4HC recompression is.
+//      An already-uncompressed doctored bundle is left untouched.
 //   7. Deletes the release and its underlying tag ref, then the scratch
 //      branch (all best-effort - a failure here is logged, not
 //      surfaced to the caller, since the doctored bundle has already

@@ -104,6 +104,59 @@ static NSData *bds_prepareBundleDataForUpload(NSData *data, NSError **error) {
     return compressed;
 }
 
+// Mirror of bds_prepareBundleDataForUpload, on the way back down: the
+// workflow's own output (AssetsTools.NET re-encoding) can hand back a
+// bundle using any of Unity's compression types, and confirmed on-device
+// testing found compressed doctored bundles fail to load in-game - so
+// unlike the upload side (transport-only, reversible, doesn't touch
+// what's actually loaded), this is NOT optional/toggleable and always
+// runs on every doctored bundle before BundleDoctorInstaller ever sees
+// it. Rewrites `path` in place as an uncompressed UnityFS archive via
+// UnityBundleCAB's own decompress/rewrite pair - same disk-backed,
+// one-block-at-a-time approach +decompressedArchiveAtPath:error: already
+// uses (see that method's MEMORY note), so this doesn't hold the whole
+// bundle in RAM even for a large Texture2D-heavy bundle. A bundle
+// already uncompressed (type 0) is left untouched - both the read and
+// the rewrite are skipped entirely, not just made into a no-op copy.
+// Failure here is treated as fatal to the whole fetch (returns NO) rather
+// than falling back to installing the still-compressed bytes, since that
+// fallback is exactly the broken state this exists to prevent.
+static BOOL bds_decompressDoctoredBundleAtPath(NSString *path, NSError **error) {
+    NSError *typeError = nil;
+    uint8_t type = [UnityBundleCAB compressionTypeForBundleAtPath:path error:&typeError];
+    if (typeError) {
+        if (error) *error = typeError;
+        return NO;
+    }
+
+    if (type == 0) {
+        ZLog(@"[BundleDoctorService] doctored bundle already uncompressed - nothing to decompress");
+        return YES;
+    }
+
+    ZLog(@"[BundleDoctorService] doctored bundle is %@ - decompressing before install…", bds_compressionLabel(type));
+
+    NSError *decompressError = nil;
+    UnityBundleArchive *archive = [UnityBundleCAB decompressedArchiveAtPath:path error:&decompressError];
+    if (!archive) {
+        if (error) *error = decompressError ?: [NSError errorWithDomain:BundleDoctorServiceErrorDomain
+                                                                       code:BundleDoctorServiceErrorRequestFailed
+                                                                   userInfo:@{NSLocalizedDescriptionKey: @"Couldn't decompress the doctored bundle."}];
+        return NO;
+    }
+
+    NSError *writeError = nil;
+    if (![UnityBundleCAB writeArchive:archive toPath:path error:&writeError]) {
+        if (error) *error = writeError ?: [NSError errorWithDomain:BundleDoctorServiceErrorDomain
+                                                                  code:BundleDoctorServiceErrorRequestFailed
+                                                              userInfo:@{NSLocalizedDescriptionKey: @"Couldn't write the decompressed bundle back out."}];
+        return NO;
+    }
+
+    ZLog(@"[BundleDoctorService] doctored bundle decompressed and rewritten uncompressed at %@", path);
+    return YES;
+}
+
 #pragma mark - BundleDoctorConfig
 
 @implementation BundleDoctorConfig
@@ -343,6 +396,14 @@ totalBytesExpectedToSend:(int64_t)totalBytesExpectedToSend {
 
         ZLog(@"[BundleDoctorService] doctored bundle ready at %@ (%lu bytes)",
               tempURL.path, (unsigned long)doctoredData.length);
+
+        NSError *decompressError = nil;
+        if (!bds_decompressDoctoredBundleAtPath(tempURL.path, &decompressError)) {
+            [NSFileManager.defaultManager removeItemAtPath:tempURL.path error:nil];
+            finish(nil, decompressError);
+            return;
+        }
+
         finish(tempURL, nil);
     });
 }
@@ -600,6 +661,14 @@ totalBytesExpectedToSend:(int64_t)totalBytesExpectedToSend {
         }
 
         ZLog(@"[BundleDoctorService] doctored bundle ready at %@ (%lu bytes)", tempURL.path, (unsigned long)doctoredData.length);
+
+        NSError *decompressError = nil;
+        if (!bds_decompressDoctoredBundleAtPath(tempURL.path, &decompressError)) {
+            [NSFileManager.defaultManager removeItemAtPath:tempURL.path error:nil];
+            finish(nil, decompressError);
+            return;
+        }
+
         finish(tempURL, nil);
     });
 }
