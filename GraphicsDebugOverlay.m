@@ -2363,26 +2363,6 @@ static UIImage *gd_make_dropdown_chevron_image(void) {
 // gd_configure_glass_button_fixed_corner_radius's own header comment
 // warns resets an unprotected corner style back to the capsule default.
 static void gd_apply_reencode_format_selection(UIButton *button, NSString *format, void (^onSelect)(NSString *format)) {
-    // Root cause of the vanishing dropdown: UIButton's own
-    // -updateConfiguration pass runs automatically on every state change
-    // (touch-down => highlighted) whenever the button has a non-nil
-    // .configuration, REGARDLESS of whether a call site installs its own
-    // configurationUpdateHandler - that part of the "Verify button" theory
-    // in this function's header comment is wrong, it's not opt-in. That
-    // automatic pass rebuilds this button's UIButtonConfiguration-owned
-    // subviews on the same touch-down that showsMenuAsPrimaryAction uses to
-    // kick off the menu presentation, tearing the pending presentation down
-    // before it appears - the touch itself still lands (hence "interactable,
-    // but nothing opens"). automaticallyUpdatesConfiguration = NO is the
-    // documented opt-out for exactly this: it stops UIKit from touching
-    // .configuration on state changes at all, so the menu's own touch-down
-    // handling is never raced by a system-driven rebuild. Safe to set on
-    // every call here (idempotent) since this function is the single place
-    // that owns this button's full setup/refresh.
-    if ([button respondsToSelector:@selector(setAutomaticallyUpdatesConfiguration:)]) {
-        button.automaticallyUpdatesConfiguration = NO;
-    }
-
     // Explicit white (not nil) so this matches every other glass field's
     // plain white text on pre-iOS-26 too - gd_style_button_as_native_glass's
     // own fallback only sets a titleColor when it's given a non-nil tint,
@@ -2426,31 +2406,47 @@ static void gd_apply_reencode_format_selection(UIButton *button, NSString *forma
         button.clipsToBounds = YES;
     }
 
-    // CORRECTION (this is what was actually wrong - see the previous "NOT
-    // doing the Verify button's defensive configurationUpdateHandler..."
-    // reasoning this replaced): the earlier theory was that the vanishing
-    // menu was caused by a call site's OWN configurationUpdateHandler
-    // rebuilding .configuration mid-touch, and that this button was safe
-    // because it never installed one. That's backwards - UIKit runs
-    // -updateConfiguration automatically on every UIControlState change
-    // (touch-down => highlighted) for ANY button with a non-nil
-    // .configuration, whether or not the call site ever hooks
-    // configurationUpdateHandler itself. That automatic pass is exactly
-    // what was tearing down this button's configuration-driven subviews on
-    // the same touch-down showsMenuAsPrimaryAction uses to start presenting
-    // the menu, cancelling the presentation before it ever appeared - the
-    // tap still registered (the button visibly highlighted), there was just
-    // no dropdown left to show by the time the rebuild finished. Fixed at
-    // the top of this function with automaticallyUpdatesConfiguration = NO,
-    // which stops UIKit from touching .configuration on state changes at
-    // all, so nothing races the menu's own touch handling anymore. Corner
-    // radius surviving every tap (see gd_configure_glass_button_fixed_corner_radius
-    // above) was never actually evidence the automatic pass was harmless -
-    // it only shows the automatic pass doesn't touch cornerStyle, not that
-    // it doesn't touch anything.
+    // NOT doing the Verify button's defensive configurationUpdateHandler
+    // reassertion here (see gd_style_auth_verify_button) - this button
+    // gave itself away as "tappable but the menu never opens", and that
+    // handler is why. showsMenuAsPrimaryAction presents its UIMenu off
+    // the same touch-down that also fires a configuration-update pass
+    // for the highlight state; a handler that turns around and calls
+    // -setConfiguration: on the button *during* that pass tears down and
+    // rebuilds the button's internal configuration-driven subviews
+    // mid-gesture, which cancels the pending menu presentation before it
+    // ever appears - the tap still registers (the button visibly
+    // highlights), there's just no dropdown left to show by the time the
+    // rebuild finishes. The Verify button doesn't have this problem
+    // because it isn't a menu button; it can afford to rebuild its
+    // configuration on every touch.
+    // It also isn't needed here the way it was for Verify: Verify's
+    // handler exists because gd_style_auth_verify_button swaps in an
+    // entirely fresh glassButtonConfiguration on every restyle (title
+    // change), which resets cornerStyle back to the capsule default each
+    // time. This button never does that after its initial build - the
+    // cornerStyle/background.cornerRadius set via
+    // gd_configure_glass_button_fixed_corner_radius just above are
+    // mutations of the button's existing configuration object, and
+    // UIKit's own automatic per-state configuration updates (the ones
+    // that would otherwise fire this handler) only touch background/
+    // foreground tint, not cornerStyle - so the corner radius already
+    // survives every tap without reasserting it.
     button.menu = gd_build_reencode_format_menu(format, onSelect);
     button.showsMenuAsPrimaryAction = YES; // tap opens the menu directly - no long-press/context-menu gesture needed
 }
+
+// Third pass, after the above still didn't fix it: the button itself was
+// never the problem a second time. panelGlass (this button's ancestor -
+// see -buildPanel:) was built with a real interactive UIGlassEffect
+// (glow/bounce touch response) sitting directly in the touch path of
+// every row in the panel, including this button's own
+// UIContextMenuInteraction - it was winning the touch before the menu
+// interaction could present anything, same "highlights, no dropdown"
+// symptom as the second pass above for an unrelated reason. Fixed at the
+// source (panelGlass built with interactive:NO now) rather than here,
+// since nothing about this button's own menu/button setup was ever
+// actually wrong.
 
 // Compact single-line row: title | a real native Liquid Glass button
 // (gd_style_button_as_native_glass) showing the current re-encode format
@@ -3927,12 +3923,35 @@ static const CGFloat kContentFadeHeight = 22;
     if (gd_has_liquid_glass()) {
         // Main panel: all four corners are rounded. UIKit resolves the
         // concentric radius from this glass element's container geometry.
-        // interactive:YES is what turns on the system's built-in touch
-        // response for a raw UIGlassEffect surface (the glow/bounce/stretch
-        // as you touch and drag it) - it was off for every dock element
-        // except the slider pills, which is why the panel/tab/log button
-        // felt static compared to the rest of Liquid Glass.
-        self.panelGlass = [[UIVisualEffectView alloc] initWithEffect:gd_make_glass_effect(YES)];
+        //
+        // interactive:NO here, deliberately - this used to be YES (the
+        // system's built-in touch response for a raw UIGlassEffect
+        // surface: glow/bounce/stretch as you touch and drag it), turned
+        // on so the panel background didn't feel static next to the
+        // slider pills. That's the same class of bug the Re-Encoding
+        // format button's own header comment (see "Re-Encoding format
+        // (Config section)" pragma mark above) walks through two failed
+        // passes of: a tap that visibly registers (the button highlights)
+        // but never actually presents its UIMenu. That comment's fix
+        // covers the button's own configuration-rebuild-mid-touch cause;
+        // this is a second, independent cause of the identical symptom -
+        // interactive:YES installs UIKit's own touch-tracking directly on
+        // this view for the glow/bounce material response, and unlike
+        // trackGlass/capsuleGlass (real interactive glass scoped to a
+        // single control that IS the whole tappable shape), panelGlass is
+        // the ancestor `contentView` for every row in the entire scroll
+        // stack - so its own touch-tracking sits directly in the path of
+        // every descendant control's touches, including the
+        // UIContextMenuInteraction a menu button's showsMenuAsPrimaryAction
+        // needs to win uncontested to present anything. Plain
+        // touchUpInside buttons elsewhere in the panel mostly get away
+        // with it - simple button tracking doesn't need that same
+        // uncontested win the same way. Turning this off costs the panel
+        // background's own glow/bounce when you touch empty space in it;
+        // none of this panel's actual gestures (close-swipe on
+        // contentOverlay, handle tap) depend on it - those are our own
+        // explicit gesture recognizers, separate from this flag.
+        self.panelGlass = [[UIVisualEffectView alloc] initWithEffect:gd_make_glass_effect(NO)];
         self.panelGlass.userInteractionEnabled = YES;
         gd_configure_glass_corners(self.panelGlass, kPanelCornerRadiusMinimum, YES);
         [self.glassContainerContent addSubview:self.panelGlass];
