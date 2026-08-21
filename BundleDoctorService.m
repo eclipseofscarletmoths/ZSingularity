@@ -111,47 +111,6 @@ static NSData *bds_prepareBundleDataForUpload(NSData *data, NSError **error) {
     return compressed;
 }
 
-// Best-effort lookup of the untouched, correctly-platformed counterpart to
-// moddedBundlePath, for BundleDoctor's shader-restore pass (see
-// Program.cs's --original). Uses the same CAB the modded bundle already
-// carries in its own directory table - editing a Texture2D/re-saving the
-// bundle doesn't change that name - to find the matching stock bundle
-// already sitting in this app's own UnityCache (see UnityCacheLocator.h).
-//
-// Deliberately returns nil rather than an NSError on every failure mode
-// here (unreadable CAB, no UnityCache directory, no match): none of these
-// are failures of the dispatch itself, they just mean this particular
-// submission proceeds without a shader-restore pass, exactly as if
-// --original were never given. Only an actual read failure on a
-// successfully-resolved path is logged any differently.
-+ (nullable NSData *)bds_findOriginalBundleDataForModdedBundleAtPath:(NSString *)moddedBundlePath {
-    NSError *cabError = nil;
-    NSString *cab = [UnityCacheLocator cabForBundleAtPath:moddedBundlePath error:&cabError];
-    if (!cab) {
-        ZLog(@"[BundleDoctorService] shader-restore: couldn't read a CAB off the modded bundle (%@) - skipping.", cabError.localizedDescription);
-        return nil;
-    }
-
-    NSError *locateError = nil;
-    NSString *originalPath = [UnityCacheLocator locateBundlePathForCAB:cab error:&locateError];
-    if (!originalPath) {
-        ZLog(@"[BundleDoctorService] shader-restore: no cached original found for CAB %@ (%@) - skipping.", cab, locateError.localizedDescription);
-        return nil;
-    }
-
-    NSError *readError = nil;
-    NSData *originalData = [NSData dataWithContentsOfFile:originalPath options:0 error:&readError];
-    if (!originalData) {
-        // This one IS worth calling out distinctly - we resolved a path but
-        // then couldn't read it (permissions, file vanished mid-read, etc.).
-        ZLog(@"[BundleDoctorService] shader-restore: resolved original at %@ but couldn't read it (%@) - skipping.", originalPath, readError.localizedDescription);
-        return nil;
-    }
-
-    ZLog(@"[BundleDoctorService] shader-restore: matched CAB %@ -> %@ (%lu bytes).", cab, originalPath, (unsigned long)originalData.length);
-    return originalData;
-}
-
 // Post-download decompression used to be mandatory here: the re-encoder
 // workflow's compressed output was being produced with a broken LZ4HC
 // encode (see UnityBundleCAB.m's write-side flags fix), and on top of
@@ -415,6 +374,47 @@ totalBytesExpectedToSend:(int64_t)totalBytesExpectedToSend {
 }
 
 #pragma mark - Decoupled phase API (see this file's header)
+
+// Best-effort lookup of the untouched, correctly-platformed counterpart to
+// moddedBundlePath, for BundleDoctor's shader-restore pass (see
+// Program.cs's --original). Uses the same CAB the modded bundle already
+// carries in its own directory table - editing a Texture2D/re-saving the
+// bundle doesn't change that name - to find the matching stock bundle
+// already sitting in this app's own UnityCache (see UnityCacheLocator.h).
+//
+// Deliberately returns nil rather than an NSError on every failure mode
+// here (unreadable CAB, no UnityCache directory, no match): none of these
+// are failures of the dispatch itself, they just mean this particular
+// submission proceeds without a shader-restore pass, exactly as if
+// --original were never given. Only an actual read failure on a
+// successfully-resolved path is logged any differently.
++ (nullable NSData *)bds_findOriginalBundleDataForModdedBundleAtPath:(NSString *)moddedBundlePath {
+    NSError *cabError = nil;
+    NSString *cab = [UnityCacheLocator cabForBundleAtPath:moddedBundlePath error:&cabError];
+    if (!cab) {
+        ZLog(@"[BundleDoctorService] shader-restore: couldn't read a CAB off the modded bundle (%@) - skipping.", cabError.localizedDescription);
+        return nil;
+    }
+
+    NSError *locateError = nil;
+    NSString *originalPath = [UnityCacheLocator locateBundlePathForCAB:cab error:&locateError];
+    if (!originalPath) {
+        ZLog(@"[BundleDoctorService] shader-restore: no cached original found for CAB %@ (%@) - skipping.", cab, locateError.localizedDescription);
+        return nil;
+    }
+
+    NSError *readError = nil;
+    NSData *originalData = [NSData dataWithContentsOfFile:originalPath options:0 error:&readError];
+    if (!originalData) {
+        // This one IS worth calling out distinctly - we resolved a path but
+        // then couldn't read it (permissions, file vanished mid-read, etc.).
+        ZLog(@"[BundleDoctorService] shader-restore: resolved original at %@ but couldn't read it (%@) - skipping.", originalPath, readError.localizedDescription);
+        return nil;
+    }
+
+    ZLog(@"[BundleDoctorService] shader-restore: matched CAB %@ -> %@ (%lu bytes).", cab, originalPath, (unsigned long)originalData.length);
+    return originalData;
+}
 
 + (void)dispatchBundleAtURL:(NSURL *)moddedBundleURL
                        config:(BundleDoctorConfig *)rawConfig
