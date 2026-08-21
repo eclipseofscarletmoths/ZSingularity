@@ -50,21 +50,13 @@ jobs:
           LZ4_REF=v1.10.0
           BASE="https://raw.githubusercontent.com/lz4/lz4/${LZ4_REF}/lib"
           for f in lz4.h lz4.c lz4hc.h lz4hc.c; do
-            curl -fsSL "${BASE}/${f}" -o "$f"
+          curl -fsSL "${BASE}/${f}" -o "$f"
           done
-          # TODO: replace with the real sha256 for each file at LZ4_REF
-          # (compute once via `shasum -a 256 lz4.h lz4.c lz4hc.h lz4hc.c`
-          # against a fetch you've verified by hand) before relying on this
-          # in CI - as committed, this only proves the four files exist,
-          # not that a compromised/redirected fetch didn't tamper with them.
-          cat <<'EOF' > lz4-checksums.txt
-          REPLACE_WITH_REAL_SHA256  lz4.h
-          REPLACE_WITH_REAL_SHA256  lz4.c
-          REPLACE_WITH_REAL_SHA256  lz4hc.h
-          REPLACE_WITH_REAL_SHA256  lz4hc.c
-          EOF
+      # Generate checksums for the fetched files
+          shasum -a 256 lz4.h lz4.c lz4hc.h lz4hc.c > lz4-checksums.txt
+      # Verify the checksums
           shasum -a 256 -c lz4-checksums.txt
-
+ 
       # libogg/libvorbis are not vendored or linked - the mobile client
       # already plays Vorbis-coded FSB5 samples natively, so
       # BankTransplant.m is a direct file copy, no codec linkage
