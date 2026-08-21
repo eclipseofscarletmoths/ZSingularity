@@ -58,7 +58,7 @@ jobs:
           for f in lz4.h lz4.c lz4hc.h lz4hc.c; do
             curl -fsSL "${BASE}/${f}" -o "$f"
           done
-          shasum -a 256 1z4.h 1z4.c 1z4hc.h 1z4hc.c > 1z4-checksums.txt
+          shasum -a 256 lz4.h lz4.c lz4hc.h lz4hc.c > lz4-checksums.txt
           shasum -a 256 -c lz4-checksums.txt
 
       # libogg/libvorbis are not vendored or linked - the mobile client
