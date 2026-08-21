@@ -405,6 +405,70 @@ static void gd_configure_glass_corners(UIView *view, CGFloat radius, BOOL concen
                                            configuration);
 }
 
+// Reliable custom corner radius for a UIButtonConfiguration-driven glass
+// button (+[UIButtonConfiguration glassButtonConfiguration] and friends) -
+// see gd_style_auth_verify_button's header comment below for the full
+// postmortem of why gd_configure_glass_corners (the UIView.cornerConfiguration
+// API that works fine on every plain UIVisualEffectView glass surface in
+// this file) does NOT work here.
+//
+// Short version: a configuration-driven button's glass background is an
+// internal subview that UIButton rebuilds from its *configuration object's*
+// own -cornerStyle/-background.cornerRadius on every configuration-update
+// pass - not from the button view's own cornerConfiguration property, which
+// that subview never reads. So the fix has to mutate the configuration
+// itself, not the view:
+//   1. configuration.cornerStyle = Fixed (== 1) - the one corner style that
+//      takes its radius from -background.cornerRadius verbatim, instead of
+//      Capsule (glassButtonConfiguration's default), a system Large/Medium/
+//      Small constant, or Dynamic's type-size-scaled radius.
+//   2. configuration.background.cornerRadius = radius.
+//   3. Write the mutated configuration back via -setConfiguration: so
+//      UIButton actually picks up the change - configuration structs/objects
+//      obtained via the getter are not observed in place.
+// Because the radius now lives on the model object every rebuild reads
+// from (rather than a view-side property that rebuild never consults), it
+// survives taps/highlight/disabled and any other automatic
+// configurationUpdateHandler-driven pass without needing to be reasserted -
+// though call sites still hook configurationUpdateHandler to call this
+// again defensively, since "the button rebuilds its glass shape from
+// something other than the property we just set" is exactly the failure
+// mode this function exists to route around, and re-deriving from the
+// current configuration each time costs nothing.
+//
+// Resolved dynamically like the rest of this file's Liquid Glass API
+// surface (see gd_configure_glass_corners above) - harmless no-op via
+// respondsToSelector on anything pre-iOS-26 or if Apple ever renames this.
+static void gd_configure_glass_button_fixed_corner_radius(UIButton *button, CGFloat radius) {
+    if (!button) return;
+
+    SEL getConfiguration = NSSelectorFromString(@"configuration");
+    if (![button respondsToSelector:getConfiguration]) return;
+    id configuration = ((id (*)(id, SEL))objc_msgSend)(button, getConfiguration);
+    if (!configuration) return;
+
+    // UIButtonConfigurationCornerStyleFixed == 1 on the current UIKit ABI
+    // (Dynamic=0, Fixed=1, Capsule=2, Large=3, Medium=4, Small=5).
+    SEL setCornerStyle = NSSelectorFromString(@"setCornerStyle:");
+    if ([configuration respondsToSelector:setCornerStyle]) {
+        ((void (*)(id, SEL, NSInteger))objc_msgSend)(configuration, setCornerStyle, 1 /* Fixed */);
+    }
+
+    SEL getBackground = NSSelectorFromString(@"background");
+    if ([configuration respondsToSelector:getBackground]) {
+        id background = ((id (*)(id, SEL))objc_msgSend)(configuration, getBackground);
+        SEL setCornerRadius = NSSelectorFromString(@"setCornerRadius:");
+        if (background && [background respondsToSelector:setCornerRadius]) {
+            ((void (*)(id, SEL, CGFloat))objc_msgSend)(background, setCornerRadius, radius);
+        }
+    }
+
+    SEL setConfiguration = NSSelectorFromString(@"setConfiguration:");
+    if ([button respondsToSelector:setConfiguration]) {
+        ((void (*)(id, SEL, id))objc_msgSend)(button, setConfiguration, configuration);
+    }
+}
+
 // Native Liquid Glass BUTTON styling - distinct from the hand-rolled
 // UIGlassEffect/UIGlassContainerEffect compositing used for the dock/pills
 // above. iOS 26 gives UIButton a first-class glass look via
@@ -516,31 +580,37 @@ static const CGFloat kGDAuthFieldCornerRadius = 6;
 // never sets a cornerRadius at all (defaults to a plain square corner),
 // so the explicit 6pt there is just for consistency across OS versions
 // rather than fixing a visible mismatch.
-// THE PREVIOUS FIX, AND WHY IT STILL SHOWED A PILL: calling
-// gd_configure_glass_corners once right after gd_style_button_as_native_glass
-// (below) does briefly apply the 6pt radius, but +[UIButtonConfiguration
-// glassButtonConfiguration] defaults to a capsule corner style, and UIButton
-// re-derives its glass background subview's shape from the *configuration's*
-// own corner style every time it runs its configuration-update cycle - not
-// just the two times this file happens to call gd_style_auth_verify_button
-// (initial build, and the "Verifying…"/"Verify" swap). That cycle also runs
-// on ordinary UIButton state changes this file never touches directly -
-// touch-down highlight on every tap being the big one - so the button
-// visibly reverted to the pill the instant it was actually pressed, which
-// reads as "the fix failed" even though the radius genuinely was 6pt for
-// the split second right after each restyle call.
+// THE PREVIOUS FIX, AND WHY IT STILL SHOWED A PILL: the original attempt
+// called gd_configure_glass_corners on the button itself - the same
+// UICornerConfiguration/-setCornerConfiguration: call that reliably
+// squares off every plain UIVisualEffectView glass surface elsewhere in
+// this file (the dock, the pull tab, every gd_wrap_field_in_native_glass
+// field). That's a UIView-level property. But +[UIButtonConfiguration
+// glassButtonConfiguration]'s glass material is an internal subview that
+// UIButton rebuilds from its *configuration object's* own -cornerStyle
+// (Capsule by default) and, only when that's Fixed, -background.cornerRadius
+// - never from the button view's own cornerConfiguration, which that
+// subview simply doesn't consult. A follow-up attempt reasserted the same
+// button-level cornerConfiguration from configurationUpdateHandler (fired
+// after every configuration-driven rebuild - any state change included,
+// not just this file's two restyle call sites), which is the right hook
+// but the wrong property: it kept re-setting something the rebuild never
+// reads, so the button still snapped back to the capsule the instant it
+// was pressed. Both attempts were "reassert a corner radius after the
+// rebuild" - the actual bug was which corner radius.
 //
-// Fix: configurationUpdateHandler is UIKit's own documented hook for
-// exactly this - it fires after every configuration-driven rebuild
-// (any state change included), not just the ones this file initiates, so
-// re-asserting the radius there covers taps/highlight too instead of only
-// this function's two call sites. Resolved dynamically like the rest of
-// this file's iOS 26 API surface, since the build's deployment target
-// predates it; harmless no-op via respondsToSelector on anything older.
+// Fix: gd_configure_glass_button_fixed_corner_radius (above) mutates the
+// *configuration's* cornerStyle/background.cornerRadius instead, which is
+// what the rebuild actually reads, and writes it back via -setConfiguration:
+// so UIButton picks up the change. configurationUpdateHandler is kept as a
+// defensive re-assertion on top of that - now calling the corrected
+// function - since it costs nothing and this exact class of bug (assuming
+// a property is read that isn't) is the one that burned this control twice
+// already.
 static void gd_style_auth_verify_button(UIButton *button, NSString *title) {
     gd_style_button_as_native_glass(button, title, gd_accent_green_color());
     button.titleLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightSemibold];
-    gd_configure_glass_corners(button, kGDAuthFieldCornerRadius, NO);
+    gd_configure_glass_button_fixed_corner_radius(button, kGDAuthFieldCornerRadius);
     if (!gd_has_liquid_glass()) {
         button.layer.cornerRadius = kGDAuthFieldCornerRadius;
         button.clipsToBounds = YES;
@@ -549,7 +619,7 @@ static void gd_style_auth_verify_button(UIButton *button, NSString *title) {
     SEL setUpdateHandler = NSSelectorFromString(@"setConfigurationUpdateHandler:");
     if ([button respondsToSelector:setUpdateHandler]) {
         void (^reassertCorners)(__kindof UIButton *) = ^(__kindof UIButton *btn) {
-            gd_configure_glass_corners(btn, kGDAuthFieldCornerRadius, NO);
+            gd_configure_glass_button_fixed_corner_radius(btn, kGDAuthFieldCornerRadius);
         };
         ((void (*)(id, SEL, id))objc_msgSend)(button, setUpdateHandler, reassertCorners);
     }
@@ -2141,34 +2211,50 @@ static UIVisualEffectView *gd_wrap_field_in_native_glass(UITextField *field, CGF
 //
 // First pass at this used a single UIButton styled via
 // gd_style_button_as_native_glass (+[UIButtonConfiguration
-// glassButtonConfiguration]) sized to a fixed 58x28. That's the wrong
-// control for this: glassButtonConfiguration defaults to a CAPSULE
-// corner style (see gd_style_button_as_native_glass's own header
-// comment - every other capsule-defaulting glass button in this file
-// re-squares itself via gd_configure_glass_corners right after, which
+// glassButtonConfiguration]) sized to a fixed 58x28. That's not what
+// actually went wrong with it, in hindsight - the real fault was that
+// gd_style_button_as_native_glass's default capsule corner style was
+// never corrected (every other capsule-defaulting glass button in this
+// file re-squares itself via a corner-radius call right after, which
 // this one skipped), and its titleLabel didn't match the rest of the
 // panel's fields (monospaced/semibold/tinted vs. the Auth/Debug fields'
 // plain white system font) - together that's exactly "looks like a
-// circular blob, text doesn't match anything else". It's also just the
-// wrong widget family: `menu`/`showsMenuAsPrimaryAction` are real
-// UIButton APIs, but a UIButtonConfiguration-driven title can't be
-// independently right-aligned next to a trailing icon the way a
-// UITextField's text + rightView can - which is what the fix below
-// actually needs.
+// circular blob, text doesn't match anything else".
 //
-// Current approach: the visible surface is a real UITextField, wrapped
-// in the exact same gd_wrap_field_in_native_glass glass container the
-// Auth/Debug fields use (so it actually matches them - same corner
-// radius, same material, same font/color conventions), but with
-// userInteractionEnabled = NO so it never becomes first responder or
-// shows a keyboard - it is purely a label at that point, not a field
-// a person can type into, per request. The actual tap target is a
-// separate, fully transparent UIButtonTypeCustom sized and pinned
-// exactly over that same glass container - THAT button owns .menu /
-// .showsMenuAsPrimaryAction, so a tap anywhere on the field opens the
-// native pull-down. Two views instead of one because UITextField and
-// "has a working .menu" don't overlap in UIKit - a text field has no
-// such API, so something has to sit on top to catch the touch.
+// Second pass replaced the button entirely with a real (but inert,
+// userInteractionEnabled = NO) UITextField wrapped in the same
+// gd_wrap_field_in_native_glass glass container the Auth/Debug fields
+// use, plus a second, fully transparent UIButtonTypeCustom pinned
+// exactly over it to own .menu/.showsMenuAsPrimaryAction - reasoning
+// being that a UIButtonConfiguration-driven title can't be independently
+// left-aligned next to a trailing chevron the way a UITextField's text +
+// rightView can. That's true, but it bought that layout at the cost of
+// the actual ask (a real Liquid Glass BUTTON) and two views standing in
+// for one, and it's the same underlying capsule-corner problem wearing a
+// different hat: gd_wrap_field_in_native_glass's glass is a plain
+// UIVisualEffectView, which takes a custom corner radius fine, so it
+// never had to solve "give a UIButtonConfiguration glass button a
+// non-capsule corner" - it just avoided the button. See the "Verify"
+// button's own gd_configure_glass_button_fixed_corner_radius above for
+// why that call actually was solvable, and once it's solvable there's no
+// reason not to use the real control.
+//
+// Current approach: back to a single native glass UIButton
+// (gd_style_button_as_native_glass), owning .menu/.showsMenuAsPrimaryAction
+// itself - no second overlay view needed, since this is the actual tap
+// target now, not a decoration sitting under one. Corners are squared via
+// gd_configure_glass_button_fixed_corner_radius, the same reliable
+// mutate-the-configuration approach the Verify button uses. The
+// left-aligned-value / trailing-chevron layout the text-field approach
+// was chasing is approximated with contentHorizontalAlignment = .leading
+// and a trailing chevron image with a small imagePadding gap - the pair
+// reads as a left-anchored value with a small "opens a picker" affordance
+// right after it, rather than a value and chevron pulled to opposite
+// edges of the control (UIButtonConfiguration has no API for that split
+// layout - only UITextField's independent text + rightView slots do, and
+// that's not this control anymore). This is much closer to how UIKit's
+// own menu buttons look elsewhere in iOS 26 than the field-plus-overlay
+// hack was.
 
 // Canonical BundleDoctorConfig.outputFormat strings this picker offers -
 // exactly the five the doctor-bundle workflow's own `output_format`
@@ -2223,60 +2309,98 @@ static UIMenu *gd_build_reencode_format_menu(NSString *selectedFormat, void (^on
 }
 
 // Small chevron.up.chevron.down glyph (two vertically-stacked arrows,
-// one up/one down - the standard system "this reveals a picker" glyph)
-// used as the field's rightView, same slot gd_wrap_field_in_native_glass
-// gives its own leftView padding spacer. Deliberately dimmer than the
-// field's own white text (see gd_apply_reencode_format_selection below)
-// so it reads as a secondary affordance, not competing with the actual
-// value.
-//
-// Returns a wrapper view wider than the glyph itself, with the glyph
-// pinned to its LEADING edge - unlike leftView (which
-// gd_wrap_field_in_native_glass pads with its own spacer subview),
-// UITextField draws rightView flush against the field's own trailing
-// edge with no built-in margin, so the chevron was sitting right on
-// top of the glass container's rounded corner. The extra
-// kTrailingPadding of empty space after the glyph is what keeps it
-// clear of that edge.
-static UIView *gd_make_dropdown_indicator_view(void) {
+// one up/one down - the standard system "this reveals a picker" glyph),
+// baked as a template-rendered UIImage at the field's own dim tint
+// (rather than left to the button's baseForegroundColor) so it stays
+// visually secondary to the value text next to it regardless of what
+// tint the button itself is given. Used as the button's trailing
+// configuration.image - see gd_apply_reencode_format_selection below.
+static UIImage *gd_make_dropdown_chevron_image(void) {
     UIImageSymbolConfiguration *symbolConfig = [UIImageSymbolConfiguration configurationWithPointSize:10 weight:UIImageSymbolWeightSemibold];
     UIImage *chevronImage = [UIImage systemImageNamed:@"chevron.up.chevron.down" withConfiguration:symbolConfig];
-    UIImageView *imageView = [[UIImageView alloc] initWithImage:chevronImage];
-    imageView.tintColor = [UIColor colorWithWhite:1 alpha:0.55];
-    imageView.contentMode = UIViewContentModeCenter;
-
-    static const CGFloat kIconWidth = 22;
-    static const CGFloat kTrailingPadding = 8;
-    // Fixed frames (not Auto Layout) - this becomes a UITextField's
-    // rightView, which sizes/positions its accessory view off its own
-    // frame rather than constraints.
-    imageView.frame = CGRectMake(0, 0, kIconWidth, 20);
-
-    UIView *wrapper = [[UIView alloc] initWithFrame:CGRectMake(0, 0, kIconWidth + kTrailingPadding, 20)];
-    [wrapper addSubview:imageView];
-    return wrapper;
+    chevronImage = [chevronImage imageWithTintColor:[UIColor colorWithWhite:1 alpha:0.55]
+                                       renderingMode:UIImageRenderingModeAlwaysOriginal];
+    return chevronImage;
 }
 
-// (Re)applies the current selection to both halves of the control -
-// `field`'s text/right-aligned layout and `overlayButton`'s menu -
-// sharing this one place so the two can never drift out of sync with
-// each other. Used by gd_make_reencode_format_row (initial build) and
-// -gd_reencodeFormatSelected: (refresh after a tap).
-static void gd_apply_reencode_format_selection(UITextField *field, UIButton *overlayButton, NSString *format, void (^onSelect)(NSString *format)) {
-    field.text = gd_reencode_format_display_name(format);
-    overlayButton.menu = gd_build_reencode_format_menu(format, onSelect);
-    overlayButton.showsMenuAsPrimaryAction = YES; // tap opens the menu directly - no long-press/context-menu gesture needed
+// (Re)applies the current selection to the button - title text, trailing
+// chevron, and menu - sharing this one place so a fresh build
+// (gd_make_reencode_format_row) and a post-tap refresh
+// (-gd_reencodeFormatSelected:) can never drift out of sync with each
+// other. Corner radius is reapplied here too, defensively - setting a
+// fresh .configuration (which this does, via
+// gd_style_button_as_native_glass) is exactly the kind of rebuild
+// gd_configure_glass_button_fixed_corner_radius's own header comment
+// warns resets an unprotected corner style back to the capsule default.
+static void gd_apply_reencode_format_selection(UIButton *button, NSString *format, void (^onSelect)(NSString *format)) {
+    // Explicit white (not nil) so this matches every other glass field's
+    // plain white text on pre-iOS-26 too - gd_style_button_as_native_glass's
+    // own fallback only sets a titleColor when it's given a non-nil tint,
+    // and would otherwise leave UIButtonTypeSystem's default blue tint.
+    gd_style_button_as_native_glass(button, gd_reencode_format_display_name(format), UIColor.whiteColor);
+    button.titleLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightRegular];
+    button.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeading;
+
+    SEL getConfiguration = NSSelectorFromString(@"configuration");
+    if ([button respondsToSelector:getConfiguration]) {
+        id configuration = ((id (*)(id, SEL))objc_msgSend)(button, getConfiguration);
+        if (configuration) {
+            // Trailing chevron with a small, fixed gap to the title -
+            // the closest a single UIButtonConfiguration gets to the old
+            // text-field-plus-rightView look, see this pragma mark's own
+            // header comment for why an even leading-value/trailing-
+            // chevron-at-the-edge split isn't achievable with one button.
+            SEL setImage = NSSelectorFromString(@"setImage:");
+            if ([configuration respondsToSelector:setImage]) {
+                ((void (*)(id, SEL, id))objc_msgSend)(configuration, setImage, gd_make_dropdown_chevron_image());
+            }
+            SEL setImagePlacement = NSSelectorFromString(@"setImagePlacement:");
+            if ([configuration respondsToSelector:setImagePlacement]) {
+                // NSDirectionalRectEdge.trailing == 8 on the current ABI.
+                ((void (*)(id, SEL, NSUInteger))objc_msgSend)(configuration, setImagePlacement, 8 /* trailing */);
+            }
+            SEL setImagePadding = NSSelectorFromString(@"setImagePadding:");
+            if ([configuration respondsToSelector:setImagePadding]) {
+                ((void (*)(id, SEL, CGFloat))objc_msgSend)(configuration, setImagePadding, 6);
+            }
+            SEL setConfig = NSSelectorFromString(@"setConfiguration:");
+            if ([button respondsToSelector:setConfig]) {
+                ((void (*)(id, SEL, id))objc_msgSend)(button, setConfig, configuration);
+            }
+        }
+    }
+
+    gd_configure_glass_button_fixed_corner_radius(button, kGDAuthFieldCornerRadius);
+    if (!gd_has_liquid_glass()) {
+        button.layer.cornerRadius = kGDAuthFieldCornerRadius;
+        button.clipsToBounds = YES;
+    }
+
+    // Same defensive re-assertion the Verify button uses (see
+    // gd_style_auth_verify_button) - every tap runs a configuration-update
+    // pass for the highlight state, which is exactly the kind of rebuild
+    // that silently lost an unprotected corner radius before. Costs
+    // nothing to redo here even though the radius now lives on the
+    // configuration object itself rather than a view-side property.
+    SEL setUpdateHandler = NSSelectorFromString(@"setConfigurationUpdateHandler:");
+    if ([button respondsToSelector:setUpdateHandler]) {
+        void (^reassertCorners)(__kindof UIButton *) = ^(__kindof UIButton *btn) {
+            gd_configure_glass_button_fixed_corner_radius(btn, kGDAuthFieldCornerRadius);
+        };
+        ((void (*)(id, SEL, id))objc_msgSend)(button, setUpdateHandler, reassertCorners);
+    }
+
+    button.menu = gd_build_reencode_format_menu(format, onSelect);
+    button.showsMenuAsPrimaryAction = YES; // tap opens the menu directly - no long-press/context-menu gesture needed
 }
 
-// Compact single-line row: title | native Liquid Glass field (matching
-// the Auth/Debug section fields' own look exactly - see
-// gd_wrap_field_in_native_glass) showing the current re-encode format,
-// with a chevron.up.chevron.down indicator on its right and a
-// transparent tap target over the whole field that presents a native
-// pull-down menu (UIMenu) of every format the repo supports. The field
-// itself is inert (userInteractionEnabled = NO) - see this pragma
-// mark's own header comment above for why a text field, disabled,
-// rather than the button-only approach this started as.
+// Compact single-line row: title | a real native Liquid Glass button
+// (gd_style_button_as_native_glass) showing the current re-encode format
+// with a trailing chevron.up.chevron.down indicator, owning
+// .menu/.showsMenuAsPrimaryAction itself so a tap presents a native
+// pull-down of every format the repo supports - see this pragma mark's
+// own header comment above for why this replaced the earlier inert-
+// text-field-plus-transparent-overlay-button approach.
 static GDRow *gd_make_reencode_format_row(NSString *selectedFormat, void (^onSelect)(NSString *format)) {
     GDRow *row = [[GDRow alloc] initWithFrame:CGRectZero];
     row.translatesAutoresizingMaskIntoConstraints = NO;
@@ -2290,50 +2414,15 @@ static GDRow *gd_make_reencode_format_row(NSString *selectedFormat, void (^onSel
     row.titleLabel.minimumScaleFactor = 0.8;
     [row addSubview:row.titleLabel];
 
-    // Same font/white-text convention as every other glass field in this
-    // file (gd_make_labeled_glass_field_row/gd_make_button_and_glass_field_row)
-    // rather than the button's old monospaced/tinted look - this is the
-    // "doesn't match the other UI elements" fix.
-    UITextField *field = [[UITextField alloc] init];
-    field.font = [UIFont systemFontOfSize:11 weight:UIFontWeightRegular];
-    field.textColor = UIColor.whiteColor;
-    field.textAlignment = NSTextAlignmentLeft; // value reads left-aligned, matching every other field in the panel
-    field.userInteractionEnabled = NO;          // inert - not a real text field a person can type into, see header comment above
-    field.rightView = gd_make_dropdown_indicator_view();
-    field.rightViewMode = UITextFieldViewModeAlways;
-    objc_setAssociatedObject(row, "gd_field", field, OBJC_ASSOCIATION_RETAIN);
+    UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
+    button.translatesAutoresizingMaskIntoConstraints = NO;
+    [row addSubview:button];
+    objc_setAssociatedObject(row, "gd_button", button, OBJC_ASSOCIATION_RETAIN);
 
-    UIVisualEffectView *fieldGlass = gd_wrap_field_in_native_glass(field, 6);
-    UIView *fieldContainer = fieldGlass ?: field;
-    fieldContainer.translatesAutoresizingMaskIntoConstraints = NO;
-    // This glass is purely decorative background for the field - the
-    // transparent overlayButton built below is the field's only real
-    // touch target. Left at its default (interactive:YES per
-    // gd_wrap_field_in_native_glass -> gd_make_glass_effect) it competes
-    // with overlayButton for the tap and the button never sees it - same
-    // failure mode as capsuleGlass/expansion elsewhere in this file, and
-    // the same fix: explicitly hand touches to the real control. See
-    // -gd_configureHoldToConfirmButton's "decorative only" comments for
-    // the precedent.
-    fieldGlass.userInteractionEnabled = NO;
-    [row addSubview:fieldContainer];
+    gd_apply_reencode_format_selection(button, selectedFormat, onSelect);
 
-    // Fully transparent, no title/image of its own - this is only ever
-    // the touch target + menu host, the field above draws everything
-    // that's actually visible. UIButtonTypeCustom (not .system) so it
-    // carries none of UIButton's default tint/highlight chrome, which
-    // would otherwise flash over the field on every tap despite having
-    // no content of its own to show.
-    UIButton *overlayButton = [UIButton buttonWithType:UIButtonTypeCustom];
-    overlayButton.translatesAutoresizingMaskIntoConstraints = NO;
-    overlayButton.backgroundColor = UIColor.clearColor;
-    [row addSubview:overlayButton];
-    objc_setAssociatedObject(row, "gd_button", overlayButton, OBJC_ASSOCIATION_RETAIN);
-
-    gd_apply_reencode_format_selection(field, overlayButton, selectedFormat, onSelect);
-
-    static const CGFloat kFieldWidth = 116; // fits the widest label ("ASTC 8x8") left-aligned plus the wider rightView indicator with room to spare
-    static const CGFloat kFieldHeight = 28; // matches fieldContainer height in gd_wrap_field_in_native_glass / gd_make_button_and_glass_field_row
+    static const CGFloat kFieldWidth = 116; // fits the widest label ("ASTC 8x8") left-aligned plus the trailing chevron with room to spare
+    static const CGFloat kFieldHeight = 28; // matches every other glass field/button row in this section
 
     // No fixed width here, unlike the slider/mode-slider rows' shared
     // kTitleColumnWidth (92) - that constant is sized for their own short
@@ -2345,22 +2434,15 @@ static GDRow *gd_make_reencode_format_row(NSString *selectedFormat, void (^onSel
     // panel's normal 11pt instead of scaled down.
     [NSLayoutConstraint activateConstraints:@[
         [row.titleLabel.leadingAnchor constraintEqualToAnchor:row.leadingAnchor],
-        [row.titleLabel.trailingAnchor constraintLessThanOrEqualToAnchor:fieldContainer.leadingAnchor constant:-6],
+        [row.titleLabel.trailingAnchor constraintLessThanOrEqualToAnchor:button.leadingAnchor constant:-6],
         [row.titleLabel.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
 
-        [fieldContainer.trailingAnchor constraintEqualToAnchor:row.trailingAnchor],
-        [fieldContainer.widthAnchor constraintEqualToConstant:kFieldWidth],
-        [fieldContainer.heightAnchor constraintEqualToConstant:kFieldHeight],
-        [fieldContainer.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
-        [row.topAnchor constraintEqualToAnchor:fieldContainer.topAnchor constant:-3],
-        [row.bottomAnchor constraintEqualToAnchor:fieldContainer.bottomAnchor constant:3],
-
-        // Pinned exactly over fieldContainer, not row - this must cover
-        // only the glass field itself, not the title label's column too.
-        [overlayButton.leadingAnchor constraintEqualToAnchor:fieldContainer.leadingAnchor],
-        [overlayButton.trailingAnchor constraintEqualToAnchor:fieldContainer.trailingAnchor],
-        [overlayButton.topAnchor constraintEqualToAnchor:fieldContainer.topAnchor],
-        [overlayButton.bottomAnchor constraintEqualToAnchor:fieldContainer.bottomAnchor],
+        [button.trailingAnchor constraintEqualToAnchor:row.trailingAnchor],
+        [button.widthAnchor constraintEqualToConstant:kFieldWidth],
+        [button.heightAnchor constraintEqualToConstant:kFieldHeight],
+        [button.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
+        [row.topAnchor constraintEqualToAnchor:button.topAnchor constant:-3],
+        [row.bottomAnchor constraintEqualToAnchor:button.bottomAnchor constant:3],
     ]];
 
     return row;
@@ -3441,15 +3523,12 @@ static UIView *gd_make_title_block(void) {
 @property (nonatomic, strong) UITextField *authTokenField;
 @property (nonatomic, strong) UIButton *authVerifyButton; // "Verify" - see -gd_authVerifyTapped:
 
-// Config section's "Re-Encoding format" field - see
+// Config section's "Re-Encoding format" picker - see
 // gd_make_reencode_format_row and -gd_reencodeFormatSelected: below.
-// Kept so a selection can refresh the control in place without
-// rebuilding the whole panel. reencodeFormatField is the visible
-// (but inert - userInteractionEnabled = NO) text; reencodeFormatButton
-// is the transparent overlay that actually owns .menu and catches the
-// tap - see gd_make_reencode_format_row's own header comment for why
-// this is two views instead of one.
-@property (nonatomic, strong) UITextField *reencodeFormatField;
+// Kept so a selection can refresh the control (title text + menu
+// checkmark) in place without rebuilding the whole panel. A single real
+// native Liquid Glass button now - it owns .menu/.showsMenuAsPrimaryAction
+// itself, no separate overlay view needed.
 @property (nonatomic, strong) UIButton *reencodeFormatButton;
 
 // Load Mods is a single button that routes each picked file to its own
@@ -4409,7 +4488,6 @@ static const CGFloat kContentFadeHeight = 22;
     GDRow *reencodeFormatRow = gd_make_reencode_format_row(currentReencodeFormat, ^(NSString *selectedFormat) {
         [weakSelf gd_reencodeFormatSelected:selectedFormat];
     });
-    self.reencodeFormatField = objc_getAssociatedObject(reencodeFormatRow, "gd_field");
     self.reencodeFormatButton = objc_getAssociatedObject(reencodeFormatRow, "gd_button");
     [self.stack addArrangedSubview:reencodeFormatRow];
 
@@ -6730,7 +6808,7 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
 
 #pragma mark Re-Encoding format
 
-// Wired to every UIAction in the Re-Encoding format field's menu (see
+// Wired to every UIAction in the Re-Encoding format button's menu (see
 // gd_build_reencode_format_menu / gd_make_reencode_format_row, and the
 // Config section in -buildPanel:). Same load-then-overwrite-one-field
 // pattern as -gd_persistAuthFields above: +saveConfig: is a full
@@ -6752,12 +6830,12 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
         return;
     }
 
-    // Refresh the field in place - new text, and the menu's own
+    // Refresh the button in place - new title, and the menu's own
     // checkmark moved onto the newly-selected option - so opening it
     // again immediately reflects what just got saved.
-    if (self.reencodeFormatField && self.reencodeFormatButton) {
+    if (self.reencodeFormatButton) {
         __weak typeof(self) weakSelf = self;
-        gd_apply_reencode_format_selection(self.reencodeFormatField, self.reencodeFormatButton, format, ^(NSString *selectedFormat) {
+        gd_apply_reencode_format_selection(self.reencodeFormatButton, format, ^(NSString *selectedFormat) {
             [weakSelf gd_reencodeFormatSelected:selectedFormat];
         });
     }
