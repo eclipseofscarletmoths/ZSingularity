@@ -1,6 +1,7 @@
 #import "BundleDoctorService.h"
 #import "ZTweakLog.h"
 #import "UnityBundleCAB.h"
+#import "UnityCacheLocator.h"
 
 NSString * const BundleDoctorServiceErrorDomain = @"BundleDoctorServiceErrorDomain";
 NSString * const BundleDoctorServiceHTTPStatusKey = @"BundleDoctorServiceHTTPStatusKey";
@@ -17,6 +18,12 @@ NSString * const BundleDoctorServiceRunURLKey = @"BundleDoctorServiceRunURLKey";
 // same release).
 static NSString * const kBDSInputAssetName = @"input.bundle";
 static NSString * const kBDSOutputAssetName = @"output.bundle";
+// Optional: only uploaded when +bds_findOriginalBundleDataForModdedBundleAtURL:
+// resolves a same-CAB stock bundle via UnityCacheLocator (see that method,
+// below). doctor-bundle.yml's own "if present" download step and
+// BundleDoctor's --original flag are what actually key off this name - it's
+// a fixed asset name for the same reason input.bundle/output.bundle are.
+static NSString * const kBDSOriginalAssetName = @"original.bundle";
 static NSString * const kBDSReleaseTagInputKey = @"release_tag";
 static NSString * const kBDSInputFormatKey = @"output_format";
 
@@ -102,6 +109,47 @@ static NSData *bds_prepareBundleDataForUpload(NSData *data, NSError **error) {
          (unsigned long)compressed.length,
          data.length ? (100.0 * (double)compressed.length / (double)data.length) : 0.0);
     return compressed;
+}
+
+// Best-effort lookup of the untouched, correctly-platformed counterpart to
+// moddedBundlePath, for BundleDoctor's shader-restore pass (see
+// Program.cs's --original). Uses the same CAB the modded bundle already
+// carries in its own directory table - editing a Texture2D/re-saving the
+// bundle doesn't change that name - to find the matching stock bundle
+// already sitting in this app's own UnityCache (see UnityCacheLocator.h).
+//
+// Deliberately returns nil rather than an NSError on every failure mode
+// here (unreadable CAB, no UnityCache directory, no match): none of these
+// are failures of the dispatch itself, they just mean this particular
+// submission proceeds without a shader-restore pass, exactly as if
+// --original were never given. Only an actual read failure on a
+// successfully-resolved path is logged any differently.
++ (nullable NSData *)bds_findOriginalBundleDataForModdedBundleAtPath:(NSString *)moddedBundlePath {
+    NSError *cabError = nil;
+    NSString *cab = [UnityCacheLocator cabForBundleAtPath:moddedBundlePath error:&cabError];
+    if (!cab) {
+        ZLog(@"[BundleDoctorService] shader-restore: couldn't read a CAB off the modded bundle (%@) - skipping.", cabError.localizedDescription);
+        return nil;
+    }
+
+    NSError *locateError = nil;
+    NSString *originalPath = [UnityCacheLocator locateBundlePathForCAB:cab error:&locateError];
+    if (!originalPath) {
+        ZLog(@"[BundleDoctorService] shader-restore: no cached original found for CAB %@ (%@) - skipping.", cab, locateError.localizedDescription);
+        return nil;
+    }
+
+    NSError *readError = nil;
+    NSData *originalData = [NSData dataWithContentsOfFile:originalPath options:0 error:&readError];
+    if (!originalData) {
+        // This one IS worth calling out distinctly - we resolved a path but
+        // then couldn't read it (permissions, file vanished mid-read, etc.).
+        ZLog(@"[BundleDoctorService] shader-restore: resolved original at %@ but couldn't read it (%@) - skipping.", originalPath, readError.localizedDescription);
+        return nil;
+    }
+
+    ZLog(@"[BundleDoctorService] shader-restore: matched CAB %@ -> %@ (%lu bytes).", cab, originalPath, (unsigned long)originalData.length);
+    return originalData;
 }
 
 // Post-download decompression used to be mandatory here: the re-encoder
@@ -406,9 +454,21 @@ totalBytesExpectedToSend:(int64_t)totalBytesExpectedToSend {
             return;
         }
 
+        // Best-effort, resolved from the modded bundle's own path (not
+        // moddedData - the lookup reads the CAB straight off disk). nil here
+        // just means this submission runs without a shader-restore pass -
+        // see +bds_findOriginalBundleDataForModdedBundleAtPath:'s own header.
+        // Uploaded byte-for-byte, deliberately NOT run through
+        // bds_prepareBundleDataForUpload's LZ4HC recompression: the whole
+        // point of this asset is to hand BundleDoctor pristine Shader bytes,
+        // and the workflow discards it right after reading them out anyway -
+        // no reason to risk a recompression bug touching the one copy of
+        // this data that has to stay exact.
+        NSData *originalData = [self bds_findOriginalBundleDataForModdedBundleAtPath:moddedBundleURL.path];
+
         NSString *scratchBranch = [NSString stringWithFormat:@"bundle-doctor/%@", [NSUUID UUID].UUIDString];
-        ZLog(@"[BundleDoctorService] dispatching %@/%@, scratch branch %@",
-              config.repoOwner, config.repoName, scratchBranch);
+        ZLog(@"[BundleDoctorService] dispatching %@/%@, scratch branch %@ (original bundle for shader-restore: %@)",
+              config.repoOwner, config.repoName, scratchBranch, originalData ? @"found" : @"not found");
 
         NSString *baseCommitSHA = nil;
         if (![self bds_resolveBaseCommitSHA:&baseCommitSHA config:config error:&error]) {
@@ -437,6 +497,23 @@ totalBytesExpectedToSend:(int64_t)totalBytesExpectedToSend {
             return;
         }
         reportProgress(1.0); // the asset upload is the entire uploadProgress contract - make sure callers land on a clean 100%
+
+        // Second asset, no progress callback - uploadProgress's contract is
+        // "the modded bundle's own body send", already satisfied above, and
+        // this upload is typically small/fast relative to that one. A
+        // failure here is NOT fatal to the whole submission: it just means
+        // the workflow proceeds without original.bundle and BundleDoctor
+        // falls back to skipping the shader-restore pass, same as if
+        // originalData had been nil to begin with.
+        if (originalData) {
+            NSError *originalUploadError = nil;
+            if (![self bds_uploadReleaseAssetData:originalData name:kBDSOriginalAssetName
+                                 uploadURLTemplate:uploadURLTemplate progress:nil
+                                            config:config error:&originalUploadError]) {
+                ZLog(@"[BundleDoctorService] couldn't upload original.bundle (proceeding without shader-restore): %@",
+                     originalUploadError.localizedDescription);
+            }
+        }
 
         if (![self bds_dispatchWorkflowOnBranch:scratchBranch config:config error:&error]) {
             [self bds_cleanupScratchSubmission:scratchBranch config:config]; // best-effort cleanup, ignore result
