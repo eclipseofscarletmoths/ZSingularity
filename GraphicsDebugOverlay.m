@@ -4105,6 +4105,25 @@ static const CGFloat kContentFadeHeight = 22;
     self.scrollView.alwaysBounceVertical = YES;
     self.scrollView.contentInsetAdjustmentBehavior = UIScrollViewContentInsetAdjustmentNever;
     self.scrollView.delegate = self; // drives on-screen-only slider Liquid Glass, see gd_updateSliderGlassVisibility
+    // Default UIScrollView behavior holds every touch for a beat before
+    // delivering it to a subview, so its own pan gesture gets first
+    // refusal on anything that turns into a drag. Ordinary buttons don't
+    // notice - a touchUpInside still fires once the touch ends, delay or
+    // not - which is why Verify/Reset/Reapply/etc. all work fine as-is.
+    // The Config section's Re-Encoding format field (see
+    // gd_make_reencode_format_row) is the one control in this panel that
+    // presents its UIMenu via .showsMenuAsPrimaryAction rather than a
+    // plain target-action tap, and that presentation is driven by a far
+    // more timing-sensitive touch-down interaction than a normal button -
+    // held back by the scroll view's default delay, it loses the race
+    // and never gets to present, even though the button still visibly
+    // highlights (the touch itself was never in doubt, only the menu).
+    // Every row's own button already owns its taps correctly (see
+    // -panelSwiped:'s shouldReceiveTouch: above, which keeps the close-
+    // swipe gesture off of them) - it's specifically this scroll view's
+    // built-in pan gesture, not that custom one, that was never told to
+    // let go immediately.
+    self.scrollView.delaysContentTouches = NO;
     [self.scrollViewport addSubview:self.scrollView];
 
     [NSLayoutConstraint activateConstraints:@[
