@@ -2229,17 +2229,32 @@ static UIMenu *gd_build_reencode_format_menu(NSString *selectedFormat, void (^on
 // field's own white text (see gd_apply_reencode_format_selection below)
 // so it reads as a secondary affordance, not competing with the actual
 // value.
-static UIImageView *gd_make_dropdown_indicator_view(void) {
+//
+// Returns a wrapper view wider than the glyph itself, with the glyph
+// pinned to its LEADING edge - unlike leftView (which
+// gd_wrap_field_in_native_glass pads with its own spacer subview),
+// UITextField draws rightView flush against the field's own trailing
+// edge with no built-in margin, so the chevron was sitting right on
+// top of the glass container's rounded corner. The extra
+// kTrailingPadding of empty space after the glyph is what keeps it
+// clear of that edge.
+static UIView *gd_make_dropdown_indicator_view(void) {
     UIImageSymbolConfiguration *symbolConfig = [UIImageSymbolConfiguration configurationWithPointSize:10 weight:UIImageSymbolWeightSemibold];
     UIImage *chevronImage = [UIImage systemImageNamed:@"chevron.up.chevron.down" withConfiguration:symbolConfig];
     UIImageView *imageView = [[UIImageView alloc] initWithImage:chevronImage];
     imageView.tintColor = [UIColor colorWithWhite:1 alpha:0.55];
     imageView.contentMode = UIViewContentModeCenter;
-    // Fixed frame (not Auto Layout) - this becomes a UITextField's
+
+    static const CGFloat kIconWidth = 22;
+    static const CGFloat kTrailingPadding = 8;
+    // Fixed frames (not Auto Layout) - this becomes a UITextField's
     // rightView, which sizes/positions its accessory view off its own
     // frame rather than constraints.
-    imageView.frame = CGRectMake(0, 0, 22, 20);
-    return imageView;
+    imageView.frame = CGRectMake(0, 0, kIconWidth, 20);
+
+    UIView *wrapper = [[UIView alloc] initWithFrame:CGRectMake(0, 0, kIconWidth + kTrailingPadding, 20)];
+    [wrapper addSubview:imageView];
+    return wrapper;
 }
 
 // (Re)applies the current selection to both halves of the control -
@@ -2282,7 +2297,7 @@ static GDRow *gd_make_reencode_format_row(NSString *selectedFormat, void (^onSel
     UITextField *field = [[UITextField alloc] init];
     field.font = [UIFont systemFontOfSize:11 weight:UIFontWeightRegular];
     field.textColor = UIColor.whiteColor;
-    field.textAlignment = NSTextAlignmentRight; // value reads right-aligned, immediately left of the dropdown indicator
+    field.textAlignment = NSTextAlignmentLeft; // value reads left-aligned, matching every other field in the panel
     field.userInteractionEnabled = NO;          // inert - not a real text field a person can type into, see header comment above
     field.rightView = gd_make_dropdown_indicator_view();
     field.rightViewMode = UITextFieldViewModeAlways;
@@ -2291,6 +2306,16 @@ static GDRow *gd_make_reencode_format_row(NSString *selectedFormat, void (^onSel
     UIVisualEffectView *fieldGlass = gd_wrap_field_in_native_glass(field, 6);
     UIView *fieldContainer = fieldGlass ?: field;
     fieldContainer.translatesAutoresizingMaskIntoConstraints = NO;
+    // This glass is purely decorative background for the field - the
+    // transparent overlayButton built below is the field's only real
+    // touch target. Left at its default (interactive:YES per
+    // gd_wrap_field_in_native_glass -> gd_make_glass_effect) it competes
+    // with overlayButton for the tap and the button never sees it - same
+    // failure mode as capsuleGlass/expansion elsewhere in this file, and
+    // the same fix: explicitly hand touches to the real control. See
+    // -gd_configureHoldToConfirmButton's "decorative only" comments for
+    // the precedent.
+    fieldGlass.userInteractionEnabled = NO;
     [row addSubview:fieldContainer];
 
     // Fully transparent, no title/image of its own - this is only ever
@@ -2307,12 +2332,20 @@ static GDRow *gd_make_reencode_format_row(NSString *selectedFormat, void (^onSel
 
     gd_apply_reencode_format_selection(field, overlayButton, selectedFormat, onSelect);
 
-    static const CGFloat kFieldWidth = 108; // fits the widest label ("ASTC 8x8") plus the rightView indicator with room to spare
+    static const CGFloat kFieldWidth = 116; // fits the widest label ("ASTC 8x8") left-aligned plus the wider rightView indicator with room to spare
     static const CGFloat kFieldHeight = 28; // matches fieldContainer height in gd_wrap_field_in_native_glass / gd_make_button_and_glass_field_row
 
+    // No fixed width here, unlike the slider/mode-slider rows' shared
+    // kTitleColumnWidth (92) - that constant is sized for their own short
+    // titles ("MSAA", "HDR", etc.), and forcing "Re-Encoding format" into
+    // it tripped adjustsFontSizeToFitWidth's minimumScaleFactor, shrinking
+    // it below every other row in this section. Sized off its own intrinsic
+    // content instead, exactly like gd_make_switch_row's title (the pattern
+    // this section's other two rows already use), so it renders at the
+    // panel's normal 11pt instead of scaled down.
     [NSLayoutConstraint activateConstraints:@[
         [row.titleLabel.leadingAnchor constraintEqualToAnchor:row.leadingAnchor],
-        [row.titleLabel.widthAnchor constraintEqualToConstant:kTitleColumnWidth],
+        [row.titleLabel.trailingAnchor constraintLessThanOrEqualToAnchor:fieldContainer.leadingAnchor constant:-6],
         [row.titleLabel.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
 
         [fieldContainer.trailingAnchor constraintEqualToAnchor:row.trailingAnchor],
