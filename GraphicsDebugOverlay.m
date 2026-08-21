@@ -1955,150 +1955,6 @@ static GDRow *gd_make_mode_slider_row(NSString *title, NSArray<NSString *> *labe
     return row;
 }
 
-#pragma mark Re-Encoding format (Config section)
-//
-// The Texture2D format BundleDoctorConfig.outputFormat tells the doctor-
-// bundle workflow's re-encoder (BundleDoctor/TextureCodec.cs, in the
-// re-encoder repo, not this project) to target. Nothing in this file
-// ever set config.outputFormat before - it stayed nil on every save, so
-// +[BundleDoctorConfig normalizedConfig] silently fell back to its own
-// "RGBA32" default (BundleDoctorService.m's kBDSDefaultOutputFormat) on
-// every single dispatch, regardless of which formats the repo actually
-// supports. This section is the fix: a picker in the Config section
-// (see -buildPanel:) that writes straight through
-// +[BundleDoctorSettings saveConfig:] - every dispatch call site in this
-// file re-loads config fresh immediately before use, so persisting the
-// choice here is the only change needed; nothing downstream has to know
-// this picker exists.
-
-// Canonical BundleDoctorConfig.outputFormat strings this picker offers -
-// exactly the five the doctor-bundle workflow's own `output_format`
-// choice input (.github/workflows/doctor-bundle.yml in the re-encoder
-// repo) and Program.cs's ParseOutputTextureFormat both accept verbatim.
-// Order here is the order they appear in the field's menu.
-static NSArray<NSString *> *gd_reencode_format_options(void) {
-    return @[@"ASTC_RGBA_4x4", @"ASTC_RGBA_6x6", @"ASTC_RGBA_8x8", @"RGBA32", @"ETC2"];
-}
-
-// Mirrors BundleDoctorService.m's own kBDSDefaultOutputFormat (private to
-// that file, so not reusable directly) - only used here to seed this
-// field's initial label/checkmark when nothing's been saved yet. The
-// real default-if-unset behavior for an actual dispatch still lives in
-// -[BundleDoctorConfig normalizedConfig], not here.
-static NSString * const kGDDefaultReencodeFormat = @"RGBA32";
-
-// Full name shown as each row's title inside the menu.
-static NSString *gd_reencode_format_display_name(NSString *format) {
-    if ([format isEqualToString:@"ASTC_RGBA_4x4"]) return @"ASTC 4x4";
-    if ([format isEqualToString:@"ASTC_RGBA_6x6"]) return @"ASTC 6x6";
-    if ([format isEqualToString:@"ASTC_RGBA_8x8"]) return @"ASTC 8x8";
-    if ([format isEqualToString:@"RGBA32"]) return @"RGBA32";
-    if ([format isEqualToString:@"ETC2"]) return @"ETC2";
-    return format ?: @"RGBA32";
-}
-
-// Short glyph shown on the field itself once a format is selected - kept
-// to 4 characters so it reads cleanly inside the field's own fixed
-// square-ish size (see kFieldWidth/kFieldHeight in
-// gd_make_reencode_format_row below) without needing to shrink the font
-// further than the row's other value labels already go.
-static NSString *gd_reencode_format_short_name(NSString *format) {
-    if ([format isEqualToString:@"ASTC_RGBA_4x4"]) return @"4\u00d74";
-    if ([format isEqualToString:@"ASTC_RGBA_6x6"]) return @"6\u00d76";
-    if ([format isEqualToString:@"ASTC_RGBA_8x8"]) return @"8\u00d78";
-    if ([format isEqualToString:@"RGBA32"]) return @"RGBA";
-    if ([format isEqualToString:@"ETC2"]) return @"ETC2";
-    return @"RGBA";
-}
-
-// One UIAction per gd_reencode_format_options() entry, with the
-// currently-selected format's action given UIMenuElementStateOn so UIKit
-// draws its own checkmark next to it - the menu doubles as its own
-// "what's selected right now" indicator every time it's opened, no
-// separate check-glyph bookkeeping needed. `onSelect` fires with the
-// tapped option's canonical string; this function only builds the menu -
-// see -gd_reencodeFormatSelected: for what actually happens on a tap.
-static UIMenu *gd_build_reencode_format_menu(NSString *selectedFormat, void (^onSelect)(NSString *format)) {
-    NSMutableArray<UIAction *> *actions = [NSMutableArray array];
-    for (NSString *format in gd_reencode_format_options()) {
-        BOOL selected = [format isEqualToString:selectedFormat];
-        UIAction *action = [UIAction actionWithTitle:gd_reencode_format_display_name(format)
-                                                image:nil
-                                           identifier:nil
-                                              handler:^(__kindof UIAction * _Nonnull a) {
-            if (onSelect) onSelect(format);
-        }];
-        action.state = selected ? UIMenuElementStateOn : UIMenuElementStateOff;
-        [actions addObject:action];
-    }
-    return [UIMenu menuWithTitle:@"" children:actions];
-}
-
-// Styles `button` as the field itself (native Liquid Glass, same
-// gd_style_button_as_native_glass every other glass button in this file
-// uses) and (re)attaches its menu for the given selection. Shared by
-// gd_make_reencode_format_row (initial build) and
-// -gd_reencodeFormatSelected: (refresh after a tap), so the button's
-// look and its menu's checkmark can never drift out of sync with each
-// other - there is exactly one place that draws "format X is selected".
-static void gd_apply_reencode_format_to_button(UIButton *button, NSString *format, void (^onSelect)(NSString *format)) {
-    gd_style_button_as_native_glass(button, gd_reencode_format_short_name(format), gd_accent_green_color());
-    button.titleLabel.font = [UIFont monospacedDigitSystemFontOfSize:10 weight:UIFontWeightSemibold];
-    button.titleLabel.adjustsFontSizeToFitWidth = YES;
-    button.titleLabel.minimumScaleFactor = 0.6;
-    button.menu = gd_build_reencode_format_menu(format, onSelect);
-    button.showsMenuAsPrimaryAction = YES; // tap opens the menu directly - no long-press/context-menu gesture needed
-}
-
-// Compact single-line row: title | square-ish native Liquid Glass field
-// that presents a native pull-down menu (UIMenu) of every re-encode
-// format the repo supports. Distinct from gd_make_mode_slider_row's
-// segmented control - five options with multi-character labels ("ASTC
-// 4x4" etc.) don't read well as inline segments at this panel's width,
-// and a menu is the more natural "closed until touched" affordance for
-// a setting that's rarely changed. The field is fixed at a small
-// near-square size (58x28) rather than stretched full-width like the
-// Auth section's text fields, per request - just wide enough for the
-// 4-character short label, tall enough to match every other field/
-// button height on this panel.
-static GDRow *gd_make_reencode_format_row(NSString *selectedFormat, void (^onSelect)(NSString *format)) {
-    GDRow *row = [[GDRow alloc] initWithFrame:CGRectZero];
-    row.translatesAutoresizingMaskIntoConstraints = NO;
-
-    row.titleLabel = [[UILabel alloc] init];
-    row.titleLabel.translatesAutoresizingMaskIntoConstraints = NO;
-    row.titleLabel.text = @"Re-Encoding format";
-    row.titleLabel.textColor = [UIColor colorWithWhite:0.9 alpha:1];
-    row.titleLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightMedium];
-    row.titleLabel.adjustsFontSizeToFitWidth = YES;
-    row.titleLabel.minimumScaleFactor = 0.8;
-    [row addSubview:row.titleLabel];
-
-    UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
-    button.translatesAutoresizingMaskIntoConstraints = NO;
-    gd_apply_reencode_format_to_button(button, selectedFormat, onSelect);
-    [row addSubview:button];
-    objc_setAssociatedObject(row, "gd_button", button, OBJC_ASSOCIATION_RETAIN);
-
-    static const CGFloat kFieldWidth = 58;
-    static const CGFloat kFieldHeight = 28; // matches fieldContainer height in gd_wrap_field_in_native_glass / gd_make_button_and_glass_field_row
-
-    [NSLayoutConstraint activateConstraints:@[
-        [row.titleLabel.leadingAnchor constraintEqualToAnchor:row.leadingAnchor],
-        [row.titleLabel.widthAnchor constraintEqualToConstant:kTitleColumnWidth],
-        [row.titleLabel.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
-
-        [button.trailingAnchor constraintEqualToAnchor:row.trailingAnchor],
-        [button.widthAnchor constraintEqualToConstant:kFieldWidth],
-        [button.heightAnchor constraintEqualToConstant:kFieldHeight],
-        [button.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
-        [row.topAnchor constraintEqualToAnchor:button.topAnchor constant:-3],
-        [row.bottomAnchor constraintEqualToAnchor:button.bottomAnchor constant:3],
-    ]];
-
-    return row;
-}
-
 static GDRow *gd_make_switch_row(NSString *title, BOOL val) {
     GDRow *row = [[GDRow alloc] initWithFrame:CGRectZero];
     row.translatesAutoresizingMaskIntoConstraints = NO;
@@ -2265,6 +2121,216 @@ static UIVisualEffectView *gd_wrap_field_in_native_glass(UITextField *field, CGF
     field.layer.cornerRadius = cornerRadius;
     field.layer.cornerCurve = kCACornerCurveContinuous;
     return nil;
+}
+
+#pragma mark Re-Encoding format (Config section)
+//
+// The Texture2D format BundleDoctorConfig.outputFormat tells the doctor-
+// bundle workflow's re-encoder (BundleDoctor/TextureCodec.cs, in the
+// re-encoder repo, not this project) to target. Nothing in this file
+// ever set config.outputFormat before - it stayed nil on every save, so
+// +[BundleDoctorConfig normalizedConfig] silently fell back to its own
+// "RGBA32" default (BundleDoctorService.m's kBDSDefaultOutputFormat) on
+// every single dispatch, regardless of which formats the repo actually
+// supports. This section is the fix: a picker in the Config section
+// (see -buildPanel:) that writes straight through
+// +[BundleDoctorSettings saveConfig:] - every dispatch call site in this
+// file re-loads config fresh immediately before use, so persisting the
+// choice here is the only change needed; nothing downstream has to know
+// this picker exists.
+//
+// First pass at this used a single UIButton styled via
+// gd_style_button_as_native_glass (+[UIButtonConfiguration
+// glassButtonConfiguration]) sized to a fixed 58x28. That's the wrong
+// control for this: glassButtonConfiguration defaults to a CAPSULE
+// corner style (see gd_style_button_as_native_glass's own header
+// comment - every other capsule-defaulting glass button in this file
+// re-squares itself via gd_configure_glass_corners right after, which
+// this one skipped), and its titleLabel didn't match the rest of the
+// panel's fields (monospaced/semibold/tinted vs. the Auth/Debug fields'
+// plain white system font) - together that's exactly "looks like a
+// circular blob, text doesn't match anything else". It's also just the
+// wrong widget family: `menu`/`showsMenuAsPrimaryAction` are real
+// UIButton APIs, but a UIButtonConfiguration-driven title can't be
+// independently right-aligned next to a trailing icon the way a
+// UITextField's text + rightView can - which is what the fix below
+// actually needs.
+//
+// Current approach: the visible surface is a real UITextField, wrapped
+// in the exact same gd_wrap_field_in_native_glass glass container the
+// Auth/Debug fields use (so it actually matches them - same corner
+// radius, same material, same font/color conventions), but with
+// userInteractionEnabled = NO so it never becomes first responder or
+// shows a keyboard - it is purely a label at that point, not a field
+// a person can type into, per request. The actual tap target is a
+// separate, fully transparent UIButtonTypeCustom sized and pinned
+// exactly over that same glass container - THAT button owns .menu /
+// .showsMenuAsPrimaryAction, so a tap anywhere on the field opens the
+// native pull-down. Two views instead of one because UITextField and
+// "has a working .menu" don't overlap in UIKit - a text field has no
+// such API, so something has to sit on top to catch the touch.
+
+// Canonical BundleDoctorConfig.outputFormat strings this picker offers -
+// exactly the five the doctor-bundle workflow's own `output_format`
+// choice input (.github/workflows/doctor-bundle.yml in the re-encoder
+// repo) and Program.cs's ParseOutputTextureFormat both accept verbatim.
+// Order here is the order they appear in the field's menu.
+static NSArray<NSString *> *gd_reencode_format_options(void) {
+    return @[@"ASTC_RGBA_4x4", @"ASTC_RGBA_6x6", @"ASTC_RGBA_8x8", @"RGBA32", @"ETC2"];
+}
+
+// Mirrors BundleDoctorService.m's own kBDSDefaultOutputFormat (private to
+// that file, so not reusable directly) - only used here to seed this
+// field's initial text when nothing's been saved yet. The real
+// default-if-unset behavior for an actual dispatch still lives in
+// -[BundleDoctorConfig normalizedConfig], not here.
+static NSString * const kGDDefaultReencodeFormat = @"RGBA32";
+
+// Full name shown both as the field's own text and as each row's title
+// inside the menu - the field is wide enough now (see
+// gd_make_reencode_format_row) that there's no need for the old
+// abbreviated short-code display this used to fall back to.
+static NSString *gd_reencode_format_display_name(NSString *format) {
+    if ([format isEqualToString:@"ASTC_RGBA_4x4"]) return @"ASTC 4x4";
+    if ([format isEqualToString:@"ASTC_RGBA_6x6"]) return @"ASTC 6x6";
+    if ([format isEqualToString:@"ASTC_RGBA_8x8"]) return @"ASTC 8x8";
+    if ([format isEqualToString:@"RGBA32"]) return @"RGBA32";
+    if ([format isEqualToString:@"ETC2"]) return @"ETC2";
+    return format ?: @"RGBA32";
+}
+
+// One UIAction per gd_reencode_format_options() entry, with the
+// currently-selected format's action given UIMenuElementStateOn so UIKit
+// draws its own checkmark next to it - the menu doubles as its own
+// "what's selected right now" indicator every time it's opened, no
+// separate check-glyph bookkeeping needed. `onSelect` fires with the
+// tapped option's canonical string; this function only builds the menu -
+// see -gd_reencodeFormatSelected: for what actually happens on a tap.
+static UIMenu *gd_build_reencode_format_menu(NSString *selectedFormat, void (^onSelect)(NSString *format)) {
+    NSMutableArray<UIAction *> *actions = [NSMutableArray array];
+    for (NSString *format in gd_reencode_format_options()) {
+        BOOL selected = [format isEqualToString:selectedFormat];
+        UIAction *action = [UIAction actionWithTitle:gd_reencode_format_display_name(format)
+                                                image:nil
+                                           identifier:nil
+                                              handler:^(__kindof UIAction * _Nonnull a) {
+            if (onSelect) onSelect(format);
+        }];
+        action.state = selected ? UIMenuElementStateOn : UIMenuElementStateOff;
+        [actions addObject:action];
+    }
+    return [UIMenu menuWithTitle:@"" children:actions];
+}
+
+// Small chevron.up.chevron.down glyph (two vertically-stacked arrows,
+// one up/one down - the standard system "this reveals a picker" glyph)
+// used as the field's rightView, same slot gd_wrap_field_in_native_glass
+// gives its own leftView padding spacer. Deliberately dimmer than the
+// field's own white text (see gd_apply_reencode_format_selection below)
+// so it reads as a secondary affordance, not competing with the actual
+// value.
+static UIImageView *gd_make_dropdown_indicator_view(void) {
+    UIImageSymbolConfiguration *symbolConfig = [UIImageSymbolConfiguration configurationWithPointSize:10 weight:UIImageSymbolWeightSemibold];
+    UIImage *chevronImage = [UIImage systemImageNamed:@"chevron.up.chevron.down" withConfiguration:symbolConfig];
+    UIImageView *imageView = [[UIImageView alloc] initWithImage:chevronImage];
+    imageView.tintColor = [UIColor colorWithWhite:1 alpha:0.55];
+    imageView.contentMode = UIViewContentModeCenter;
+    // Fixed frame (not Auto Layout) - this becomes a UITextField's
+    // rightView, which sizes/positions its accessory view off its own
+    // frame rather than constraints.
+    imageView.frame = CGRectMake(0, 0, 22, 20);
+    return imageView;
+}
+
+// (Re)applies the current selection to both halves of the control -
+// `field`'s text/right-aligned layout and `overlayButton`'s menu -
+// sharing this one place so the two can never drift out of sync with
+// each other. Used by gd_make_reencode_format_row (initial build) and
+// -gd_reencodeFormatSelected: (refresh after a tap).
+static void gd_apply_reencode_format_selection(UITextField *field, UIButton *overlayButton, NSString *format, void (^onSelect)(NSString *format)) {
+    field.text = gd_reencode_format_display_name(format);
+    overlayButton.menu = gd_build_reencode_format_menu(format, onSelect);
+    overlayButton.showsMenuAsPrimaryAction = YES; // tap opens the menu directly - no long-press/context-menu gesture needed
+}
+
+// Compact single-line row: title | native Liquid Glass field (matching
+// the Auth/Debug section fields' own look exactly - see
+// gd_wrap_field_in_native_glass) showing the current re-encode format,
+// with a chevron.up.chevron.down indicator on its right and a
+// transparent tap target over the whole field that presents a native
+// pull-down menu (UIMenu) of every format the repo supports. The field
+// itself is inert (userInteractionEnabled = NO) - see this pragma
+// mark's own header comment above for why a text field, disabled,
+// rather than the button-only approach this started as.
+static GDRow *gd_make_reencode_format_row(NSString *selectedFormat, void (^onSelect)(NSString *format)) {
+    GDRow *row = [[GDRow alloc] initWithFrame:CGRectZero];
+    row.translatesAutoresizingMaskIntoConstraints = NO;
+
+    row.titleLabel = [[UILabel alloc] init];
+    row.titleLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    row.titleLabel.text = @"Re-Encoding format";
+    row.titleLabel.textColor = [UIColor colorWithWhite:0.9 alpha:1];
+    row.titleLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightMedium];
+    row.titleLabel.adjustsFontSizeToFitWidth = YES;
+    row.titleLabel.minimumScaleFactor = 0.8;
+    [row addSubview:row.titleLabel];
+
+    // Same font/white-text convention as every other glass field in this
+    // file (gd_make_labeled_glass_field_row/gd_make_button_and_glass_field_row)
+    // rather than the button's old monospaced/tinted look - this is the
+    // "doesn't match the other UI elements" fix.
+    UITextField *field = [[UITextField alloc] init];
+    field.font = [UIFont systemFontOfSize:11 weight:UIFontWeightRegular];
+    field.textColor = UIColor.whiteColor;
+    field.textAlignment = NSTextAlignmentRight; // value reads right-aligned, immediately left of the dropdown indicator
+    field.userInteractionEnabled = NO;          // inert - not a real text field a person can type into, see header comment above
+    field.rightView = gd_make_dropdown_indicator_view();
+    field.rightViewMode = UITextFieldViewModeAlways;
+    objc_setAssociatedObject(row, "gd_field", field, OBJC_ASSOCIATION_RETAIN);
+
+    UIVisualEffectView *fieldGlass = gd_wrap_field_in_native_glass(field, 6);
+    UIView *fieldContainer = fieldGlass ?: field;
+    fieldContainer.translatesAutoresizingMaskIntoConstraints = NO;
+    [row addSubview:fieldContainer];
+
+    // Fully transparent, no title/image of its own - this is only ever
+    // the touch target + menu host, the field above draws everything
+    // that's actually visible. UIButtonTypeCustom (not .system) so it
+    // carries none of UIButton's default tint/highlight chrome, which
+    // would otherwise flash over the field on every tap despite having
+    // no content of its own to show.
+    UIButton *overlayButton = [UIButton buttonWithType:UIButtonTypeCustom];
+    overlayButton.translatesAutoresizingMaskIntoConstraints = NO;
+    overlayButton.backgroundColor = UIColor.clearColor;
+    [row addSubview:overlayButton];
+    objc_setAssociatedObject(row, "gd_button", overlayButton, OBJC_ASSOCIATION_RETAIN);
+
+    gd_apply_reencode_format_selection(field, overlayButton, selectedFormat, onSelect);
+
+    static const CGFloat kFieldWidth = 108; // fits the widest label ("ASTC 8x8") plus the rightView indicator with room to spare
+    static const CGFloat kFieldHeight = 28; // matches fieldContainer height in gd_wrap_field_in_native_glass / gd_make_button_and_glass_field_row
+
+    [NSLayoutConstraint activateConstraints:@[
+        [row.titleLabel.leadingAnchor constraintEqualToAnchor:row.leadingAnchor],
+        [row.titleLabel.widthAnchor constraintEqualToConstant:kTitleColumnWidth],
+        [row.titleLabel.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
+
+        [fieldContainer.trailingAnchor constraintEqualToAnchor:row.trailingAnchor],
+        [fieldContainer.widthAnchor constraintEqualToConstant:kFieldWidth],
+        [fieldContainer.heightAnchor constraintEqualToConstant:kFieldHeight],
+        [fieldContainer.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
+        [row.topAnchor constraintEqualToAnchor:fieldContainer.topAnchor constant:-3],
+        [row.bottomAnchor constraintEqualToAnchor:fieldContainer.bottomAnchor constant:3],
+
+        // Pinned exactly over fieldContainer, not row - this must cover
+        // only the glass field itself, not the title label's column too.
+        [overlayButton.leadingAnchor constraintEqualToAnchor:fieldContainer.leadingAnchor],
+        [overlayButton.trailingAnchor constraintEqualToAnchor:fieldContainer.trailingAnchor],
+        [overlayButton.topAnchor constraintEqualToAnchor:fieldContainer.topAnchor],
+        [overlayButton.bottomAnchor constraintEqualToAnchor:fieldContainer.bottomAnchor],
+    ]];
+
+    return row;
 }
 
 // Debug section's Toggle Syslog button + blacklist entry field, sharing
@@ -3344,8 +3410,13 @@ static UIView *gd_make_title_block(void) {
 
 // Config section's "Re-Encoding format" field - see
 // gd_make_reencode_format_row and -gd_reencodeFormatSelected: below.
-// Kept so a selection can refresh the field's own short label/checkmark
-// in place without rebuilding the whole panel.
+// Kept so a selection can refresh the control in place without
+// rebuilding the whole panel. reencodeFormatField is the visible
+// (but inert - userInteractionEnabled = NO) text; reencodeFormatButton
+// is the transparent overlay that actually owns .menu and catches the
+// tap - see gd_make_reencode_format_row's own header comment for why
+// this is two views instead of one.
+@property (nonatomic, strong) UITextField *reencodeFormatField;
 @property (nonatomic, strong) UIButton *reencodeFormatButton;
 
 // Load Mods is a single button that routes each picked file to its own
@@ -4298,13 +4369,14 @@ static const CGFloat kContentFadeHeight = 22;
     // could actually target. Reads whatever's currently saved (falling
     // back to kGDDefaultReencodeFormat only for the field's initial
     // display, same "RGBA32" the re-encoder itself defaults to) so the
-    // field's short label/checkmark always matches what the NEXT
+    // field's text always matches what the NEXT
     // dispatch would use.
     NSString *currentReencodeFormat = [BundleDoctorSettings loadConfig].outputFormat;
     if (currentReencodeFormat.length == 0) currentReencodeFormat = kGDDefaultReencodeFormat;
     GDRow *reencodeFormatRow = gd_make_reencode_format_row(currentReencodeFormat, ^(NSString *selectedFormat) {
         [weakSelf gd_reencodeFormatSelected:selectedFormat];
     });
+    self.reencodeFormatField = objc_getAssociatedObject(reencodeFormatRow, "gd_field");
     self.reencodeFormatButton = objc_getAssociatedObject(reencodeFormatRow, "gd_button");
     [self.stack addArrangedSubview:reencodeFormatRow];
 
@@ -6647,12 +6719,12 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
         return;
     }
 
-    // Refresh the field in place - new short label, and the menu's own
+    // Refresh the field in place - new text, and the menu's own
     // checkmark moved onto the newly-selected option - so opening it
     // again immediately reflects what just got saved.
-    if (self.reencodeFormatButton) {
+    if (self.reencodeFormatField && self.reencodeFormatButton) {
         __weak typeof(self) weakSelf = self;
-        gd_apply_reencode_format_to_button(self.reencodeFormatButton, format, ^(NSString *selectedFormat) {
+        gd_apply_reencode_format_selection(self.reencodeFormatField, self.reencodeFormatButton, format, ^(NSString *selectedFormat) {
             [weakSelf gd_reencodeFormatSelected:selectedFormat];
         });
     }
