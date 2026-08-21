@@ -467,16 +467,6 @@ static void gd_configure_glass_button_fixed_corner_radius(UIButton *button, CGFl
     if ([button respondsToSelector:setConfiguration]) {
         ((void (*)(id, SEL, id))objc_msgSend)(button, setConfiguration, configuration);
     }
-
-    // Continuous ("squircle") corner curve, same as every plain glass
-    // surface in this file gets automatically from UICornerConfiguration
-    // and the pre-26 fallback sets explicitly (see
-    // gd_style_button_as_native_glass). UIButtonConfiguration.background
-    // has no curve API of its own - this is a no-op for whatever the
-    // Liquid Glass background subview actually renders with, but it's
-    // free and keeps the button's own layer consistent with every other
-    // rounded surface in the panel.
-    button.layer.cornerCurve = kCACornerCurveContinuous;
 }
 
 // Native Liquid Glass BUTTON styling - distinct from the hand-rolled
@@ -571,40 +561,24 @@ static void gd_style_icon_button_as_native_glass(UIButton *button, UIImage *imag
     button.contentHorizontalAlignment = UIControlContentHorizontalAlignmentCenter;
 }
 
-// Intended to read as the same curvature as the Auth section's own text
-// fields (gd_wrap_field_in_native_glass's own cornerRadius argument, 6pt
-// at its two call sites) - but a plain numeric match isn't actually a
-// visual match. The fields get their corner shape from
-// UICornerConfiguration (via gd_configure_glass_corners), which is
-// Liquid Glass's own continuous/"squircle" corner curve. A
-// UIButtonConfiguration's background.cornerRadius has no equivalent
-// curve API - it's the older, plain-circular corner model - so at the
-// *same* numeric radius it reads visibly sharper than the fields next
-// to it. gd_configure_glass_button_fixed_corner_radius (below) now also
-// sets the button's own layer.cornerCurve to continuous as a harmless
-// belt-and-suspenders match for the pre-26 fallback path, but that
-// doesn't reach the internal glass background subview on the Liquid
-// Glass path - so the radius itself is bumped up slightly (6 -> 8) to
-// compensate for circular corners reading tighter than continuous ones
-// at an identical radius. Kept as a named constant so the Verify button
-// and the Re-Encoding format button below can't drift apart from each
-// other; NOT reused for the fields themselves (those pass their own
-// literal 6 to gd_wrap_field_in_native_glass), so bumping this doesn't
-// touch them.
-static const CGFloat kGDAuthFieldCornerRadius = 8;
+// Same 6pt radius as the Auth section's own text fields
+// (gd_wrap_field_in_native_glass's own cornerRadius argument at its two
+// call sites) - kept as a named constant so the Verify button below and
+// the fields it sits next to can't drift apart.
+static const CGFloat kGDAuthFieldCornerRadius = 6;
 
 // Auth section's "Verify" button - gd_style_button_as_native_glass on
 // its own gives every button iOS 26's default fully-rounded glass pill,
 // which reads as a mismatched shape sitting directly against the
-// square-ish PAT field beside it. Per the person's spec, this reapplies
-// a fixed radius on top (kGDAuthFieldCornerRadius - see its own comment
-// for why that's 8, not the fields' literal 6) - and does it every time
-// the button's glass configuration gets rebuilt, since restyling (see
-// -gd_authVerifyTapped:'s "Verifying…"/"Verify" swap) replaces the
-// configuration and would otherwise silently revert to the pill.
-// Pre-iOS-26, gd_style_button_as_native_glass's own fallback never sets
-// a cornerRadius at all (defaults to a plain square corner), so the
-// explicit radius there is just for consistency across OS versions
+// square-ish (6pt corner) PAT field beside it. Per the person's spec,
+// this reapplies that same 6pt radius on top, via the identical
+// gd_configure_glass_corners call the fields themselves use - and does
+// it every time the button's glass configuration gets rebuilt, since
+// restyling (see -gd_authVerifyTapped:'s "Verifying…"/"Verify" swap)
+// replaces the configuration and would otherwise silently revert to
+// the pill. Pre-iOS-26, gd_style_button_as_native_glass's own fallback
+// never sets a cornerRadius at all (defaults to a plain square corner),
+// so the explicit 6pt there is just for consistency across OS versions
 // rather than fixing a visible mismatch.
 // THE PREVIOUS FIX, AND WHY IT STILL SHOWED A PILL: the original attempt
 // called gd_configure_glass_corners on the button itself - the same
@@ -628,30 +602,11 @@ static const CGFloat kGDAuthFieldCornerRadius = 8;
 // Fix: gd_configure_glass_button_fixed_corner_radius (above) mutates the
 // *configuration's* cornerStyle/background.cornerRadius instead, which is
 // what the rebuild actually reads, and writes it back via -setConfiguration:
-// so UIButton picks up the change.
-//
-// A follow-up attempt on top of that also hooked configurationUpdateHandler
-// to reassert the corner on every state-driven rebuild "defensively" -
-// that's what was still shipping, and it's what turned out to cause both
-// the still-a-pill "Verifying…" state AND the encoder dropdown not opening
-// (see gd_apply_reencode_format_selection). configurationUpdateHandler
-// fires synchronously mid-touch, for every control-state transition
-// (highlighted, disabled, ...), including the touch-down that
-// showsMenuAsPrimaryAction relies on to present its menu, and including
-// the -gd_authVerifyTapped: transition into `enabled = NO`. Calling
-// -setConfiguration: again from inside that handler - the same mutate-and-
-// write-back this function already does once, correctly, at the actual
-// restyle call sites below and in -gd_authVerifyTapped: - fights UIKit's
-// own in-flight handling of that same touch: it can leave a disabled
-// button's *rendered* glass on whatever shape the system's own disabled-
-// state derivation just produced (observed as a pill, regardless of what
-// was written a moment earlier), and it can cancel showsMenuAsPrimaryAction's
-// pending menu presentation outright. There's nothing this handler does
-// that isn't already covered by the two explicit call sites (this
-// function itself, and -gd_authVerifyTapped:'s Verify/Verifying… swap) -
-// every actual configuration change already goes through
-// gd_configure_glass_button_fixed_corner_radius once, deliberately. So
-// the fix here is to just not add the second, touch-time one.
+// so UIButton picks up the change. configurationUpdateHandler is kept as a
+// defensive re-assertion on top of that - now calling the corrected
+// function - since it costs nothing and this exact class of bug (assuming
+// a property is read that isn't) is the one that burned this control twice
+// already.
 static void gd_style_auth_verify_button(UIButton *button, NSString *title) {
     gd_style_button_as_native_glass(button, title, gd_accent_green_color());
     button.titleLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightSemibold];
@@ -660,6 +615,44 @@ static void gd_style_auth_verify_button(UIButton *button, NSString *title) {
         button.layer.cornerRadius = kGDAuthFieldCornerRadius;
         button.clipsToBounds = YES;
     }
+
+    SEL setUpdateHandler = NSSelectorFromString(@"setConfigurationUpdateHandler:");
+    if ([button respondsToSelector:setUpdateHandler]) {
+        void (^reassertCorners)(__kindof UIButton *) = ^(__kindof UIButton *btn) {
+            gd_configure_glass_button_fixed_corner_radius(btn, kGDAuthFieldCornerRadius);
+        };
+        ((void (*)(id, SEL, id))objc_msgSend)(button, setUpdateHandler, reassertCorners);
+    }
+}
+
+// Swaps the Verify button between "Verify" and "Verifying…" in place -
+// same pill, same size, just the label content cross-fading rather than
+// snapping instantly. gd_style_auth_verify_button itself has no
+// animation of its own (it's a synchronous configuration rebuild), so
+// this wraps that same call in a UIView cross-dissolve transition on
+// the button rather than duplicating any of its styling logic. Snapshot-
+// based (transitionWithView: diffs the view's rendered content before
+// and after the animations block runs), so it doesn't matter that
+// gd_style_auth_verify_button replaces the button's underlying
+// UIButtonConfiguration/title subview wholesale rather than mutating
+// existing text in place - the transition only cares about the button's
+// rendered appearance before vs. after, not how it got there.
+// -gd_authVerifyTapped: calls this instead of gd_style_auth_verify_button
+// directly for both the "Verify" -> "Verifying…" swap and the revert
+// back, so the label content fades between the two states in the same
+// button instead of the earlier behavior of a separate "Verifying…"
+// button replacing it outright. The button's very first styling (its
+// initial creation in -buildPanel:) still goes through
+// gd_style_auth_verify_button directly, with no transition wanted for
+// that one-time setup.
+static void gd_crossfade_auth_verify_button_title(UIButton *button, NSString *title) {
+    [UIView transitionWithView:button
+                       duration:0.2
+                        options:UIViewAnimationOptionTransitionCrossDissolve | UIViewAnimationOptionAllowUserInteraction
+                     animations:^{
+        gd_style_auth_verify_button(button, title);
+    }
+                     completion:nil];
 }
 
 // Associated-object key backing the generic hold-to-confirm gesture
@@ -2413,21 +2406,32 @@ static void gd_apply_reencode_format_selection(UIButton *button, NSString *forma
         button.clipsToBounds = YES;
     }
 
-    // NOTE: this used to also hook configurationUpdateHandler here as a
-    // "defensive" re-assertion of the corner radius on every state-driven
-    // rebuild, mirroring gd_style_auth_verify_button. That handler fires
-    // synchronously mid-touch - including on the exact touch-down that
-    // showsMenuAsPrimaryAction (below) uses to decide whether to present
-    // its menu - and calling -setConfiguration: again from inside it was
-    // cancelling that in-flight menu presentation: the button visibly
-    // highlighted (so it read as "interactable") but the menu itself
-    // never appeared. See gd_style_auth_verify_button's header comment
-    // for the full explanation - removed there for the same reason.
-    // Nothing is lost: every real change to this button's configuration
-    // already goes through gd_configure_glass_button_fixed_corner_radius
-    // once above, at the only two places this button actually gets
-    // restyled (initial build and -gd_reencodeFormatSelected:'s refresh).
-
+    // NOT doing the Verify button's defensive configurationUpdateHandler
+    // reassertion here (see gd_style_auth_verify_button) - this button
+    // gave itself away as "tappable but the menu never opens", and that
+    // handler is why. showsMenuAsPrimaryAction presents its UIMenu off
+    // the same touch-down that also fires a configuration-update pass
+    // for the highlight state; a handler that turns around and calls
+    // -setConfiguration: on the button *during* that pass tears down and
+    // rebuilds the button's internal configuration-driven subviews
+    // mid-gesture, which cancels the pending menu presentation before it
+    // ever appears - the tap still registers (the button visibly
+    // highlights), there's just no dropdown left to show by the time the
+    // rebuild finishes. The Verify button doesn't have this problem
+    // because it isn't a menu button; it can afford to rebuild its
+    // configuration on every touch.
+    // It also isn't needed here the way it was for Verify: Verify's
+    // handler exists because gd_style_auth_verify_button swaps in an
+    // entirely fresh glassButtonConfiguration on every restyle (title
+    // change), which resets cornerStyle back to the capsule default each
+    // time. This button never does that after its initial build - the
+    // cornerStyle/background.cornerRadius set via
+    // gd_configure_glass_button_fixed_corner_radius just above are
+    // mutations of the button's existing configuration object, and
+    // UIKit's own automatic per-state configuration updates (the ones
+    // that would otherwise fire this handler) only touch background/
+    // foreground tint, not cornerStyle - so the corner radius already
+    // survives every tap without reasserting it.
     button.menu = gd_build_reencode_format_menu(format, onSelect);
     button.showsMenuAsPrimaryAction = YES; // tap opens the menu directly - no long-press/context-menu gesture needed
 }
@@ -6888,18 +6892,8 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
 // saved, then asks BundleDoctorService to confirm the repo link + token
 // authenticate against the GitHub API - see
 // +[BundleDoctorService verifyCredentialsForConfig:completion:]. Button
-// is blocked from re-entry and relabeled for the duration of the check
-// so a second tap can't stack a duplicate request on top of the first.
-//
-// Deliberately NOT `sender.enabled = NO` - a UIButtonConfiguration-driven
-// glass button's disabled appearance is derived by the system, and that
-// derivation was the other half of why this button kept rendering as a
-// pill in its "Verifying…" state (see gd_style_auth_verify_button's
-// header comment for the configurationUpdateHandler half of it).
-// userInteractionEnabled blocks the same double-tap without going
-// through that disabled-state machinery at all, so the Fixed corner
-// style gd_style_auth_verify_button just applied has nothing left to
-// fight. Dimmed manually to still read as non-interactive.
+// is disabled and relabeled for the duration of the check so a second
+// tap can't stack a duplicate request on top of the first.
 - (void)gd_authVerifyTapped:(UIButton *)sender {
     [self gd_persistAuthFields];
 
@@ -6910,18 +6904,16 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
         return;
     }
 
-    sender.userInteractionEnabled = NO;
-    sender.alpha = 0.6;
-    gd_style_auth_verify_button(sender, @"Verifying\u2026");
+    sender.enabled = NO;
+    gd_crossfade_auth_verify_button_title(sender, @"Verifying\u2026");
 
     __weak typeof(self) weakSelf = self;
     [BundleDoctorService verifyCredentialsForConfig:config completion:^(BOOL valid, NSError *verifyError) {
         __strong typeof(weakSelf) strongSelf = weakSelf;
         if (!strongSelf) return;
 
-        sender.userInteractionEnabled = YES;
-        sender.alpha = 1.0;
-        gd_style_auth_verify_button(sender, @"Verify");
+        sender.enabled = YES;
+        gd_crossfade_auth_verify_button_title(sender, @"Verify");
 
         if (valid) {
             [strongSelf gd_presentModsAlertWithTitle:@"Credentials Verified"
