@@ -29,6 +29,12 @@ static const NSTimeInterval kBDSRunDiscoveryPollInterval = 2.0;
 static const NSTimeInterval kBDSRunCompletionTimeout = 600.0; // waiting for the run itself to finish - AssetsTools.NET re-encoding can be slow on a big bundle
 static const NSTimeInterval kBDSRunCompletionPollInterval = 5.0;
 
+// Persistence for the Config section's "Disable LZ4HC compression on
+// dispatch" switch - same NSUserDefaults approach as
+// PatchManifestNetwork's own Config-driven boolean (see that file for
+// the equivalent).
+static NSString * const kBDSUploadCompressionEnabledDefaultsKey = @"com.120F.BundleDoctorService.uploadCompressionEnabled";
+
 static NSString *bds_compressionLabel(uint8_t type) {
     switch (type) {
         case 0: return @"none";
@@ -47,6 +53,12 @@ static NSString *bds_compressionLabel(uint8_t type) {
 // that this on-device parser cannot faithfully reproduce.
 static NSData *bds_prepareBundleDataForUpload(NSData *data, NSError **error) {
     if (data.length == 0) return data;
+
+    if (![BundleDoctorService isUploadCompressionEnabled]) {
+        ZLog(@"[BundleDoctorService] upload compression disabled via Config switch - uploading %lu bytes unchanged",
+             (unsigned long)data.length);
+        return data;
+    }
 
     NSString *tmpName = [NSString stringWithFormat:@"bds-upload-%@.bundle", NSUUID.UUID.UUIDString];
     NSString *tmpPath = [NSTemporaryDirectory() stringByAppendingPathComponent:tmpName];
@@ -194,6 +206,19 @@ totalBytesExpectedToSend:(int64_t)totalBytesExpectedToSend {
 #pragma mark - BundleDoctorService
 
 @implementation BundleDoctorService
+
++ (BOOL)isUploadCompressionEnabled {
+    id stored = [NSUserDefaults.standardUserDefaults objectForKey:kBDSUploadCompressionEnabledDefaultsKey];
+    // No stored value yet (fresh install, or a build predating this
+    // switch) - default to YES so behavior doesn't silently change out
+    // from under anyone already relying on it.
+    return stored ? [stored boolValue] : YES;
+}
+
++ (void)setUploadCompressionEnabled:(BOOL)enabled {
+    [NSUserDefaults.standardUserDefaults setBool:enabled forKey:kBDSUploadCompressionEnabledDefaultsKey];
+    ZLog(@"[BundleDoctorService] upload compression %@ via Config switch", enabled ? @"enabled" : @"disabled");
+}
 
 #pragma mark Public entry point
 

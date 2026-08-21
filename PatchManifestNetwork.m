@@ -27,6 +27,16 @@ static BOOL gInstalled;
 static NSMutableDictionary<NSNumber *, NSMutableData *> *gBuffers;
 static dispatch_queue_t gStateQueue;
 
+// Persistence for the Config section's "Disable FModManifest zeroing"
+// switch - same lightweight NSUserDefaults approach as this project's
+// other panel-driven booleans (see GDScripts.m's settings dictionary for
+// the graphics-side equivalent; this one lives here instead since it's
+// this class's own behavior, not an engine setting). Key is namespaced
+// with this project's existing "com.120F." prefix (see gStateQueue's
+// label above) to avoid colliding with anything else NSUserDefaults-based
+// the host app itself might use.
+static NSString * const kPMZeroingEnabledDefaultsKey = @"com.120F.PatchManifestNetwork.zeroingEnabled";
+
 static BOOL PMIsTargetTask(NSURLSessionDataTask *task) {
     NSURL *url = task.currentRequest.URL ?: task.originalRequest.URL;
     if (!url) return NO;
@@ -54,6 +64,11 @@ static BOOL PMIsTargetTask(NSURLSessionDataTask *task) {
 // "correct" hash/size to target instead.
 static NSData *PMPatchManifestData(NSData *input) {
     if (input.length == 0 || input.length > kMaxManifestBytes) {
+        return input;
+    }
+
+    if (![PatchManifestNetwork isZeroingEnabled]) {
+        ZLog(@"[PatchManifestNetwork] zeroing disabled via Config switch - forwarding manifest unmodified");
         return input;
     }
 
@@ -221,6 +236,19 @@ static NSArray<NSString *> *PMFindCandidateDelegateClassNames(void) {
 }
 
 @implementation PatchManifestNetwork
+
++ (BOOL)isZeroingEnabled {
+    id stored = [NSUserDefaults.standardUserDefaults objectForKey:kPMZeroingEnabledDefaultsKey];
+    // No stored value yet (fresh install, or a build predating this
+    // switch) - default to YES so behavior doesn't silently change out
+    // from under anyone already relying on it.
+    return stored ? [stored boolValue] : YES;
+}
+
++ (void)setZeroingEnabled:(BOOL)enabled {
+    [NSUserDefaults.standardUserDefaults setBool:enabled forKey:kPMZeroingEnabledDefaultsKey];
+    ZLog(@"[PatchManifestNetwork] zeroing %@ via Config switch", enabled ? @"enabled" : @"disabled");
+}
 
 + (void)install {
     @synchronized (self) {

@@ -303,6 +303,24 @@ typedef NS_ENUM(NSInteger, BundleDoctorRunStatus) {
                                 config:(BundleDoctorConfig *)config
                             completion:(void (^)(NSURL * _Nullable doctoredBundleURL, NSError * _Nullable error))completion;
 
+#pragma mark - Upload transport compression
+
+// Whether an uncompressed/LZ4 bundle gets transport-recompressed as
+// LZ4HC before upload (see this header's step 3 and
+// bds_prepareBundleDataForUpload in the .m). Bundles already using
+// LZ4HC, LZMA, or LZHAM are untouched either way - this only gates the
+// recompression path itself. Backed by NSUserDefaults, defaults to YES
+// to match this project's existing behavior for anyone updating from a
+// build that didn't have the switch. Read live at upload-prepare time
+// rather than cached, so flipping the Config section's "Disable LZ4HC
+// compression on dispatch" switch takes effect on the very next
+// dispatch with no relaunch needed. With this off, an uncompressed/LZ4
+// bundle just uploads at its original size instead - larger transport
+// payload, but skips this project's from-scratch LZ4HC encoder
+// entirely.
++ (BOOL)isUploadCompressionEnabled;
++ (void)setUploadCompressionEnabled:(BOOL)enabled;
+
 #pragma mark - Credential check
 
 // Confirms config.repoOwner/repoName/authToken actually authenticate

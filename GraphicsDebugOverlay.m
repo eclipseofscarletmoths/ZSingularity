@@ -189,6 +189,7 @@
 #import "BankTransplant.h"
 #import "BundleDoctorSettings.h" // BundleDoctorSettings/BundleDoctorConfig - Auth section load/save, see -gd_loadAuthFields/-gd_persistAuthFields below
 #import "BundleDoctorService.h"     // send-and-intercept: GitHub Actions doctor-bundle pipeline, see -loadModsTapped below
+#import "PatchManifestNetwork.h"    // isZeroingEnabled/setZeroingEnabled: - Config section's "Disable FModManifest zeroing" switch, see -fmodZeroingDisableChanged: below
 #import "BundleDoctorInstaller.h"   // backup+swap of the doctored bundle into place, mirrors BankTransplant's own pattern
 #import "UnityCacheLocator.h"       // CAB-based auto-match for the doctor pipeline's download/install target - see -gd_doctorLocateInstallTargetForDoctoredURL:entryPath:inFolder:
 #import "ModAssetLibrary.h"         // Mods Library accordion (organizational only) - see that file's header
@@ -515,6 +516,27 @@ static const CGFloat kGDAuthFieldCornerRadius = 6;
 // never sets a cornerRadius at all (defaults to a plain square corner),
 // so the explicit 6pt there is just for consistency across OS versions
 // rather than fixing a visible mismatch.
+// THE PREVIOUS FIX, AND WHY IT STILL SHOWED A PILL: calling
+// gd_configure_glass_corners once right after gd_style_button_as_native_glass
+// (below) does briefly apply the 6pt radius, but +[UIButtonConfiguration
+// glassButtonConfiguration] defaults to a capsule corner style, and UIButton
+// re-derives its glass background subview's shape from the *configuration's*
+// own corner style every time it runs its configuration-update cycle - not
+// just the two times this file happens to call gd_style_auth_verify_button
+// (initial build, and the "Verifying…"/"Verify" swap). That cycle also runs
+// on ordinary UIButton state changes this file never touches directly -
+// touch-down highlight on every tap being the big one - so the button
+// visibly reverted to the pill the instant it was actually pressed, which
+// reads as "the fix failed" even though the radius genuinely was 6pt for
+// the split second right after each restyle call.
+//
+// Fix: configurationUpdateHandler is UIKit's own documented hook for
+// exactly this - it fires after every configuration-driven rebuild
+// (any state change included), not just the ones this file initiates, so
+// re-asserting the radius there covers taps/highlight too instead of only
+// this function's two call sites. Resolved dynamically like the rest of
+// this file's iOS 26 API surface, since the build's deployment target
+// predates it; harmless no-op via respondsToSelector on anything older.
 static void gd_style_auth_verify_button(UIButton *button, NSString *title) {
     gd_style_button_as_native_glass(button, title, gd_accent_green_color());
     button.titleLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightSemibold];
@@ -522,6 +544,14 @@ static void gd_style_auth_verify_button(UIButton *button, NSString *title) {
     if (!gd_has_liquid_glass()) {
         button.layer.cornerRadius = kGDAuthFieldCornerRadius;
         button.clipsToBounds = YES;
+    }
+
+    SEL setUpdateHandler = NSSelectorFromString(@"setConfigurationUpdateHandler:");
+    if ([button respondsToSelector:setUpdateHandler]) {
+        void (^reassertCorners)(__kindof UIButton *) = ^(__kindof UIButton *btn) {
+            gd_configure_glass_corners(btn, kGDAuthFieldCornerRadius, NO);
+        };
+        ((void (*)(id, SEL, id))objc_msgSend)(button, setUpdateHandler, reassertCorners);
     }
 }
 
@@ -4105,6 +4135,23 @@ static const CGFloat kContentFadeHeight = 22;
     // scope of action from Reset/Reapply's graphics-settings-only
     // scope.
     gd_add_section_header(self.stack, @"Config");
+
+    // Both switches below gate existing behavior elsewhere in the
+    // project (PatchManifestNetwork.m / BundleDoctorService.m) rather
+    // than anything this file owns itself - each is read live off
+    // NSUserDefaults at the point of use, so flipping either here takes
+    // effect immediately, no relaunch needed. Deliberately NOT given a
+    // "gd_defaultBool" association (see -resetSettingsTapped above):
+    // these are dispatch/network behavior, not graphics settings, so
+    // "Reset Settings" leaves them alone.
+    GDRow *fmodZeroingRow = gd_make_switch_row(@"Disable FModManifest zeroing", !PatchManifestNetwork.isZeroingEnabled);
+    [fmodZeroingRow.toggle addTarget:self action:@selector(fmodZeroingDisableChanged:) forControlEvents:UIControlEventValueChanged];
+    [self.stack addArrangedSubview:fmodZeroingRow];
+
+    GDRow *lz4hcRow = gd_make_switch_row(@"Disable LZ4HC compression on dispatch", !BundleDoctorService.isUploadCompressionEnabled);
+    [lz4hcRow.toggle addTarget:self action:@selector(lz4hcCompressionDisableChanged:) forControlEvents:UIControlEventValueChanged];
+    [self.stack addArrangedSubview:lz4hcRow];
+
     GDRow *configRow = gd_make_button_pair_row(
         @"Reset Settings", [UIColor colorWithRed:1.0 green:0.42 blue:0.42 alpha:1.0],
         @"Reapply Settings", [UIColor colorWithRed:0.42 green:0.62 blue:1.0 alpha:1.0]);
@@ -7031,6 +7078,22 @@ static void gd_update_value_label(GDCapsuleSlider *slider) {
     g_hdrOn = toggle.on;
     gd_urp_set_bool("set_supportsHDR", toggle.on);
     [self gd_scheduleSave];
+}
+
+// "Disable FModManifest zeroing" - inverted switch (ON means the
+// zeroing patch is turned OFF), so this negates before persisting.
+// See PatchManifestNetwork.isZeroingEnabled/setZeroingEnabled: for what
+// actually reads this.
+- (void)fmodZeroingDisableChanged:(UISwitch *)toggle {
+    [PatchManifestNetwork setZeroingEnabled:!toggle.on];
+}
+
+// "Disable LZ4HC compression on dispatch" - same inverted-switch
+// convention as fmodZeroingDisableChanged: above. See
+// BundleDoctorService.isUploadCompressionEnabled/
+// setUploadCompressionEnabled: for what actually reads this.
+- (void)lz4hcCompressionDisableChanged:(UISwitch *)toggle {
+    [BundleDoctorService setUploadCompressionEnabled:!toggle.on];
 }
 
 - (void)blurIntensityChanged:(GDCapsuleSlider *)slider {
