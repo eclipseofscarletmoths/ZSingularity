@@ -2251,20 +2251,32 @@ static UIVisualEffectView *gd_wrap_field_in_native_glass(UITextField *field, CGF
 // menu system at all - see below.
 //
 // New behavior (per request): tapping reencodeFormatButton doesn't pop
-// a system menu - it grows a plain UIView (reencodeDropdownOverlay)
-// downward directly under the button, in place, with one option row per
-// gd_reencode_format_options() entry and a 1px hairline divider between
-// each pair of rows. Because that overlay is added to self.contentOverlay
+// a system menu - it grows a real Liquid Glass surface
+// (reencodeDropdownOverlay, a UIVisualEffectView over UIGlassEffect,
+// interactive like the collapsed button itself) downward directly under
+// the button, in place, with one option row per gd_reencode_format_options()
+// entry and a 1px hairline divider between each pair of rows. The
+// collapsed button is hidden the instant the overlay appears at that
+// button's own frame, so what reads on screen is the button itself
+// growing into the option list, not a new element appearing next to it -
+// see -gd_openReencodeDropdown for the frame/alpha choreography behind
+// that illusion. Because that overlay is added to self.contentOverlay
 // (a window-level view that sits above the scroll view's content, not
 // inside self.stack), expanding it never touches the stack's own Auto
 // Layout - every other row in the panel stays exactly where it was, per
 // request; the overlay simply paints over whatever rows happen to sit
 // below the button while it's open. Picking an option (or tapping the
-// scrim behind the overlay - see reencodeDropdownScrim) animates the
+// scrim behind the overlay - see reencodeDropdownScrim) morphs the
 // overlay back down to a single row showing the pick and tears it down,
 // un-hiding the real button underneath with its title already updated -
 // see -gd_openReencodeDropdown/-gd_closeReencodeDropdownAnimated:/
 // -gd_reencodeDropdownOptionTapped: below for the actual mechanics.
+//
+// The collapsed button's own trailing chevron is a separate pinned
+// subview rather than part of its UIButtonConfiguration - see
+// gd_reencode_chevron_view below gd_make_dropdown_chevron_image - so it
+// can sit flush against the button's trailing edge instead of just
+// riding next to the title text.
 
 // Canonical BundleDoctorConfig.outputFormat strings this picker offers -
 // exactly the five the doctor-bundle workflow's own `output_format`
@@ -2288,6 +2300,20 @@ static NSString * const kGDDefaultReencodeFormat = @"RGBA32";
 static const CGFloat kGDReencodeFieldWidth = 116;  // fits the widest label ("ASTC 8x8") left-aligned plus the trailing chevron with room to spare
 static const CGFloat kGDReencodeFieldHeight = 28;  // matches every other glass field/button row in this section
 
+// Horizontal padding the title text sits at from the button's leading
+// edge - same 10pt gd_make_reencode_dropdown_option_button already uses
+// for its own titleEdgeInsets, so text doesn't visibly shift left/right
+// when the button morphs into the open dropdown's first row (see
+// -gd_openReencodeDropdown). The trailing chevron (see
+// gd_reencode_chevron_view below) is pinned this same distance from the
+// button's trailing edge, so both sides read as symmetric padding.
+static const CGFloat kGDReencodeHorizontalPadding = 10;
+
+// Room reserved on the trailing side of the title, beyond
+// kGDReencodeHorizontalPadding, so the widest label ("ASTC 8x8") never
+// runs in under the chevron glyph sitting on top of it.
+static const CGFloat kGDReencodeChevronReserve = 20;
+
 // Full name shown both as the collapsed button's own text and as each
 // row's label inside the open dropdown - the field is wide enough now
 // (see gd_make_reencode_format_row) that there's no need for the old
@@ -2306,8 +2332,8 @@ static NSString *gd_reencode_format_display_name(NSString *format) {
 // baked as a template-rendered UIImage at the field's own dim tint
 // (rather than left to the button's baseForegroundColor) so it stays
 // visually secondary to the value text next to it regardless of what
-// tint the button itself is given. Used as the button's trailing
-// configuration.image - see gd_style_reencode_format_button below. The
+// tint the button itself is given. Used as the image for the pinned
+// trailing chevron subview - see gd_reencode_chevron_view below. The
 // button itself is simply hidden while the dropdown is open (see
 // -gd_openReencodeDropdown), so there's no separate "open" state of this
 // glyph to draw.
@@ -2317,6 +2343,43 @@ static UIImage *gd_make_dropdown_chevron_image(void) {
     chevronImage = [chevronImage imageWithTintColor:[UIColor colorWithWhite:1 alpha:0.55]
                                        renderingMode:UIImageRenderingModeAlwaysOriginal];
     return chevronImage;
+}
+
+// Trailing chevron, pinned to the button's own trailing edge rather than
+// riding along next to the title text. UIButtonConfiguration's
+// image/imagePlacement/imagePadding (the old approach here) treats
+// title+image as one hugging content block, so a Leading-aligned button
+// only ever gets "chevron right after the text", not "chevron flush
+// against the button's right edge" - there's no configuration knob that
+// splits the two apart to opposite edges of the same button, per this
+// pragma mark's own header comment. Fix: give the chevron its own
+// existence as a plain subview of the button, laid out with real Auto
+// Layout against the button's edges instead of through the
+// configuration at all. It's cached via associated object (keyed off
+// `button`) so repeat calls from -gd_reencodeFormatSelected: reuse the
+// same view instead of stacking duplicates.
+static UIImageView *gd_reencode_chevron_view(UIButton *button) {
+    static const void *kChevronKey = &kChevronKey;
+    UIImageView *chevron = objc_getAssociatedObject(button, kChevronKey);
+    if (!chevron) {
+        chevron = [[UIImageView alloc] initWithImage:gd_make_dropdown_chevron_image()];
+        chevron.translatesAutoresizingMaskIntoConstraints = NO;
+        chevron.contentMode = UIViewContentModeCenter;
+        // Purely decorative - taps anywhere on the button (including
+        // right on top of the chevron) should hit the button itself.
+        chevron.userInteractionEnabled = NO;
+        [button addSubview:chevron];
+        [NSLayoutConstraint activateConstraints:@[
+            // Same distance from the button's trailing edge as the title
+            // sits from its leading edge (kGDReencodeHorizontalPadding),
+            // so the two paddings read as symmetric.
+            [chevron.trailingAnchor constraintEqualToAnchor:button.trailingAnchor
+                                                    constant:-kGDReencodeHorizontalPadding],
+            [chevron.centerYAnchor constraintEqualToAnchor:button.centerYAnchor],
+        ]];
+        objc_setAssociatedObject(button, kChevronKey, chevron, OBJC_ASSOCIATION_RETAIN);
+    }
+    return chevron;
 }
 
 // (Re)applies the current selection to the collapsed button's look only -
@@ -2339,23 +2402,23 @@ static void gd_style_reencode_format_button(UIButton *button, NSString *format) 
     if ([button respondsToSelector:getConfiguration]) {
         id configuration = ((id (*)(id, SEL))objc_msgSend)(button, getConfiguration);
         if (configuration) {
-            // Trailing chevron with a small, fixed gap to the title -
-            // the closest a single UIButtonConfiguration gets to the old
-            // text-field-plus-rightView look, see this pragma mark's own
-            // header comment for why an even leading-value/trailing-
-            // chevron-at-the-edge split isn't achievable with one button.
-            SEL setImage = NSSelectorFromString(@"setImage:");
-            if ([configuration respondsToSelector:setImage]) {
-                ((void (*)(id, SEL, id))objc_msgSend)(configuration, setImage, gd_make_dropdown_chevron_image());
-            }
-            SEL setImagePlacement = NSSelectorFromString(@"setImagePlacement:");
-            if ([configuration respondsToSelector:setImagePlacement]) {
-                // NSDirectionalRectEdge.trailing == 8 on the current ABI.
-                ((void (*)(id, SEL, NSUInteger))objc_msgSend)(configuration, setImagePlacement, 8 /* trailing */);
-            }
-            SEL setImagePadding = NSSelectorFromString(@"setImagePadding:");
-            if ([configuration respondsToSelector:setImagePadding]) {
-                ((void (*)(id, SEL, CGFloat))objc_msgSend)(configuration, setImagePadding, 6);
+            // No configuration.image here anymore - the chevron is a
+            // separate subview (see gd_reencode_chevron_view above) laid
+            // out independently of the title. What this configuration
+            // still needs to control is the title's own content insets,
+            // explicitly, so its leading padding is a known constant
+            // (kGDReencodeHorizontalPadding) rather than whatever
+            // glassButtonConfiguration defaults to - the chevron's
+            // trailing padding is pinned to that same constant, and the
+            // two can't match unless both come from it. Trailing gets
+            // extra room (kGDReencodeChevronReserve) so the widest label
+            // never runs in under the chevron.
+            SEL setContentInsets = NSSelectorFromString(@"setContentInsets:");
+            if ([configuration respondsToSelector:setContentInsets]) {
+                NSDirectionalEdgeInsets insets = NSDirectionalEdgeInsetsMake(
+                    6, kGDReencodeHorizontalPadding,
+                    6, kGDReencodeHorizontalPadding + kGDReencodeChevronReserve);
+                ((void (*)(id, SEL, NSDirectionalEdgeInsets))objc_msgSend)(configuration, setContentInsets, insets);
             }
             SEL setConfig = NSSelectorFromString(@"setConfiguration:");
             if ([button respondsToSelector:setConfig]) {
@@ -2369,6 +2432,11 @@ static void gd_style_reencode_format_button(UIButton *button, NSString *format) 
         button.layer.cornerRadius = kGDAuthFieldCornerRadius;
         button.clipsToBounds = YES;
     }
+
+    // Add (first call) or just resurface (repeat calls, after
+    // -setConfiguration: above may have touched the button's internal
+    // content view) the trailing chevron on top of everything else.
+    [button bringSubviewToFront:gd_reencode_chevron_view(button)];
 }
 
 // One row inside the open dropdown overlay - the currently-selected
@@ -6904,10 +6972,15 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
 // gd_reencode_format_options() entry, each kGDReencodeFieldHeight tall
 // (so the stack of rows lines up exactly with the button they grew out
 // of) with a 1px hairline divider between every pair of rows. The
-// overlay starts pinned exactly over the collapsed button, so the grow
-// animation below reads as the button itself stretching downward, and
-// is added to self.contentOverlay - a SIBLING of self.scrollViewport,
-// not a descendant of self.stack - specifically so its growth never
+// overlay starts pinned exactly over the collapsed button, at the same
+// size, same corner radius, and (on iOS 26) the same real interactive
+// glass material the button itself renders with - so hiding the button
+// and showing the overlay in the same run-loop turn is invisible, and
+// what follows genuinely reads as that surface stretching, the way a
+// real Liquid Glass control morphs into an expanded picker rather than
+// a new box appearing and growing to cover it. is added to
+// self.contentOverlay - a SIBLING of self.scrollViewport, not a
+// descendant of self.stack - specifically so its growth never
 // participates in the stack's own Auto Layout pass. Nothing else in the
 // panel moves; the overlay just paints over whatever rows happen to sit
 // below the button until it closes, per request.
@@ -6937,19 +7010,42 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
     [self.contentOverlay addSubview:scrim];
     self.reencodeDropdownScrim = scrim;
 
-    UIView *overlay = [[UIView alloc] initWithFrame:collapsedFrame];
-    overlay.clipsToBounds = YES;
-    overlay.layer.cornerRadius = kGDAuthFieldCornerRadius;
-    overlay.layer.cornerCurve = kCACornerCurveContinuous;
-    overlay.layer.borderWidth = 1;
-    overlay.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.18].CGColor;
-    // Solid-ish (not glass) fill - deliberately opaque enough that
-    // whatever it's covering below reads as clearly inactive while
-    // open, rather than a translucent glass surface letting covered
-    // rows show through and compete for taps visually.
-    overlay.backgroundColor = [UIColor colorWithWhite:0.11 alpha:0.98];
+    // Real native glass on iOS 26 - the exact same gd_make_glass_effect/
+    // gd_configure_glass_corners plumbing gd_wrap_field_in_native_glass
+    // uses for this panel's other glass fields, marked interactive so it
+    // picks up the same press/release response a real Liquid Glass
+    // control gets. Content (option buttons/dividers) has to go in
+    // .contentView for a UIVisualEffectView, not the view itself - see
+    // `rowHost` below and in -gd_closeReencodeDropdownAnimated:. Falls
+    // back to the old flat opaque fill pre-iOS-26, where there's no real
+    // glass material to wrap with anyway (gd_has_liquid_glass() is NO).
+    UIView *overlay;
+    UIVisualEffectView *glassOverlay = nil;
+    if (gd_has_liquid_glass()) {
+        glassOverlay = [[UIVisualEffectView alloc] initWithEffect:gd_make_glass_effect(YES)];
+        glassOverlay.frame = collapsedFrame;
+        glassOverlay.clipsToBounds = YES;
+        gd_configure_glass_corners(glassOverlay, kGDAuthFieldCornerRadius, NO);
+        glassOverlay.layer.borderWidth = 1;
+        glassOverlay.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.18].CGColor;
+        overlay = glassOverlay;
+    } else {
+        overlay = [[UIView alloc] initWithFrame:collapsedFrame];
+        overlay.clipsToBounds = YES;
+        overlay.layer.cornerRadius = kGDAuthFieldCornerRadius;
+        overlay.layer.cornerCurve = kCACornerCurveContinuous;
+        overlay.layer.borderWidth = 1;
+        overlay.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.18].CGColor;
+        // Solid-ish (not glass) fill - deliberately opaque enough that
+        // whatever it's covering below reads as clearly inactive while
+        // open, rather than a translucent surface letting covered rows
+        // show through and compete for taps visually.
+        overlay.backgroundColor = [UIColor colorWithWhite:0.11 alpha:0.98];
+    }
     [self.contentOverlay addSubview:overlay];
     self.reencodeDropdownOverlay = overlay;
+
+    UIView *rowHost = glassOverlay ? glassOverlay.contentView : overlay;
 
     for (NSInteger i = 0; i < (NSInteger)options.count; i++) {
         NSString *format = options[i];
@@ -6958,7 +7054,12 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
                                                                           @selector(gd_reencodeDropdownOptionTapped:));
         optionButton.frame = CGRectMake(0, i * kGDReencodeFieldHeight,
                                          CGRectGetWidth(collapsedFrame), kGDReencodeFieldHeight);
-        [overlay addSubview:optionButton];
+        // Starts invisible - faded in below alongside the grow animation
+        // so the options feel like they're materializing as part of the
+        // same morph, not just sitting there pre-formed under a growing
+        // clip mask.
+        optionButton.alpha = 0;
+        [rowHost addSubview:optionButton];
 
         if (i > 0) {
             // Thin grey separator between each pair of options, sitting
@@ -6970,7 +7071,8 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
             UIView *divider = [[UIView alloc] initWithFrame:CGRectMake(0, i * kGDReencodeFieldHeight - hairline,
                                                                         CGRectGetWidth(collapsedFrame), hairline)];
             divider.backgroundColor = [UIColor colorWithWhite:0.6 alpha:0.5];
-            [overlay addSubview:divider];
+            divider.alpha = 0;
+            [rowHost addSubview:divider];
         }
     }
 
@@ -6987,6 +7089,9 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
                         options:UIViewAnimationOptionCurveEaseOut
                      animations:^{
         overlay.frame = expandedFrame;
+        for (UIView *subview in rowHost.subviews) {
+            subview.alpha = 1;
+        }
     } completion:nil];
 
     UISelectionFeedbackGenerator *haptic = [UISelectionFeedbackGenerator new];
@@ -7027,7 +7132,14 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
         return;
     }
 
-    for (UIView *subview in overlay.subviews) {
+    // Option buttons/dividers live in .contentView for a real glass
+    // overlay (see -gd_openReencodeDropdown) - overlay.subviews on a
+    // UIVisualEffectView would only reach its internal effect/content
+    // views, not the rows added inside contentView.
+    UIView *rowHost = [overlay isKindOfClass:[UIVisualEffectView class]]
+        ? ((UIVisualEffectView *)overlay).contentView
+        : overlay;
+    for (UIView *subview in rowHost.subviews) {
         subview.alpha = 0;
     }
 
