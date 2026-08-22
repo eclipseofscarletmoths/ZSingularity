@@ -2239,58 +2239,38 @@ static UIVisualEffectView *gd_wrap_field_in_native_glass(UITextField *field, CGF
 // choice here is the only change needed; nothing downstream has to know
 // this picker exists.
 //
-// First pass at this used a single UIButton styled via
-// gd_style_button_as_native_glass (+[UIButtonConfiguration
-// glassButtonConfiguration]) sized to a fixed 58x28. That's not what
-// actually went wrong with it, in hindsight - the real fault was that
-// gd_style_button_as_native_glass's default capsule corner style was
-// never corrected (every other capsule-defaulting glass button in this
-// file re-squares itself via a corner-radius call right after, which
-// this one skipped), and its titleLabel didn't match the rest of the
-// panel's fields (monospaced/semibold/tinted vs. the Auth/Debug fields'
-// plain white system font) - together that's exactly "looks like a
-// circular blob, text doesn't match anything else".
+// Rebuilt from scratch as a custom control (per request) rather than
+// Apple's UIMenu/.showsMenuAsPrimaryAction, which is what every earlier
+// pass at this control (see git history/older revisions of this file)
+// was built on: a tap reliably highlighted the button but no menu ever
+// appeared, through three different root causes (capsule corner style,
+// panelGlass's interactive glass winning the touch, and finally a
+// configurationUpdateHandler tearing the button's configuration down
+// mid-presentation). Rather than keep chasing UIMenu presentation
+// timing, this control no longer presents anything through UIKit's
+// menu system at all - see below.
 //
-// Second pass replaced the button entirely with a real (but inert,
-// userInteractionEnabled = NO) UITextField wrapped in the same
-// gd_wrap_field_in_native_glass glass container the Auth/Debug fields
-// use, plus a second, fully transparent UIButtonTypeCustom pinned
-// exactly over it to own .menu/.showsMenuAsPrimaryAction - reasoning
-// being that a UIButtonConfiguration-driven title can't be independently
-// left-aligned next to a trailing chevron the way a UITextField's text +
-// rightView can. That's true, but it bought that layout at the cost of
-// the actual ask (a real Liquid Glass BUTTON) and two views standing in
-// for one, and it's the same underlying capsule-corner problem wearing a
-// different hat: gd_wrap_field_in_native_glass's glass is a plain
-// UIVisualEffectView, which takes a custom corner radius fine, so it
-// never had to solve "give a UIButtonConfiguration glass button a
-// non-capsule corner" - it just avoided the button. See the "Verify"
-// button's own gd_configure_glass_button_fixed_corner_radius above for
-// why that call actually was solvable, and once it's solvable there's no
-// reason not to use the real control.
-//
-// Current approach: back to a single native glass UIButton
-// (gd_style_button_as_native_glass), owning .menu/.showsMenuAsPrimaryAction
-// itself - no second overlay view needed, since this is the actual tap
-// target now, not a decoration sitting under one. Corners are squared via
-// gd_configure_glass_button_fixed_corner_radius, the same reliable
-// mutate-the-configuration approach the Verify button uses. The
-// left-aligned-value / trailing-chevron layout the text-field approach
-// was chasing is approximated with contentHorizontalAlignment = .leading
-// and a trailing chevron image with a small imagePadding gap - the pair
-// reads as a left-anchored value with a small "opens a picker" affordance
-// right after it, rather than a value and chevron pulled to opposite
-// edges of the control (UIButtonConfiguration has no API for that split
-// layout - only UITextField's independent text + rightView slots do, and
-// that's not this control anymore). This is much closer to how UIKit's
-// own menu buttons look elsewhere in iOS 26 than the field-plus-overlay
-// hack was.
+// New behavior (per request): tapping reencodeFormatButton doesn't pop
+// a system menu - it grows a plain UIView (reencodeDropdownOverlay)
+// downward directly under the button, in place, with one option row per
+// gd_reencode_format_options() entry and a 1px hairline divider between
+// each pair of rows. Because that overlay is added to self.contentOverlay
+// (a window-level view that sits above the scroll view's content, not
+// inside self.stack), expanding it never touches the stack's own Auto
+// Layout - every other row in the panel stays exactly where it was, per
+// request; the overlay simply paints over whatever rows happen to sit
+// below the button while it's open. Picking an option (or tapping the
+// scrim behind the overlay - see reencodeDropdownScrim) animates the
+// overlay back down to a single row showing the pick and tears it down,
+// un-hiding the real button underneath with its title already updated -
+// see -gd_openReencodeDropdown/-gd_closeReencodeDropdownAnimated:/
+// -gd_reencodeDropdownOptionTapped: below for the actual mechanics.
 
 // Canonical BundleDoctorConfig.outputFormat strings this picker offers -
 // exactly the five the doctor-bundle workflow's own `output_format`
 // choice input (.github/workflows/doctor-bundle.yml in the re-encoder
 // repo) and Program.cs's ParseOutputTextureFormat both accept verbatim.
-// Order here is the order they appear in the field's menu.
+// Order here is the order they appear in the dropdown, top to bottom.
 static NSArray<NSString *> *gd_reencode_format_options(void) {
     return @[@"ASTC_RGBA_4x4", @"ASTC_RGBA_6x6", @"ASTC_RGBA_8x8", @"RGBA32", @"ETC2"];
 }
@@ -2302,9 +2282,15 @@ static NSArray<NSString *> *gd_reencode_format_options(void) {
 // -[BundleDoctorConfig normalizedConfig], not here.
 static NSString * const kGDDefaultReencodeFormat = @"RGBA32";
 
-// Full name shown both as the field's own text and as each row's title
-// inside the menu - the field is wide enough now (see
-// gd_make_reencode_format_row) that there's no need for the old
+// Shared by both the collapsed button (gd_make_reencode_format_row) and
+// the expanded dropdown overlay (-gd_openReencodeDropdown) so an open
+// dropdown's rows line up exactly with the button they grew out of.
+static const CGFloat kGDReencodeFieldWidth = 116;  // fits the widest label ("ASTC 8x8") left-aligned plus the trailing chevron with room to spare
+static const CGFloat kGDReencodeFieldHeight = 28;  // matches every other glass field/button row in this section
+
+// Full name shown both as the collapsed button's own text and as each
+// row's label inside the open dropdown - the field is wide enough now
+// (see gd_make_reencode_format_row) that there's no need for the old
 // abbreviated short-code display this used to fall back to.
 static NSString *gd_reencode_format_display_name(NSString *format) {
     if ([format isEqualToString:@"ASTC_RGBA_4x4"]) return @"ASTC 4x4";
@@ -2315,36 +2301,16 @@ static NSString *gd_reencode_format_display_name(NSString *format) {
     return format ?: @"RGBA32";
 }
 
-// One UIAction per gd_reencode_format_options() entry, with the
-// currently-selected format's action given UIMenuElementStateOn so UIKit
-// draws its own checkmark next to it - the menu doubles as its own
-// "what's selected right now" indicator every time it's opened, no
-// separate check-glyph bookkeeping needed. `onSelect` fires with the
-// tapped option's canonical string; this function only builds the menu -
-// see -gd_reencodeFormatSelected: for what actually happens on a tap.
-static UIMenu *gd_build_reencode_format_menu(NSString *selectedFormat, void (^onSelect)(NSString *format)) {
-    NSMutableArray<UIAction *> *actions = [NSMutableArray array];
-    for (NSString *format in gd_reencode_format_options()) {
-        BOOL selected = [format isEqualToString:selectedFormat];
-        UIAction *action = [UIAction actionWithTitle:gd_reencode_format_display_name(format)
-                                                image:nil
-                                           identifier:nil
-                                              handler:^(__kindof UIAction * _Nonnull a) {
-            if (onSelect) onSelect(format);
-        }];
-        action.state = selected ? UIMenuElementStateOn : UIMenuElementStateOff;
-        [actions addObject:action];
-    }
-    return [UIMenu menuWithTitle:@"" children:actions];
-}
-
 // Small chevron.up.chevron.down glyph (two vertically-stacked arrows,
 // one up/one down - the standard system "this reveals a picker" glyph),
 // baked as a template-rendered UIImage at the field's own dim tint
 // (rather than left to the button's baseForegroundColor) so it stays
 // visually secondary to the value text next to it regardless of what
 // tint the button itself is given. Used as the button's trailing
-// configuration.image - see gd_apply_reencode_format_selection below.
+// configuration.image - see gd_style_reencode_format_button below. The
+// button itself is simply hidden while the dropdown is open (see
+// -gd_openReencodeDropdown), so there's no separate "open" state of this
+// glyph to draw.
 static UIImage *gd_make_dropdown_chevron_image(void) {
     UIImageSymbolConfiguration *symbolConfig = [UIImageSymbolConfiguration configurationWithPointSize:10 weight:UIImageSymbolWeightSemibold];
     UIImage *chevronImage = [UIImage systemImageNamed:@"chevron.up.chevron.down" withConfiguration:symbolConfig];
@@ -2353,16 +2319,14 @@ static UIImage *gd_make_dropdown_chevron_image(void) {
     return chevronImage;
 }
 
-// (Re)applies the current selection to the button - title text, trailing
-// chevron, and menu - sharing this one place so a fresh build
-// (gd_make_reencode_format_row) and a post-tap refresh
-// (-gd_reencodeFormatSelected:) can never drift out of sync with each
-// other. Corner radius is reapplied here too, defensively - setting a
-// fresh .configuration (which this does, via
-// gd_style_button_as_native_glass) is exactly the kind of rebuild
-// gd_configure_glass_button_fixed_corner_radius's own header comment
-// warns resets an unprotected corner style back to the capsule default.
-static void gd_apply_reencode_format_selection(UIButton *button, NSString *format, void (^onSelect)(NSString *format)) {
+// (Re)applies the current selection to the collapsed button's look only -
+// title text and trailing chevron. No .menu, no showsMenuAsPrimaryAction;
+// this button no longer presents anything through UIKit's menu system -
+// see -gd_reencodeFormatButtonTapped: for what a tap actually does now.
+// Shared by a fresh build (gd_make_reencode_format_row) and a post-pick
+// refresh (-gd_reencodeFormatSelected:) so they can never drift out of
+// sync with each other.
+static void gd_style_reencode_format_button(UIButton *button, NSString *format) {
     // Explicit white (not nil) so this matches every other glass field's
     // plain white text on pre-iOS-26 too - gd_style_button_as_native_glass's
     // own fallback only sets a titleColor when it's given a non-nil tint,
@@ -2405,57 +2369,39 @@ static void gd_apply_reencode_format_selection(UIButton *button, NSString *forma
         button.layer.cornerRadius = kGDAuthFieldCornerRadius;
         button.clipsToBounds = YES;
     }
-
-    // NOT doing the Verify button's defensive configurationUpdateHandler
-    // reassertion here (see gd_style_auth_verify_button) - this button
-    // gave itself away as "tappable but the menu never opens", and that
-    // handler is why. showsMenuAsPrimaryAction presents its UIMenu off
-    // the same touch-down that also fires a configuration-update pass
-    // for the highlight state; a handler that turns around and calls
-    // -setConfiguration: on the button *during* that pass tears down and
-    // rebuilds the button's internal configuration-driven subviews
-    // mid-gesture, which cancels the pending menu presentation before it
-    // ever appears - the tap still registers (the button visibly
-    // highlights), there's just no dropdown left to show by the time the
-    // rebuild finishes. The Verify button doesn't have this problem
-    // because it isn't a menu button; it can afford to rebuild its
-    // configuration on every touch.
-    // It also isn't needed here the way it was for Verify: Verify's
-    // handler exists because gd_style_auth_verify_button swaps in an
-    // entirely fresh glassButtonConfiguration on every restyle (title
-    // change), which resets cornerStyle back to the capsule default each
-    // time. This button never does that after its initial build - the
-    // cornerStyle/background.cornerRadius set via
-    // gd_configure_glass_button_fixed_corner_radius just above are
-    // mutations of the button's existing configuration object, and
-    // UIKit's own automatic per-state configuration updates (the ones
-    // that would otherwise fire this handler) only touch background/
-    // foreground tint, not cornerStyle - so the corner radius already
-    // survives every tap without reasserting it.
-    button.menu = gd_build_reencode_format_menu(format, onSelect);
-    button.showsMenuAsPrimaryAction = YES; // tap opens the menu directly - no long-press/context-menu gesture needed
 }
 
-// Third pass, after the above still didn't fix it: the button itself was
-// never the problem a second time. panelGlass (this button's ancestor -
-// see -buildPanel:) was built with a real interactive UIGlassEffect
-// (glow/bounce touch response) sitting directly in the touch path of
-// every row in the panel, including this button's own
-// UIContextMenuInteraction - it was winning the touch before the menu
-// interaction could present anything, same "highlights, no dropdown"
-// symptom as the second pass above for an unrelated reason. Fixed at the
-// source (panelGlass built with interactive:NO now) rather than here,
-// since nothing about this button's own menu/button setup was ever
-// actually wrong.
+// One row inside the open dropdown overlay - the currently-selected
+// format's label is drawn full-white, every other option dims to match
+// the rest of this section's secondary text. `tag` is the option's index
+// into gd_reencode_format_options(), read back in
+// -gd_reencodeDropdownOptionTapped: so that method doesn't need its own
+// parallel lookup table.
+static UIButton *gd_make_reencode_dropdown_option_button(NSString *format, BOOL selected, NSInteger tag, id target, SEL action) {
+    UIButton *option = [UIButton buttonWithType:UIButtonTypeSystem];
+    option.tag = tag;
+    option.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeading;
+    option.titleEdgeInsets = UIEdgeInsetsMake(0, 10, 0, 10);
+    option.titleLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightRegular];
+    [option setTitle:gd_reencode_format_display_name(format) forState:UIControlStateNormal];
+    [option setTitleColor:(selected ? UIColor.whiteColor : [UIColor colorWithWhite:1 alpha:0.6])
+                  forState:UIControlStateNormal];
+    option.backgroundColor = UIColor.clearColor;
+    // No custom highlighted state - UIButtonTypeSystem already dims its
+    // title on press by default, which is enough press feedback for a
+    // plain row like this without needing a per-row glass effect.
+    [option addTarget:target action:action forControlEvents:UIControlEventTouchUpInside];
+    return option;
+}
 
 // Compact single-line row: title | a real native Liquid Glass button
 // (gd_style_button_as_native_glass) showing the current re-encode format
-// with a trailing chevron.up.chevron.down indicator, owning
-// .menu/.showsMenuAsPrimaryAction itself so a tap presents a native
-// pull-down of every format the repo supports - see this pragma mark's
-// own header comment above for why this replaced the earlier inert-
-// text-field-plus-transparent-overlay-button approach.
-static GDRow *gd_make_reencode_format_row(NSString *selectedFormat, void (^onSelect)(NSString *format)) {
+// with a trailing chevron.up.chevron.down indicator. The button owns no
+// menu of its own now - `target`/`action` are wired to it directly
+// (UIControlEventTouchUpInside), same pattern as this file's other
+// target/action rows (e.g. gd_make_mods_folder_row's tapAction) - see
+// -gd_reencodeFormatButtonTapped: for what the tap does.
+static GDRow *gd_make_reencode_format_row(NSString *selectedFormat, id target, SEL tapAction) {
     GDRow *row = [[GDRow alloc] initWithFrame:CGRectZero];
     row.translatesAutoresizingMaskIntoConstraints = NO;
 
@@ -2470,13 +2416,11 @@ static GDRow *gd_make_reencode_format_row(NSString *selectedFormat, void (^onSel
 
     UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
     button.translatesAutoresizingMaskIntoConstraints = NO;
+    [button addTarget:target action:tapAction forControlEvents:UIControlEventTouchUpInside];
     [row addSubview:button];
     objc_setAssociatedObject(row, "gd_button", button, OBJC_ASSOCIATION_RETAIN);
 
-    gd_apply_reencode_format_selection(button, selectedFormat, onSelect);
-
-    static const CGFloat kFieldWidth = 116; // fits the widest label ("ASTC 8x8") left-aligned plus the trailing chevron with room to spare
-    static const CGFloat kFieldHeight = 28; // matches every other glass field/button row in this section
+    gd_style_reencode_format_button(button, selectedFormat);
 
     // No fixed width here, unlike the slider/mode-slider rows' shared
     // kTitleColumnWidth (92) - that constant is sized for their own short
@@ -2492,8 +2436,8 @@ static GDRow *gd_make_reencode_format_row(NSString *selectedFormat, void (^onSel
         [row.titleLabel.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
 
         [button.trailingAnchor constraintEqualToAnchor:row.trailingAnchor],
-        [button.widthAnchor constraintEqualToConstant:kFieldWidth],
-        [button.heightAnchor constraintEqualToConstant:kFieldHeight],
+        [button.widthAnchor constraintEqualToConstant:kGDReencodeFieldWidth],
+        [button.heightAnchor constraintEqualToConstant:kGDReencodeFieldHeight],
         [button.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
         [row.topAnchor constraintEqualToAnchor:button.topAnchor constant:-3],
         [row.bottomAnchor constraintEqualToAnchor:button.bottomAnchor constant:3],
@@ -3577,13 +3521,22 @@ static UIView *gd_make_title_block(void) {
 @property (nonatomic, strong) UITextField *authTokenField;
 @property (nonatomic, strong) UIButton *authVerifyButton; // "Verify" - see -gd_authVerifyTapped:
 
-// Config section's "Re-Encoding format" picker - see
-// gd_make_reencode_format_row and -gd_reencodeFormatSelected: below.
-// Kept so a selection can refresh the control (title text + menu
-// checkmark) in place without rebuilding the whole panel. A single real
-// native Liquid Glass button now - it owns .menu/.showsMenuAsPrimaryAction
-// itself, no separate overlay view needed.
+// Config section's "Re-Encoding format" picker - a custom-built expanding
+// control now (NOT Apple's UIMenu/.showsMenuAsPrimaryAction - see the
+// "Re-Encoding format (Config section)" pragma mark for why). Kept so a
+// selection can refresh the collapsed control's title in place without
+// rebuilding the whole panel. reencodeDropdownOverlay is the expanded
+// list of options (nil while closed) - it's added to self.contentOverlay,
+// NOT to self.stack, specifically so growing it never reflows any other
+// row in the panel; it just paints over whatever's below the button
+// until it closes. reencodeDropdownScrim is a full-panel invisible tap
+// target that sits behind the overlay only while it's open, purely to
+// close the dropdown on an outside tap - also nil while closed. See
+// -gd_openReencodeDropdown/-gd_closeReencodeDropdownAnimated:.
 @property (nonatomic, strong) UIButton *reencodeFormatButton;
+@property (nonatomic, strong) UIView *reencodeDropdownOverlay;
+@property (nonatomic, strong) UIControl *reencodeDropdownScrim;
+@property (nonatomic, assign) BOOL reencodeDropdownOpen;
 
 // Load Mods is a single button that routes each picked file to its own
 // pipeline by kind (see -gd_handleLoadModsPickedURLs:intoFolder:): a
@@ -4144,15 +4097,16 @@ static const CGFloat kContentFadeHeight = 22;
     // delivering it to a subview, so its own pan gesture gets first
     // refusal on anything that turns into a drag. Ordinary buttons don't
     // notice - a touchUpInside still fires once the touch ends, delay or
-    // not - which is why Verify/Reset/Reapply/etc. all work fine as-is.
-    // The Config section's Re-Encoding format field (see
-    // gd_make_reencode_format_row) is the one control in this panel that
-    // presents its UIMenu via .showsMenuAsPrimaryAction rather than a
-    // plain target-action tap, and that presentation is driven by a far
-    // more timing-sensitive touch-down interaction than a normal button -
-    // held back by the scroll view's default delay, it loses the race
-    // and never gets to present, even though the button still visibly
-    // highlights (the touch itself was never in doubt, only the menu).
+    // not - which is why Verify/Reset/Reapply/the Re-Encoding format
+    // button/etc. all work fine as-is now that all of them are plain
+    // target-action taps (see gd_make_reencode_format_row and the
+    // "Re-Encoding format (Config section)" pragma mark for why that
+    // button in particular no longer presents a UIMenu - it used to be
+    // the one control in this panel that needed this delay disabled,
+    // back when a UIMenu's touch-down-driven presentation was too timing-
+    // sensitive to survive the scroll view's default hold; harmless to
+    // leave disabled now that nothing in the panel depends on it, and
+    // one less thing to re-break if a future control ever adds one back).
     // Every row's own button already owns its taps correctly (see
     // -panelSwiped:'s shouldReceiveTouch: above, which keeps the close-
     // swipe gesture off of them) - it's specifically this scroll view's
@@ -4581,9 +4535,8 @@ static const CGFloat kContentFadeHeight = 22;
     // dispatch would use.
     NSString *currentReencodeFormat = [BundleDoctorSettings loadConfig].outputFormat;
     if (currentReencodeFormat.length == 0) currentReencodeFormat = kGDDefaultReencodeFormat;
-    GDRow *reencodeFormatRow = gd_make_reencode_format_row(currentReencodeFormat, ^(NSString *selectedFormat) {
-        [weakSelf gd_reencodeFormatSelected:selectedFormat];
-    });
+    GDRow *reencodeFormatRow = gd_make_reencode_format_row(currentReencodeFormat, self,
+                                                            @selector(gd_reencodeFormatButtonTapped:));
     self.reencodeFormatButton = objc_getAssociatedObject(reencodeFormatRow, "gd_button");
     [self.stack addArrangedSubview:reencodeFormatRow];
 
@@ -6904,9 +6857,7 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
 
 #pragma mark Re-Encoding format
 
-// Wired to every UIAction in the Re-Encoding format button's menu (see
-// gd_build_reencode_format_menu / gd_make_reencode_format_row, and the
-// Config section in -buildPanel:). Same load-then-overwrite-one-field
+// Persists a newly-picked format. Same load-then-overwrite-one-field
 // pattern as -gd_persistAuthFields above: +saveConfig: is a full
 // replace, so this loads the current config first and only touches
 // outputFormat, leaving repoOwner/repoName/ref/workflowFile/authToken
@@ -6915,7 +6866,11 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
 // +[BundleDoctorSettings loadConfig] immediately before it dispatches,
 // so persisting here is the entire fix - nothing else in the pipeline
 // needs to change for a non-default selection to actually reach the
-// workflow.
+// workflow. Only touches the model and the collapsed button's own
+// label (which is safe to restyle even while it's hidden behind an open
+// dropdown - see -gd_openReencodeDropdown); the dropdown's open/close
+// choreography lives in -gd_reencodeDropdownOptionTapped: below, which
+// calls this first and then closes the dropdown.
 - (void)gd_reencodeFormatSelected:(NSString *)format {
     BundleDoctorConfig *config = [BundleDoctorSettings loadConfig];
     config.outputFormat = format;
@@ -6926,18 +6881,183 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
         return;
     }
 
-    // Refresh the button in place - new title, and the menu's own
-    // checkmark moved onto the newly-selected option - so opening it
-    // again immediately reflects what just got saved.
     if (self.reencodeFormatButton) {
-        __weak typeof(self) weakSelf = self;
-        gd_apply_reencode_format_selection(self.reencodeFormatButton, format, ^(NSString *selectedFormat) {
-            [weakSelf gd_reencodeFormatSelected:selectedFormat];
-        });
+        gd_style_reencode_format_button(self.reencodeFormatButton, format);
     }
 
     UISelectionFeedbackGenerator *haptic = [UISelectionFeedbackGenerator new];
     [haptic selectionChanged];
+}
+
+// Wired directly to reencodeFormatButton's UIControlEventTouchUpInside
+// (see gd_make_reencode_format_row) - a plain toggle, since this control
+// no longer owns a UIMenu to present/dismiss on its own.
+- (void)gd_reencodeFormatButtonTapped:(UIButton *)sender {
+    if (self.reencodeDropdownOpen) {
+        [self gd_closeReencodeDropdownAnimated:YES];
+    } else {
+        [self gd_openReencodeDropdown];
+    }
+}
+
+// Builds reencodeDropdownOverlay: one option row per
+// gd_reencode_format_options() entry, each kGDReencodeFieldHeight tall
+// (so the stack of rows lines up exactly with the button they grew out
+// of) with a 1px hairline divider between every pair of rows. The
+// overlay starts pinned exactly over the collapsed button, so the grow
+// animation below reads as the button itself stretching downward, and
+// is added to self.contentOverlay - a SIBLING of self.scrollViewport,
+// not a descendant of self.stack - specifically so its growth never
+// participates in the stack's own Auto Layout pass. Nothing else in the
+// panel moves; the overlay just paints over whatever rows happen to sit
+// below the button until it closes, per request.
+- (void)gd_openReencodeDropdown {
+    if (!self.reencodeFormatButton || !self.contentOverlay || self.reencodeDropdownOpen) return;
+
+    NSArray<NSString *> *options = gd_reencode_format_options();
+    if (options.count == 0) return;
+
+    BundleDoctorConfig *config = [BundleDoctorSettings loadConfig];
+    NSString *currentFormat = config.outputFormat.length > 0 ? config.outputFormat : kGDDefaultReencodeFormat;
+
+    CGRect collapsedFrame = [self.reencodeFormatButton convertRect:self.reencodeFormatButton.bounds
+                                                              toView:self.contentOverlay];
+
+    // Scrim first (added behind the overlay below) so an outside tap
+    // closes the dropdown without a second gesture recognizer routed
+    // through -gestureRecognizer:shouldReceiveTouch: (which already has
+    // its own job for the panel's close-swipe - see that method above).
+    // Full contentOverlay bounds, so it also blocks taps meant for
+    // whatever rows the overlay is currently covering while it's open,
+    // not just the empty space around the panel.
+    UIControl *scrim = [[UIControl alloc] initWithFrame:self.contentOverlay.bounds];
+    scrim.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    scrim.backgroundColor = UIColor.clearColor;
+    [scrim addTarget:self action:@selector(gd_reencodeDropdownScrimTapped:) forControlEvents:UIControlEventTouchUpInside];
+    [self.contentOverlay addSubview:scrim];
+    self.reencodeDropdownScrim = scrim;
+
+    UIView *overlay = [[UIView alloc] initWithFrame:collapsedFrame];
+    overlay.clipsToBounds = YES;
+    overlay.layer.cornerRadius = kGDAuthFieldCornerRadius;
+    overlay.layer.cornerCurve = kCACornerCurveContinuous;
+    overlay.layer.borderWidth = 1;
+    overlay.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.18].CGColor;
+    // Solid-ish (not glass) fill - deliberately opaque enough that
+    // whatever it's covering below reads as clearly inactive while
+    // open, rather than a translucent glass surface letting covered
+    // rows show through and compete for taps visually.
+    overlay.backgroundColor = [UIColor colorWithWhite:0.11 alpha:0.98];
+    [self.contentOverlay addSubview:overlay];
+    self.reencodeDropdownOverlay = overlay;
+
+    for (NSInteger i = 0; i < (NSInteger)options.count; i++) {
+        NSString *format = options[i];
+        BOOL selected = [format isEqualToString:currentFormat];
+        UIButton *optionButton = gd_make_reencode_dropdown_option_button(format, selected, i, self,
+                                                                          @selector(gd_reencodeDropdownOptionTapped:));
+        optionButton.frame = CGRectMake(0, i * kGDReencodeFieldHeight,
+                                         CGRectGetWidth(collapsedFrame), kGDReencodeFieldHeight);
+        [overlay addSubview:optionButton];
+
+        if (i > 0) {
+            // Thin grey separator between each pair of options, sitting
+            // exactly on the boundary above this option. Hairline height
+            // (1 device pixel, not 1 point) so it reads as crisp as
+            // every other 1px divider in this file rather than a
+            // visibly thick point-wide bar on a 2x/3x screen.
+            CGFloat hairline = 1.0 / MAX(UIScreen.mainScreen.scale, (CGFloat)1.0);
+            UIView *divider = [[UIView alloc] initWithFrame:CGRectMake(0, i * kGDReencodeFieldHeight - hairline,
+                                                                        CGRectGetWidth(collapsedFrame), hairline)];
+            divider.backgroundColor = [UIColor colorWithWhite:0.6 alpha:0.5];
+            [overlay addSubview:divider];
+        }
+    }
+
+    self.reencodeFormatButton.hidden = YES;
+    self.reencodeDropdownOpen = YES;
+
+    CGFloat expandedHeight = kGDReencodeFieldHeight * options.count;
+    CGRect expandedFrame = CGRectMake(CGRectGetMinX(collapsedFrame), CGRectGetMinY(collapsedFrame),
+                                       CGRectGetWidth(collapsedFrame), expandedHeight);
+    [UIView animateWithDuration:0.22
+                          delay:0
+         usingSpringWithDamping:0.86
+          initialSpringVelocity:0
+                        options:UIViewAnimationOptionCurveEaseOut
+                     animations:^{
+        overlay.frame = expandedFrame;
+    } completion:nil];
+
+    UISelectionFeedbackGenerator *haptic = [UISelectionFeedbackGenerator new];
+    [haptic selectionChanged];
+}
+
+// Tears reencodeDropdownOverlay/reencodeDropdownScrim down. When
+// animated, every option row and divider fades out together as the
+// overlay shrinks back to the button's own single-row frame - "the
+// button only shrinks into the option picked and hides the other
+// options", per request - rather than just snapping away; the real
+// button (already showing whatever -gd_reencodeFormatSelected: last set
+// its label to, if a pick just happened) is un-hidden the instant the
+// shrink finishes, so what's left in that slot is always the current
+// selection. `animated:NO` is for -scrollViewDidScroll: above, which
+// needs the overlay gone immediately rather than mid-flight while the
+// content it's pinned to is moving out from under it.
+- (void)gd_closeReencodeDropdownAnimated:(BOOL)animated {
+    if (!self.reencodeDropdownOpen) return;
+
+    UIView *overlay = self.reencodeDropdownOverlay;
+    UIControl *scrim = self.reencodeDropdownScrim;
+    self.reencodeDropdownOverlay = nil;
+    self.reencodeDropdownScrim = nil;
+    self.reencodeDropdownOpen = NO;
+
+    CGRect collapsedFrame = [self.reencodeFormatButton convertRect:self.reencodeFormatButton.bounds
+                                                              toView:self.contentOverlay];
+
+    void (^finish)(void) = ^{
+        [overlay removeFromSuperview];
+        [scrim removeFromSuperview];
+        self.reencodeFormatButton.hidden = NO;
+    };
+
+    if (!animated) {
+        finish();
+        return;
+    }
+
+    for (UIView *subview in overlay.subviews) {
+        subview.alpha = 0;
+    }
+
+    [UIView animateWithDuration:0.18
+                          delay:0
+                        options:UIViewAnimationOptionCurveEaseIn
+                     animations:^{
+        overlay.frame = collapsedFrame;
+    } completion:^(BOOL finished) {
+        finish();
+    }];
+}
+
+// Wired to every option row's UIControlEventTouchUpInside (see
+// gd_make_reencode_dropdown_option_button) - sender.tag is that row's
+// index into gd_reencode_format_options(), set when the row was built
+// in -gd_openReencodeDropdown.
+- (void)gd_reencodeDropdownOptionTapped:(UIButton *)sender {
+    NSArray<NSString *> *options = gd_reencode_format_options();
+    if (sender.tag < 0 || sender.tag >= (NSInteger)options.count) return;
+
+    NSString *format = options[sender.tag];
+    [self gd_reencodeFormatSelected:format];
+    [self gd_closeReencodeDropdownAnimated:YES];
+}
+
+// Wired to reencodeDropdownScrim - any tap outside the open overlay
+// closes it without changing the current selection.
+- (void)gd_reencodeDropdownScrimTapped:(UIControl *)sender {
+    [self gd_closeReencodeDropdownAnimated:YES];
 }
 
 // Wired to the PAT field's "Verify" button (see -buildPanel:'s Auth
@@ -7369,6 +7489,15 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
 // green fill and labels are never dimmed by the pill glass.
 - (void)scrollViewDidScroll:(UIScrollView *)scrollView {
     [self gd_updateSliderGlassVisibility];
+
+    // reencodeDropdownOverlay is positioned in self.contentOverlay's own
+    // coordinate space (see -gd_openReencodeDropdown) precisely so it
+    // doesn't move when other rows do - but that also means it doesn't
+    // track this scroll view's content, which does move. Close it rather
+    // than let it drift out of alignment with the button underneath.
+    if (self.reencodeDropdownOpen) {
+        [self gd_closeReencodeDropdownAnimated:NO];
+    }
 }
 
 - (void)gd_updateSliderGlassVisibility {
