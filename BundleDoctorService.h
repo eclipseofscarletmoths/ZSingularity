@@ -143,6 +143,46 @@
 // None of these four take a `progress:` status-string block the way the
 // old method did - phases 2-4 are each one cheap JSON request with a
 // single outcome, not a multi-step sequence worth narrating.
+//
+// DETERMINISTIC RELEASE NAMING, AND WHY (read before touching
+// +bds_deterministicTagForCAB:moddedData: in the .m): the scratch branch/
+// release tag used to be a fresh "bundle-doctor/<uuid>" on every call,
+// with no relationship between two dispatches of the same bundle. It's
+// now derived from the bundle's own identity instead, so re-dispatching
+// an unchanged bundle lands on the exact same tag:
+//
+//   bundle-doctor/CAB-<first 5 hex chars of the bundle's own CAB
+//   identifier>-sha256-<first 5 hex chars of the un-doctored modded
+//   bundle's own SHA-256>
+//
+// e.g. "bundle-doctor/CAB-38321-sha256-9f2a1". Per the person's spec this
+// was meant to read "CAB-XXXXX/sha256:XXXXX" - a colon and a second slash
+// are both illegal in a git ref name (this string is both a branch name
+// and, via the release tag, a "refs/tags/..." name), so the punctuation
+// was swapped for hyphens while keeping the same two truncated-hex
+// pieces; functionally identical, just ref-safe. If the bundle's CAB
+// can't be resolved (+[UnityBundleCAB primaryCABForBundleAtPath:error:]
+// failed - not a UnityFS archive this can parse), this falls back to the
+// old random-UUID tag, since a submission this class can't identify
+// can't be meaningfully deduplicated against future ones either.
+//
+// This exists to let +dispatchBundleAtURL:config:uploadProgress:
+// completion: check, before doing any work, whether a release already
+// sits under this exact tag with BDS_OUTPUT_ASSET_NAME already on it -
+// if so, it skips the upload/branch-create/workflow-dispatch steps
+// entirely and hands back a handle with alreadyComplete == YES (see that
+// property above) pointing straight at the existing release. A
+// consequence of turning these tags into a reusable cache key instead of
+// a one-shot scratch identifier: +fetchDoctoredBundleForHandle:...'s
+// post-download cleanup no longer deletes the release/tag the way it
+// used to (only the now-empty scratch branch, when one exists) - the
+// release is the cache now, so it has to survive its own first
+// successful download. Clearing it out entirely is a separate, explicit
+// operation (see the Config section's "delete stored bundles in proxy").
+//
+// A run that fails, or is still mid-flight, does NOT get an
+// early-exit here - only a release that already has the finished
+// BDS_OUTPUT_ASSET_NAME asset on it counts as a cache hit.
 
 #import <Foundation/Foundation.h>
 
@@ -204,9 +244,24 @@ typedef NS_ENUM(NSInteger, BundleDoctorRunStatus) {
 // doctorRunURL fields, which are exactly this object's own fields
 // flattened for manifest.json storage).
 @interface BundleDoctorHandle : NSObject
-@property (nonatomic, copy, readonly) NSString *scratchBranch;   // the never-reused "bundle-doctor/<uuid>" string this submission lives on - both the scratch git branch dispatched against and the tag name of the release carrying its input/output bundle assets (see this header's transport note)
+@property (nonatomic, copy, readonly) NSString *scratchBranch;   // the tag/branch string this submission lives on - both the scratch git branch dispatched against (when one was created - see alreadyComplete) and the tag name of the release carrying its input/output bundle assets (see this header's transport note and its "Deterministic release naming" addendum below)
 @property (nonatomic, copy, nullable) NSString *runID;           // nil until +resolveRunForHandle:config:completion: fills it in
 @property (nonatomic, copy, nullable) NSString *runURL;          // nil until the same call fills it in - the run's html_url, for surfacing on failure
+
+// YES when +dispatchBundleAtURL:config:uploadProgress:completion: found an
+// already-doctored release sitting under this bundle's deterministic tag
+// (see the addendum below) and skipped the upload/branch/dispatch steps
+// entirely - runID/runURL are (and will stay) nil in this case, since no
+// run was ever created for this call. Callers MUST check this before
+// falling into the normal phase 2/3 poll loop: when YES, go straight to
+// +fetchDoctoredBundleForHandle:config:progress:completion: (phase 4)
+// instead, exactly as if phase 3 had just reported
+// BundleDoctorRunStatusSucceeded. Always NO on a handle rebuilt via
+// +handleFromDictionaryRepresentation: (this flag is a same-call signal,
+// not part of a submission's persisted state - by the time a Processing
+// entry's handle would need reconstructing after an app relaunch, this
+// call has already returned and the caller has already acted on it).
+@property (nonatomic, assign, readonly) BOOL alreadyComplete;
 
 // Flattened form of this handle's own three properties, suitable for
 // storing verbatim into ModAssetLibraryEntry's doctorScratchBranch/
@@ -223,6 +278,47 @@ typedef NS_ENUM(NSInteger, BundleDoctorRunStatus) {
 // app was killed comes back with those nil, exactly as if
 // +resolveRunForHandle:config:completion: simply hadn't succeeded yet).
 + (nullable instancetype)handleFromDictionaryRepresentation:(NSDictionary<NSString *, NSString *> *)dict;
+@end
+
+// One GitHub Release under config.repoOwner/repoName that already
+// carries a finished BDS_OUTPUT_ASSET_NAME ("output.bundle") asset -
+// i.e. one row in 6's "Processed Bundles" folder listing. Read-only,
+// display-only snapshot of the release's own GitHub metadata at the
+// moment +listProcessedReleasesForConfig:completion: ran; unlike
+// BundleDoctorHandle this doesn't track an in-flight submission and
+// isn't persisted anywhere - the release itself, sitting in the repo's
+// releases tab, is the only source of truth (see this header's
+// "Deterministic release naming" addendum: the release now outlives
+// the submission that created it, on purpose, as its own on-proxy
+// cache entry).
+@interface BundleDoctorProcessedRelease : NSObject
+@property (nonatomic, copy, readonly) NSString *tagName; // e.g. "bundle-doctor/CAB-38321-sha256-9f2a1" - the release's own git tag (see bds_deterministicTagForCAB)
+
+// "CAB-XXXXX" parsed out of tagName, per the person's 6 spec ("the
+// release's name, excluding the sha part") - i.e. tagName's own
+// truncated CAB segment, not a re-read of the doctored bundle's full
+// CAB id (nothing in the release response carries that - reading it
+// back out would mean downloading the bundle itself just to label a
+// list row). nil when tagName doesn't contain a "CAB-<hex>" segment at
+// all - the old random-UUID fallback tag (see bds_deterministicTagForCAB)
+// used when the original submission's bundle had no readable CAB of
+// its own; there's nothing to extract from a bare UUID in that case.
+@property (nonatomic, copy, readonly, nullable) NSString *cabDisplayName;
+// cabDisplayName when present, else tagName verbatim - what the row
+// actually renders as its file name, so a legacy random-UUID-tagged
+// release still shows something instead of a blank row.
+@property (nonatomic, copy, readonly) NSString *displayName;
+@property (nonatomic, assign, readonly) unsigned long long byteSize;   // BDS_OUTPUT_ASSET_NAME asset's own "size"
+@property (nonatomic, copy, readonly, nullable) NSString *uploadedAt;  // that asset's own "created_at", verbatim ISO 8601 UTC as GitHub returns it - nil if the response omitted it
+// "sha256:<hex>", verbatim from the release asset's own "digest" field
+// (GitHub computes and returns this itself) - NOT recomputed on-device,
+// which would mean downloading every listed bundle just to render a
+// list row. nil on a response that didn't carry a digest (an older
+// GitHub Enterprise version, or an asset uploaded before GitHub started
+// returning this field) - the Checksum row is simply omitted for that
+// release rather than shown blank; see gd_make_processed_bundle_info_panel
+// in GraphicsDebugOverlay.m.
+@property (nonatomic, copy, readonly, nullable) NSString *checksum;
 @end
 
 @interface BundleDoctorService : NSObject
@@ -305,8 +401,15 @@ typedef NS_ENUM(NSInteger, BundleDoctorRunStatus) {
 // more than once if the caller's own download step needs retrying - the
 // release/branch are only deleted after a successful fetch, and deleting
 // an already-deleted release/branch is itself best-effort/silent.
+// downloadProgress, when non-nil, is called on the main queue with a
+// 0.0-1.0 fraction as the doctored bundle's bytes come down - same
+// contract as +dispatchBundleAtURL:...'s uploadProgress, mirrored for
+// this side of the pipeline. May be called zero times if the response
+// never reports a Content-Length (progress just never renders past 0%
+// in that case; the fetch itself is unaffected).
 + (void)fetchDoctoredBundleForHandle:(BundleDoctorHandle *)handle
                                 config:(BundleDoctorConfig *)config
+                              progress:(nullable void (^)(double fractionComplete))downloadProgress
                             completion:(void (^)(NSURL * _Nullable doctoredBundleURL, NSError * _Nullable error))completion;
 
 #pragma mark - Upload transport compression
@@ -326,6 +429,49 @@ typedef NS_ENUM(NSInteger, BundleDoctorRunStatus) {
 // entirely.
 + (BOOL)isUploadCompressionEnabled;
 + (void)setUploadCompressionEnabled:(BOOL)enabled;
+
+#pragma mark - Processed Bundles listing (6)
+
+// Every release under config.repoOwner/repoName that already carries a
+// finished BDS_OUTPUT_ASSET_NAME asset - i.e. 6's "Processed Bundles"
+// folder listing, one BundleDoctorProcessedRelease per release. Pages
+// through GET /repos/{owner}/{repo}/releases (100 per page, GitHub's
+// own max) until a short page ends it, same "only a release that
+// already has the output asset counts" rule
+// +bds_releaseAtTagHasOutputAsset:config: already applies to a single
+// tag - a release still mid-flight, or one a caller abandoned before
+// the workflow uploaded its output, is silently skipped rather than
+// listed with a missing size/checksum. Returned array is sorted
+// newest-uploaded-first, by the output asset's own created_at - the
+// folder's own "always last, ignore A-Z" placement in the accordion is
+// the caller's job (GraphicsDebugOverlay.m's -gd_rebuildModsLibrary),
+// this is just this folder's own row order. On failure (bad/missing
+// credentials, a transport error, a non-2xx partway through pagination),
+// releases is nil and error is filled - same BundleDoctorServiceErrorCode
+// shape every other call in this class uses.
++ (void)listProcessedReleasesForConfig:(BundleDoctorConfig *)config
+                              completion:(void (^)(NSArray<BundleDoctorProcessedRelease *> * _Nullable releases, NSError * _Nullable error))completion;
+
+#pragma mark - Delete every stored release (8)
+
+// 8: "delete stored bundles in proxy" - unlike +listProcessedReleasesForConfig:
+// above (which only surfaces releases that already have an
+// output.bundle asset), this deletes EVERY release entry in the
+// configured repo, finished or not, plus each one's underlying git
+// tag ref (a release delete alone leaves that behind - same fact
+// +bds_deleteReleaseWithTag:config: already accounts for). Each
+// release/tag-ref pair is best-effort independently, same shape as
+// +bds_cleanupScratchSubmission: - one release's 404/failure doesn't
+// stop the rest from being attempted. `deletedCount` is how many
+// release objects were actually removed (tag-ref cleanup failures
+// aren't counted or surfaced - see the .m); `error` is only set for a
+// failure that stopped this before it could even list what's there
+// (bad/missing credentials, a transport error, a non-2xx partway
+// through pagination) - same BundleDoctorServiceErrorCode shape every
+// other call in this class uses. Wired to the Config section's
+// "Delete Stored Bundles in Proxy" button in GraphicsDebugOverlay.m.
++ (void)deleteAllReleasesForConfig:(BundleDoctorConfig *)config
+                          completion:(void (^)(NSInteger deletedCount, NSError * _Nullable error))completion;
 
 #pragma mark - Credential check
 

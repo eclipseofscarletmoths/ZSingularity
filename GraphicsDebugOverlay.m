@@ -478,16 +478,41 @@ static void gd_configure_glass_button_fixed_corner_radius(UIButton *button, CGFl
 // lower-deployment-target reason as the rest of this file's Liquid Glass
 // calls. Falls back to an approximation of the dock's own glass material
 // on pre-iOS-26 so the reset button still reads as "glass" there too.
-static void gd_style_button_as_native_glass(UIButton *button, NSString *title, UIColor *tintColor) {
+// 3.6 fix: on iOS 26, gd_style_button_as_native_glass hands the button a
+// UIButtonConfiguration (setConfiguration: below) rather than just setting
+// title/font on the button directly. UIKit re-derives titleLabel's actual
+// displayed font from that configuration on every layout pass, so a caller
+// that sets `button.titleLabel.font = ...` *after* this call (as the
+// dispatch/retry/download capsules used to) gets silently overwritten back
+// to the configuration's own default system font the next time the button
+// lays out - which is exactly why "a previous implementation... the text
+// size hasn't changed at all". There's no direct "font" setter on
+// UIButtonConfiguration; the font has to be baked into an attributedTitle
+// instead. This variant takes an optional font and, when non-nil, uses
+// setAttributedTitle: (with that font attached) instead of the plain
+// setTitle:, so the size survives the configuration system's own re-layout.
+// gd_style_button_as_native_glass (below) is unchanged in behavior - just a
+// thin wrapper over this with font:nil.
+static void gd_style_button_as_native_glass_with_font(UIButton *button, NSString *title, UIColor *tintColor, UIFont *font) {
     if (@available(iOS 26.0, *)) {
         Class configClass = NSClassFromString(@"UIButtonConfiguration");
         SEL glassSel = NSSelectorFromString(@"glassButtonConfiguration");
         if (configClass && [configClass respondsToSelector:glassSel]) {
             id configuration = ((id (*)(id, SEL))objc_msgSend)(configClass, glassSel);
             if (configuration) {
-                SEL setTitle = NSSelectorFromString(@"setTitle:");
-                if ([configuration respondsToSelector:setTitle]) {
-                    ((void (*)(id, SEL, id))objc_msgSend)(configuration, setTitle, title);
+                if (font) {
+                    SEL setAttributedTitle = NSSelectorFromString(@"setAttributedTitle:");
+                    if ([configuration respondsToSelector:setAttributedTitle]) {
+                        NSAttributedString *attributedTitle =
+                            [[NSAttributedString alloc] initWithString:title
+                                                             attributes:@{NSFontAttributeName: font}];
+                        ((void (*)(id, SEL, id))objc_msgSend)(configuration, setAttributedTitle, attributedTitle);
+                    }
+                } else {
+                    SEL setTitle = NSSelectorFromString(@"setTitle:");
+                    if ([configuration respondsToSelector:setTitle]) {
+                        ((void (*)(id, SEL, id))objc_msgSend)(configuration, setTitle, title);
+                    }
                 }
                 SEL setBaseForeground = NSSelectorFromString(@"setBaseForegroundColor:");
                 if (tintColor && [configuration respondsToSelector:setBaseForeground]) {
@@ -506,15 +531,22 @@ static void gd_style_button_as_native_glass(UIButton *button, NSString *title, U
     // Pre-iOS-26 fallback: approximate glass with the same translucent
     // material style used elsewhere in this file for non-Liquid-Glass
     // devices, since UIButtonConfiguration's native glass style doesn't
-    // exist there.
+    // exist there. This path uses a real titleLabel (no configuration
+    // object re-deriving it every layout), so a direct font assignment
+    // sticks fine here.
     [button setTitle:title forState:UIControlStateNormal];
     if (tintColor) [button setTitleColor:tintColor forState:UIControlStateNormal];
+    if (font) button.titleLabel.font = font;
     button.backgroundColor = [UIColor colorWithWhite:1 alpha:0.08];
     button.layer.borderWidth = 1;
     button.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.18].CGColor;
     button.layer.cornerCurve = kCACornerCurveContinuous;
     button.clipsToBounds = YES;
     button.contentHorizontalAlignment = UIControlContentHorizontalAlignmentCenter;
+}
+
+static void gd_style_button_as_native_glass(UIButton *button, NSString *title, UIColor *tintColor) {
+    gd_style_button_as_native_glass_with_font(button, title, tintColor, nil);
 }
 
 // Icon-only counterpart to gd_style_button_as_native_glass - same native
@@ -653,6 +685,77 @@ static void gd_crossfade_auth_verify_button_title(UIButton *button, NSString *ti
         gd_style_auth_verify_button(button, title);
     }
                      completion:nil];
+}
+
+// authVerifyButton's other permanent state (Section 4): once credentials
+// are confirmed (manually or via the boot-time auto-check - see
+// -gd_authEnterVerifiedState/-gd_authEnterStaleState), the button stops
+// being a plain-tap "Verify" and becomes a destructive hold-to-confirm
+// "Remove" - same 6pt-corner glass shape as gd_style_auth_verify_button
+// above, just red instead of green, matching every other destructive
+// control on this panel (Restore Originals, Reset Settings, the Mods
+// Library's own Delete rows). Kept as a fully separate function rather
+// than an extra tint parameter on gd_style_auth_verify_button so that
+// function's existing "Verify"/"Verifying…" call sites can't accidentally
+// drift onto this styling by a stray argument.
+static void gd_style_auth_remove_button(UIButton *button, NSString *title) {
+    gd_style_button_as_native_glass(button, title, [UIColor colorWithRed:1.0 green:0.42 blue:0.42 alpha:1.0]);
+    button.titleLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightSemibold];
+    gd_configure_glass_button_fixed_corner_radius(button, kGDAuthFieldCornerRadius);
+    if (!gd_has_liquid_glass()) {
+        button.layer.cornerRadius = kGDAuthFieldCornerRadius;
+        button.clipsToBounds = YES;
+    }
+
+    SEL setUpdateHandler = NSSelectorFromString(@"setConfigurationUpdateHandler:");
+    if ([button respondsToSelector:setUpdateHandler]) {
+        void (^reassertCorners)(__kindof UIButton *) = ^(__kindof UIButton *btn) {
+            gd_configure_glass_button_fixed_corner_radius(btn, kGDAuthFieldCornerRadius);
+        };
+        ((void (*)(id, SEL, id))objc_msgSend)(button, setUpdateHandler, reassertCorners);
+    }
+}
+
+// Cross-dissolve counterparts to gd_crossfade_auth_verify_button_title
+// above, for the one-time Verify<->Remove mode switch (as opposed to
+// that function's same-mode "Verify"/"Verifying…" label swap) - kept
+// separate since these two also flip the button's tint, not just its
+// title.
+static void gd_crossfade_auth_button_to_remove(UIButton *button) {
+    [UIView transitionWithView:button
+                       duration:0.2
+                        options:UIViewAnimationOptionTransitionCrossDissolve | UIViewAnimationOptionAllowUserInteraction
+                     animations:^{
+        gd_style_auth_remove_button(button, @"Remove");
+    }
+                     completion:nil];
+}
+
+static void gd_crossfade_auth_button_to_verify(UIButton *button) {
+    [UIView transitionWithView:button
+                       duration:0.2
+                        options:UIViewAnimationOptionTransitionCrossDissolve | UIViewAnimationOptionAllowUserInteraction
+                     animations:^{
+        gd_style_auth_verify_button(button, @"Verify");
+    }
+                     completion:nil];
+}
+
+// Removes any UILongPressGestureRecognizer previously attached by
+// gd_attach_pill_hold_to_confirm/gd_attach_pill_hold_to_confirm_duration
+// - used to tear down authVerifyButton's hold-to-confirm gesture when
+// leaving Remove mode (-gd_authRemoveCredentialsConfirmed) so re-entering
+// it later (-gd_authEnterVerifiedState/-gd_authEnterStaleState) attaches
+// exactly one fresh recognizer instead of stacking another on top.
+// authVerifyButton never carries any other gesture recognizer, so a
+// class check alone is enough to identify the right one(s) - no need to
+// inspect the recognizer's action/target.
+static void gd_remove_pill_hold_to_confirm_gestures(UIButton *button) {
+    for (UIGestureRecognizer *recognizer in [button.gestureRecognizers copy]) {
+        if ([recognizer isKindOfClass:[UILongPressGestureRecognizer class]]) {
+            [button removeGestureRecognizer:recognizer];
+        }
+    }
 }
 
 // Associated-object key backing the generic hold-to-confirm gesture
@@ -2804,30 +2907,84 @@ static UIView *gd_make_blacklist_entry_row(NSString *term, id target, SEL remove
 
 #pragma mark - Mods Library accordion rows
 
-// Width (points) of the folder row's Add button - widened from the
-// other 18x18 icon buttons on this row so it reads as a capsule/pill
-// rather than a circle, while staying the same 18pt tall as its
-// neighbors so it lines up with them.
-static const CGFloat kGDFolderAddButtonWidth = 32;
+// Pill button width/height for a row's "..." options control (used by
+// both the folder row below and the file row further down - see 3.4/
+// 3.4.5) - wider than tall so its native-glass silhouette resolves as a
+// capsule rather than a circle. Declared up here, ahead of
+// gd_make_mods_folder_row, since that function needs it and C requires
+// a file-scope const be declared before first use, unlike the
+// Objective-C methods elsewhere in this file that can reference each
+// other regardless of source order.
+static const CGFloat kGDModsOptionsButtonWidth = 30;
+static const CGFloat kGDModsOptionsButtonHeight = 18;
+
+// 6: the Mod Asset Library's one immutable, non-ModAssetLibrary-backed
+// folder - see "#pragma mark Mods Library" further down for where it's
+// spliced into -gd_rebuildModsLibrary's own list of real folders
+// (always last, ignoring the real folders' own A-Z sort). Name and
+// subtext are exactly the person's own spec text. NOTE: since this is
+// just a display-time string, not a reserved name enforced anywhere in
+// ModAssetLibrary itself, a person COULD name a real folder
+// "Processed Bundles" via the ordinary New Folder flow and end up with
+// two folder rows sharing this label - flagged here rather than fixed
+// this pass (would mean touching +[ModAssetLibrary createFolderNamed:
+// error:]'s validation, out of scope for 6).
+static NSString * const kGDProcessedBundlesFolderName = @"Processed Bundles";
+static NSString * const kGDProcessedBundlesFolderSubtext = @"download bundles stored in the proxy\u2019s release tab";
+
+// 7: the Mod Asset Library's OTHER immutable folder - sits directly
+// above Processed Bundles (see -gd_rebuildModsLibrary for the exact
+// splice order) and, unlike that one, IS a real +[ModAssetLibrary
+// folderNames] entry under the hood (it has to actually hold the
+// cached-away bundle files somewhere on disk) - it's just excluded from
+// the normal A-Z folder loop and pinned here instead, and offers none
+// of the ordinary folder actions (no Add mod/Rename/Cache folder/Add
+// remark/Delete - see gd_make_mods_folder_row's optionsAction:NULL
+// callers below). Created lazily on the first "Cache bundle" rather
+// than up front, so a fresh install's library doesn't grow an empty
+// folder nobody's used yet - see -gd_cacheBundleEntry:inFolder:.
+static NSString * const kGDStoredBundlesFolderName = @"Stored Bundles";
+static NSString * const kGDStoredBundlesFolderSubtext = @"Your stored bundles are here, you can restore them any time.";
 
 // Folder header row for the Mods Library accordion: [chevron][folder
-// icon][name] .... [Add pill][pencil][X]. The whole row is tappable
-// for expand/collapse via a tap gesture wired to `target`/`action` - a
-// bigger hit target beats a precise one for a disclosure control - but
-// that gesture only covers the row's own background; the three
-// trailing controls are real buttons the tap gesture doesn't intercept
-// (UIKit routes a touch to the deepest hit-testing view first). The
-// folder name is stashed as an associated object on the row itself
-// (for the tap gesture) AND on each of the trailing buttons (for their
-// own handlers) since each is wired up independently by the caller
-// (see -gd_rebuildModsLibrary).
+// icon][name (+ remark subtext right below it, if set)] .... [options
+// "..." pill]. The whole row is tappable for expand/collapse via a tap
+// gesture wired to `target`/`action` - a bigger hit target beats a
+// precise one for a disclosure control - but that gesture only covers
+// the row's own background; the trailing pill is a real button the tap
+// gesture doesn't intercept (UIKit routes a touch to the deepest
+// hit-testing view first). The folder name is stashed as an associated
+// object on the row itself (for the tap gesture) AND on the options
+// button (for its own handler, see -gd_modsLibraryFolderOptionsTapped:)
+// since each is wired up independently by the caller (see
+// -gd_rebuildModsLibrary).
 //
-// Add/Rename are plain buttons the caller wires with target/action.
-// Delete is NOT wired with target/action here - like every other X
-// icon in this accordion, its hold-to-confirm gesture (and capsule-
-// expand animation) is attached by the caller via the
-// "gd_button_delete" associated object (see gd_attach_hold_to_confirm).
-static UIView *gd_make_mods_folder_row(NSString *folderName, BOOL expanded, id target, SEL tapAction, SEL addAction, SEL renameAction) {
+// 3.4.5: this used to end in a standalone Add("+")/Rename(pencil)/
+// Delete(X) icon trio, each its own button - collapsed here into the
+// same single pill-shaped "..." control the file row's own 3.4 rework
+// already uses (Add/Rename/Delete are all still present, just as rows
+// inside that dropdown now - see gd_mods_folder_options()). Not
+// wired with addTarget:action: here, same as every other per-row
+// control that opens a shared dropdown overlay in this file - the
+// caller wires it via optionsAction (see -gd_rebuildModsLibrary), same
+// pattern gd_make_mods_entry_row's own options pill uses.
+//
+// remark (may be nil/empty) renders as a small static subtext line
+// directly below the folder name - unlike a FILE's remark, this is
+// always visible on the folder's own header row, not tucked inside an
+// expand-to-see dropdown (there's no per-folder "info" panel the way
+// there is per-file), per the person's 3.4.5 spec. When absent the row
+// stays exactly the single-line height it always was; the row grows by
+// one line only when a remark is actually set.
+//
+// optionsAction may be NULL (6): the immutable "Processed Bundles"
+// folder this introduces has no Add mod/Rename/Cache folder/Add remark/
+// Delete to offer - there's nothing on it a person can mutate - so its
+// row is built with no "..." pill at all rather than one that opens an
+// empty (or entirely wrong-context) dropdown. A real ModAssetLibrary
+// folder always passes a real selector here, same as before this
+// parameter became nullable.
+static UIView *gd_make_mods_folder_row(NSString *folderName, NSString *remark, BOOL expanded, id target, SEL tapAction, SEL optionsAction) {
     UIView *row = [[UIView alloc] init];
     row.translatesAutoresizingMaskIntoConstraints = NO;
     objc_setAssociatedObject(row, "gd_modsFolderName", folderName, OBJC_ASSOCIATION_COPY);
@@ -2856,83 +3013,100 @@ static UIView *gd_make_mods_folder_row(NSString *folderName, BOOL expanded, id t
     label.lineBreakMode = NSLineBreakByTruncatingMiddle;
     [row addSubview:label];
 
-    // X - delete, at the row's absolute far right extreme. Not wired
-    // with addTarget:action: here - see this function's own header.
-    UIButton *deleteButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    deleteButton.translatesAutoresizingMaskIntoConstraints = NO;
-    UIImageSymbolConfiguration *xSymbolConfig = [UIImageSymbolConfiguration configurationWithPointSize:6 weight:UIImageSymbolWeightSemibold];
-    UIImage *xImage = [UIImage systemImageNamed:@"xmark" withConfiguration:xSymbolConfig];
-    UIColor *xTint = [UIColor colorWithWhite:1 alpha:0.55];
-    gd_style_icon_button_as_native_glass(deleteButton, xImage, xTint);
-    objc_setAssociatedObject(deleteButton, "gd_modsFolderName", folderName, OBJC_ASSOCIATION_COPY);
-    [row addSubview:deleteButton];
-    objc_setAssociatedObject(row, "gd_button_delete", deleteButton, OBJC_ASSOCIATION_RETAIN);
+    BOOL hasRemark = (remark.length > 0);
+    UILabel *remarkLabel = nil;
+    if (hasRemark) {
+        remarkLabel = [[UILabel alloc] init];
+        remarkLabel.translatesAutoresizingMaskIntoConstraints = NO;
+        remarkLabel.text = remark;
+        remarkLabel.font = [UIFont systemFontOfSize:10 weight:UIFontWeightRegular];
+        remarkLabel.textColor = [UIColor colorWithWhite:1 alpha:0.45];
+        remarkLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+        remarkLabel.numberOfLines = 1;
+        [row addSubview:remarkLabel];
+    }
 
-    // Pencil - rename, immediately to the left of delete.
-    UIButton *renameButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    renameButton.translatesAutoresizingMaskIntoConstraints = NO;
-    UIImageSymbolConfiguration *pencilConfig = [UIImageSymbolConfiguration configurationWithPointSize:9 weight:UIImageSymbolWeightSemibold];
-    UIImage *pencilImage = [UIImage systemImageNamed:@"pencil" withConfiguration:pencilConfig];
-    gd_style_icon_button_as_native_glass(renameButton, pencilImage, [UIColor colorWithWhite:1 alpha:0.6]);
-    [renameButton addTarget:target action:renameAction forControlEvents:UIControlEventTouchUpInside];
-    objc_setAssociatedObject(renameButton, "gd_modsFolderName", folderName, OBJC_ASSOCIATION_COPY);
-    [row addSubview:renameButton];
-
-    // Add - icon-only plus glyph, immediately to the left of the
-    // pencil - adds more files into this already-existing folder
-    // without going through the New Folder prompt again. Widened
-    // (kGDFolderAddButtonWidth, vs. the 18pt-square pencil/X either
-    // side of it) so its native-glass silhouette resolves as a capsule
-    // rather than a circle - height stays 18pt like its neighbors so
-    // it lines up with them.
-    UIButton *addButton = [UIButton buttonWithType:UIButtonTypeSystem];
-    addButton.translatesAutoresizingMaskIntoConstraints = NO;
-    UIImageSymbolConfiguration *plusConfig = [UIImageSymbolConfiguration configurationWithPointSize:9 weight:UIImageSymbolWeightSemibold];
-    UIImage *plusImage = [UIImage systemImageNamed:@"plus" withConfiguration:plusConfig];
-    gd_style_icon_button_as_native_glass(addButton, plusImage, [UIColor colorWithRed:0.42 green:0.62 blue:1.0 alpha:1.0]);
-    [addButton addTarget:target action:addAction forControlEvents:UIControlEventTouchUpInside];
-    objc_setAssociatedObject(addButton, "gd_modsFolderName", folderName, OBJC_ASSOCIATION_COPY);
-    [row addSubview:addButton];
+    // "..." - single options pill, at the row's absolute far right
+    // extreme, same kGDModsOptionsButtonWidth/Height pill silhouette
+    // and gd_style_icon_button_as_native_glass styling as the file
+    // row's own options button (see that pragma mark). Always present
+    // (not gated behind `expanded`) - the old Add/Rename/Delete trio it
+    // replaces was always visible too, and unlike a file row a folder
+    // row's own expand state means "show its files", not "you've
+    // looked at this folder's info", so there's no equivalent
+    // "must-look-first" gate to apply here.
+    UIButton *optionsButton = nil;
+    if (optionsAction) {
+        optionsButton = [UIButton buttonWithType:UIButtonTypeSystem];
+        optionsButton.translatesAutoresizingMaskIntoConstraints = NO;
+        UIImageSymbolConfiguration *dotsSymbolConfig = [UIImageSymbolConfiguration configurationWithPointSize:10 weight:UIImageSymbolWeightSemibold];
+        UIImage *dotsImage = [UIImage systemImageNamed:@"ellipsis" withConfiguration:dotsSymbolConfig];
+        gd_style_icon_button_as_native_glass(optionsButton, dotsImage, [UIColor colorWithWhite:1 alpha:0.6]);
+        objc_setAssociatedObject(optionsButton, "gd_modsFolderName", folderName, OBJC_ASSOCIATION_COPY);
+        [optionsButton addTarget:target action:optionsAction forControlEvents:UIControlEventTouchUpInside];
+        [row addSubview:optionsButton];
+        objc_setAssociatedObject(row, "gd_button_options", optionsButton, OBJC_ASSOCIATION_RETAIN);
+    }
 
     UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:target action:tapAction];
     [row addGestureRecognizer:tap];
 
+    // Chevron/folder icon center on the NAME line specifically (via
+    // label.centerYAnchor, not row.centerYAnchor) - identical position
+    // to before when there's no remark (label is still the row's only
+    // line, so its centerY IS the row's), but keeps them level with the
+    // folder name instead of the row's full two-line midpoint once a
+    // remark line is added below it.
     [NSLayoutConstraint activateConstraints:@[
         [chevron.leadingAnchor constraintEqualToAnchor:row.leadingAnchor constant:2],
-        [chevron.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
+        [chevron.centerYAnchor constraintEqualToAnchor:label.centerYAnchor],
         [chevron.widthAnchor constraintEqualToConstant:14],
 
         [folderIcon.leadingAnchor constraintEqualToAnchor:chevron.trailingAnchor constant:4],
-        [folderIcon.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
+        [folderIcon.centerYAnchor constraintEqualToAnchor:label.centerYAnchor],
         [folderIcon.widthAnchor constraintEqualToConstant:18],
 
         [label.leadingAnchor constraintEqualToAnchor:folderIcon.trailingAnchor constant:6],
-        [label.trailingAnchor constraintLessThanOrEqualToAnchor:addButton.leadingAnchor constant:-6],
-        [label.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
-
-        [deleteButton.trailingAnchor constraintEqualToAnchor:row.trailingAnchor],
-        [deleteButton.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
-        [deleteButton.widthAnchor constraintEqualToConstant:18],
-        [deleteButton.heightAnchor constraintEqualToConstant:18],
-
-        [renameButton.trailingAnchor constraintEqualToAnchor:deleteButton.leadingAnchor constant:-3],
-        [renameButton.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
-        [renameButton.widthAnchor constraintEqualToConstant:18],
-        [renameButton.heightAnchor constraintEqualToConstant:18],
-
-        [addButton.trailingAnchor constraintEqualToAnchor:renameButton.leadingAnchor constant:-3],
-        [addButton.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
-        [addButton.widthAnchor constraintEqualToConstant:kGDFolderAddButtonWidth],
-        [addButton.heightAnchor constraintEqualToConstant:18],
-
-        [row.topAnchor constraintEqualToAnchor:label.topAnchor constant:-5],
-        [row.bottomAnchor constraintEqualToAnchor:label.bottomAnchor constant:5],
     ]];
+
+    // Trailing anchor for the name (and remark, below) is the options
+    // pill when there is one, else the row's own trailing edge - same
+    // "labelTrailingNeighbor" pattern gd_make_mods_entry_row already
+    // uses for its own optional trailing controls.
+    UIView *labelTrailingNeighbor = optionsButton ?: row;
+    [NSLayoutConstraint activateConstraints:@[
+        [label.trailingAnchor constraintLessThanOrEqualToAnchor:labelTrailingNeighbor.trailingAnchor constant:(labelTrailingNeighbor == row ? -8 : -6)],
+    ]];
+    if (optionsButton) {
+        [NSLayoutConstraint activateConstraints:@[
+            [optionsButton.trailingAnchor constraintEqualToAnchor:row.trailingAnchor],
+            [optionsButton.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
+            [optionsButton.widthAnchor constraintEqualToConstant:kGDModsOptionsButtonWidth],
+            [optionsButton.heightAnchor constraintEqualToConstant:kGDModsOptionsButtonHeight],
+        ]];
+    }
+
+    if (hasRemark) {
+        [NSLayoutConstraint activateConstraints:@[
+            [label.topAnchor constraintEqualToAnchor:row.topAnchor constant:6],
+
+            [remarkLabel.leadingAnchor constraintEqualToAnchor:label.leadingAnchor],
+            [remarkLabel.topAnchor constraintEqualToAnchor:label.bottomAnchor constant:2],
+            [remarkLabel.trailingAnchor constraintLessThanOrEqualToAnchor:labelTrailingNeighbor.trailingAnchor constant:(labelTrailingNeighbor == row ? -8 : -6)],
+            [row.bottomAnchor constraintEqualToAnchor:remarkLabel.bottomAnchor constant:6],
+        ]];
+    } else {
+        [NSLayoutConstraint activateConstraints:@[
+            [label.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
+            [row.topAnchor constraintEqualToAnchor:label.topAnchor constant:-5],
+            [row.bottomAnchor constraintEqualToAnchor:label.bottomAnchor constant:5],
+        ]];
+    }
     return row;
 }
 
 // One tracked file's row, indented under its folder: [doc icon] [name]
-// .... [Delete - only when expanded]. Tapping anywhere on the row
+// .... [options "..." pill - only when expanded]. Tapping anywhere on the row
 // (same whole-row tap-target approach as the folder row above) toggles
 // the path/size/date-added dropdown the caller (see
 // -gd_rebuildModsLibrary) inserts right after this row when the
@@ -2995,8 +3169,9 @@ static UIView *gd_make_mods_folder_row(NSString *folderName, BOOL expanded, id t
 //
 // dispatchAction/downloadAction/retryAction are only ever invoked with
 // `entry` already stashed on the control via the same "gd_modsEntry"
-// associated-object convention deleteButton uses above, so the
-// target's handler can look the entry up the same way.
+// associated-object convention the row's own "..." options button uses
+// (see gd_make_mods_entry_row below), so the target's handler can look
+// the entry up the same way.
 static const CGFloat kGDModsDoctorCapsuleHeight = 18;    // matches the row's existing 18pt icon-button footprint
 static const CGFloat kGDModsDoctorCapsuleMinWidth = 54;  // enough for "dispatch"/"download"/"retry" at kGDModsDoctorCapsuleFontSize
 // 40% smaller than the original 9pt, per the person's spec - the
@@ -3004,9 +3179,148 @@ static const CGFloat kGDModsDoctorCapsuleMinWidth = 54;  // enough for "dispatch
 // match, so the text just sits smaller inside the same-size capsule.
 static const CGFloat kGDModsDoctorCapsuleFontSize = 9 * 0.6;
 
+#pragma mark - Mods Library file options menu (3.4)
+//
+// Replaces the entry row's old lone delete X with a single pill-shaped
+// "..." button that opens a small dropdown of file-level actions - per
+// the person's 3.4 spec, so adding more per-file actions later doesn't
+// mean adding more buttons to an already-crowded header. Built as its
+// own widened clone of the Re-Encoding format picker's expand/collapse
+// dropdown (see the "Re-Encoding format (Config section)" pragma mark
+// above, especially -gd_openReencodeDropdown/-gd_closeReencodeDropdownAnimated:)
+// rather than sharing that control directly - the shapes are close but
+// not identical: this one has no "currently selected" row to highlight,
+// every row carries its own trailing SF symbol instead of just a
+// checkmark, and the option list itself is a fixed 3-entry action menu
+// rather than an open set of formats. 3.4.5 (the folder-row equivalent -
+// see the "Mods Library folder options menu (3.4.5)" pragma mark below)
+// reuses this dropdown's open/close/scrim machinery as-is, with its own
+// separate 4-entry option list.
+
+// Wider than the reencode dropdown (kGDReencodeFieldWidth is sized for a
+// short format code like "ASTC 8x8") - these rows carry a full word or
+// two plus a trailing SF symbol. Per spec: "use the dropdown that the
+// re-encoding format options use in the config section but make it
+// wider for our purpose".
+static const CGFloat kGDModsOptionsDropdownWidth = 190;
+static const CGFloat kGDModsOptionsRowHeight = kGDReencodeFieldHeight; // same 28pt row height as the reencode dropdown's own rows
+
+// Static action list for a FILE row's "..." dropdown, in the exact order
+// the person's 3.4 spec lists them. "Cache bundle" is an explicit
+// future-feature stub this pass (wired to a "coming soon" alert -
+// section 7 implements the real swap-to-original behavior later); "Add
+// remark" is fully implemented here (see
+// -gd_promptForModRemarkForEntry:inFolder:); "Delete" reuses the exact
+// same underlying -gd_deleteModEntryConfirmed:inFolder: the old delete X
+// called, just reached via a destructive confirm alert now instead of a
+// press-and-hold capsule (see -gd_confirmDeleteModEntry:inFolder:) -
+// there's no room inside a compact dropdown row to grow a fill capsule
+// the way the old standalone icon button did. "destructive" tints
+// Delete's text+icon red, matching every other destructive control in
+// this file.
+static NSArray<NSDictionary<NSString *, id> *> *gd_mods_file_options(void) {
+    return @[
+        @{@"title": @"Cache bundle", @"symbol": @"archivebox",   @"destructive": @NO},
+        @{@"title": @"Add remark",   @"symbol": @"quote.bubble", @"destructive": @NO},
+        @{@"title": @"Delete",       @"symbol": @"trash",        @"destructive": @YES},
+    ];
+}
+
+// 7: a file row's dropdown INSIDE the immutable "Stored Bundles" folder
+// gets this list instead of gd_mods_file_options() above - Restore in
+// place of Cache bundle/Add remark (a stored entry is inert, there's
+// nothing left to cache further and no live install to remark on), and
+// the same Delete. See -gd_openModsOptionsDropdownForButton:entry:
+// folderName: and -gd_modsOptionsDropdownRowTapped: for where folderName
+// picks this list over the ordinary one.
+static NSArray<NSDictionary<NSString *, id> *> *gd_mods_stored_bundle_file_options(void) {
+    return @[
+        @{@"title": @"Restore", @"symbol": @"arrow.uturn.backward", @"destructive": @NO},
+        @{@"title": @"Delete",  @"symbol": @"trash",                @"destructive": @YES},
+    ];
+}
+
+// One row inside an open mods-options dropdown: label leading, SF symbol
+// trailing, both tinted red for the destructive (Delete) row. Mirrors
+// gd_make_reencode_dropdown_option_button's shape (UIButtonTypeSystem,
+// TouchUpInside, tag = index into the options array) but adds the
+// trailing symbol image - unlike a format picker there's no "currently
+// selected" row to highlight here, every row is just an action, so
+// there's no selected/unselected color split to make instead.
+static UIButton *gd_make_mods_options_row_button(NSDictionary<NSString *, id> *option, NSInteger tag, id target, SEL action) {
+    BOOL destructive = [option[@"destructive"] boolValue];
+    UIColor *tint = destructive ? [UIColor colorWithRed:1.0 green:0.42 blue:0.42 alpha:1.0]
+                                : [UIColor colorWithWhite:1 alpha:0.85];
+
+    UIButton *row = [UIButton buttonWithType:UIButtonTypeSystem];
+    row.tag = tag;
+    row.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeading;
+    row.titleEdgeInsets = UIEdgeInsetsMake(0, 10, 0, 24); // leaves room for the trailing symbol so a long title never runs under it
+    row.titleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightRegular];
+    [row setTitle:option[@"title"] forState:UIControlStateNormal];
+    [row setTitleColor:tint forState:UIControlStateNormal];
+    row.backgroundColor = UIColor.clearColor;
+    [row addTarget:target action:action forControlEvents:UIControlEventTouchUpInside];
+
+    UIImageSymbolConfiguration *symConfig = [UIImageSymbolConfiguration configurationWithPointSize:12 weight:UIImageSymbolWeightRegular];
+    UIImage *symbolImage = [UIImage systemImageNamed:option[@"symbol"] withConfiguration:symConfig];
+    symbolImage = [symbolImage imageWithTintColor:tint renderingMode:UIImageRenderingModeAlwaysOriginal];
+    UIImageView *symbolView = [[UIImageView alloc] initWithImage:symbolImage];
+    symbolView.translatesAutoresizingMaskIntoConstraints = NO;
+    symbolView.contentMode = UIViewContentModeCenter;
+    symbolView.userInteractionEnabled = NO; // purely decorative - taps route to the row button itself, same convention as gd_reencode_chevron_view
+    [row addSubview:symbolView];
+    [NSLayoutConstraint activateConstraints:@[
+        [symbolView.trailingAnchor constraintEqualToAnchor:row.trailingAnchor constant:-10],
+        [symbolView.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
+        [symbolView.widthAnchor constraintEqualToConstant:16],
+    ]];
+
+    return row;
+}
+
+#pragma mark - Mods Library folder options menu (3.4.5)
+//
+// Folder-row equivalent of the file "..." dropdown just above - same
+// pill button, same gd_make_mods_options_row_button row shape, same
+// kGDModsOptionsDropdownWidth/RowHeight sizing, reusing all of it as-is
+// rather than a second parallel implementation (see this pass's
+// progress.md notes). What's folder-specific is just this one static
+// option list, plus the folder row layout itself
+// (gd_make_mods_folder_row below) and the instance-method dispatch in
+// -gd_modsOptionsDropdownRowTapped: (see that method's own header for
+// how it tells a file-mode dropdown from a folder-mode one).
+//
+// Per the person's 3.4.5 spec this REPLACES the folder row's old
+// standalone Add("+")/Rename(pencil)/Delete(X) icon trio outright - not
+// just Delete, the way 3.4 only touched the file row's delete X. Add
+// mod keeps its old behavior (same picker as the old "+"), Delete keeps
+// its old underlying -gd_deleteModFolderConfirmed: (just reached via a
+// destructive confirm alert now instead of a press-and-hold capsule,
+// same reasoning as the file row's own Delete), and Cache folder is a
+// future-feature stub. The person's original spec for this dropdown
+// listed only four rows and didn't mention Rename - flagged as a
+// question in a prior pass's progress.md rather than guessed at. The
+// person has since confirmed the omission was accidental and Rename
+// should come back, positioned right after Add mod. It reuses the
+// exact prompt/rename plumbing the old standalone pencil button used
+// to drive (-gd_promptForModFolderNameWithTitle:actionTitle:completion:
+// + +[ModAssetLibrary renameFolderNamed:to:error:] - see
+// -gd_promptForModFolderRenameForFolder: below), just reached from this
+// dropdown row instead of its own icon now.
+static NSArray<NSDictionary<NSString *, id> *> *gd_mods_folder_options(void) {
+    return @[
+        @{@"title": @"Add mod",      @"symbol": @"plus",         @"destructive": @NO},
+        @{@"title": @"Rename",       @"symbol": @"pencil",       @"destructive": @NO},
+        @{@"title": @"Cache folder", @"symbol": @"archivebox",   @"destructive": @NO},
+        @{@"title": @"Add remark",   @"symbol": @"quote.bubble", @"destructive": @NO},
+        @{@"title": @"Delete",       @"symbol": @"trash",        @"destructive": @YES},
+    ];
+}
+
 static UIView *gd_make_mods_entry_row(ModAssetLibraryEntry *entry, id target, SEL tapAction,
-                                       SEL dispatchAction, SEL downloadAction, SEL retryAction, BOOL showActions,
-                                       BOOL downloadInFlight) {
+                                       SEL dispatchAction, SEL downloadAction, SEL retryAction, SEL optionsAction, BOOL showActions,
+                                       BOOL downloadInFlight, BOOL isStoredBundlesFolder) {
     UIView *row = [[UIView alloc] init];
     row.translatesAutoresizingMaskIntoConstraints = NO;
     objc_setAssociatedObject(row, "gd_modsEntry", entry, OBJC_ASSOCIATION_RETAIN);
@@ -3019,7 +3333,14 @@ static UIView *gd_make_mods_entry_row(ModAssetLibraryEntry *entry, id target, SE
     // literally "__data" (Unity's own loader requires that exact name),
     // but that's a consequence of being a bundle, not what identifies
     // one - see UnityBundleCAB.h's isUnityFSBundleAtPath: header comment.
-    BOOL isDoctorEligible = entry.isAssetBundle;
+    // 7: a "Stored Bundles" row is never doctor-pipeline eligible for
+    // display purposes even though entry.isAssetBundle is still YES on
+    // it - it's sitting inert in storage, not tracked through the
+    // upload/process/download states, so there's nothing for the
+    // dispatch/download/retry capsule slot below to show. Its Status
+    // line is forced to "Stored" in gd_make_mods_entry_info_panel
+    // instead - see isStoredBundlesFolder there.
+    BOOL isDoctorEligible = entry.isAssetBundle && !isStoredBundlesFolder;
     UIImageSymbolConfiguration *iconConfig = [UIImageSymbolConfiguration configurationWithPointSize:12 weight:UIImageSymbolWeightRegular];
     UIImageView *icon = [[UIImageView alloc] initWithImage:
         [UIImage systemImageNamed:(isBank ? @"waveform" : @"doc.fill") withConfiguration:iconConfig]];
@@ -3039,17 +3360,31 @@ static UIView *gd_make_mods_entry_row(ModAssetLibraryEntry *entry, id target, SE
     UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:target action:tapAction];
     [row addGestureRecognizer:tap];
 
-    UIButton *deleteButton = nil;
+    // 3.4: the lone delete X this used to be is gone - Delete is now one
+    // row inside the "..." options dropdown (see gd_mods_file_options()
+    // and -gd_openModsOptionsDropdownForButton:), alongside the new
+    // Cache bundle/Add remark actions. Same showActions gating as the
+    // old delete button had (only present while this entry's Info
+    // dropdown is open), same pill-not-circle sizing reasoning as
+    // kGDModsOptionsButtonWidth/Height above. Wired directly here (TouchUpInside),
+    // same as the doctor-pipeline buttons below, rather than through the
+    // separate gd_attach_hold_to_confirm wiring pass in
+    // -gd_rebuildModsLibrary - there's no hold-to-confirm capsule
+    // animation on this control itself anymore; Delete's own confirm now
+    // happens as a destructive alert once it's picked from the dropdown
+    // (see -gd_confirmDeleteModEntry:inFolder:), since a menu row has no
+    // room to grow a fill capsule the way a lone icon button did.
+    UIButton *optionsButton = nil;
     if (showActions) {
-        UIImageSymbolConfiguration *xSymbolConfig = [UIImageSymbolConfiguration configurationWithPointSize:6 weight:UIImageSymbolWeightSemibold];
-        UIImage *xImage = [UIImage systemImageNamed:@"xmark" withConfiguration:xSymbolConfig];
-        UIColor *xTint = [UIColor colorWithWhite:1 alpha:0.55];
-        deleteButton = [UIButton buttonWithType:UIButtonTypeSystem];
-        deleteButton.translatesAutoresizingMaskIntoConstraints = NO;
-        gd_style_icon_button_as_native_glass(deleteButton, xImage, xTint);
-        objc_setAssociatedObject(deleteButton, "gd_modsEntry", entry, OBJC_ASSOCIATION_RETAIN);
-        [row addSubview:deleteButton];
-        objc_setAssociatedObject(row, "gd_button_delete", deleteButton, OBJC_ASSOCIATION_RETAIN);
+        optionsButton = [UIButton buttonWithType:UIButtonTypeSystem];
+        optionsButton.translatesAutoresizingMaskIntoConstraints = NO;
+        UIImageSymbolConfiguration *dotsSymbolConfig = [UIImageSymbolConfiguration configurationWithPointSize:10 weight:UIImageSymbolWeightSemibold];
+        UIImage *dotsImage = [UIImage systemImageNamed:@"ellipsis" withConfiguration:dotsSymbolConfig];
+        gd_style_icon_button_as_native_glass(optionsButton, dotsImage, [UIColor colorWithWhite:1 alpha:0.6]);
+        objc_setAssociatedObject(optionsButton, "gd_modsEntry", entry, OBJC_ASSOCIATION_RETAIN);
+        [optionsButton addTarget:target action:optionsAction forControlEvents:UIControlEventTouchUpInside];
+        [row addSubview:optionsButton];
+        objc_setAssociatedObject(row, "gd_button_options", optionsButton, OBJC_ASSOCIATION_RETAIN);
     }
 
     // Doctor-pipeline slot - built after reset/delete so its leading
@@ -3081,35 +3416,28 @@ static UIView *gd_make_mods_entry_row(ModAssetLibraryEntry *entry, id target, SE
                 }
                 doctorButton = [UIButton buttonWithType:UIButtonTypeSystem];
                 doctorButton.translatesAutoresizingMaskIntoConstraints = NO;
-                gd_style_button_as_native_glass(doctorButton, @"dispatch", gd_accent_green_color());
-                doctorButton.titleLabel.font = [UIFont systemFontOfSize:kGDModsDoctorCapsuleFontSize weight:UIFontWeightSemibold];
+                gd_style_button_as_native_glass_with_font(doctorButton, @"dispatch", gd_accent_green_color(),
+                    [UIFont systemFontOfSize:kGDModsDoctorCapsuleFontSize weight:UIFontWeightSemibold]);
                 [doctorButton addTarget:target action:dispatchAction forControlEvents:UIControlEventTouchUpInside];
                 objc_setAssociatedObject(row, "gd_button_dispatch", doctorButton, OBJC_ASSOCIATION_RETAIN);
                 doctorView = doctorButton;
                 break;
             }
             case ModAssetLibraryDoctorStatusUploading: {
-                NSInteger percent = (NSInteger)round(MAX(0.0, MIN(1.0, entry.doctorUploadProgress)) * 100.0);
-                UILabel *progressLabel = [[UILabel alloc] init];
-                progressLabel.translatesAutoresizingMaskIntoConstraints = NO;
-                progressLabel.text = [NSString stringWithFormat:@"%ld%% uploaded", (long)percent];
-                progressLabel.font = [UIFont systemFontOfSize:10 weight:UIFontWeightMedium];
-                progressLabel.textColor = gd_accent_green_color();
-                progressLabel.textAlignment = NSTextAlignmentRight;
-                objc_setAssociatedObject(row, "gd_label_doctorProgress", progressLabel, OBJC_ASSOCIATION_RETAIN);
-                doctorView = progressLabel;
+                // 3.3: no more row-level "N% uploaded" subtext here - it
+                // duplicated the Status line already shown in this
+                // entry's Info dropdown (see gd_make_mods_entry_info_panel)
+                // right next to the delete button, per the person's spec.
+                // The dropdown is now the only place this percent renders.
+                // Leave doctorView nil - nothing tappable in this state,
+                // so the row's trailing slot is simply empty while
+                // uploading.
                 break;
             }
             case ModAssetLibraryDoctorStatusProcessing: {
-                NSInteger percent = (NSInteger)round(MAX(0.0, MIN(1.0, entry.doctorProcessProgress)) * 100.0);
-                UILabel *progressLabel = [[UILabel alloc] init];
-                progressLabel.translatesAutoresizingMaskIntoConstraints = NO;
-                progressLabel.text = [NSString stringWithFormat:@"%ld%% processed", (long)percent];
-                progressLabel.font = [UIFont systemFontOfSize:10 weight:UIFontWeightMedium];
-                progressLabel.textColor = gd_accent_green_color();
-                progressLabel.textAlignment = NSTextAlignmentRight;
-                objc_setAssociatedObject(row, "gd_label_doctorProgress", progressLabel, OBJC_ASSOCIATION_RETAIN);
-                doctorView = progressLabel;
+                // 3.3, same reasoning as Uploading just above - "N%
+                // processed" is redundant with the Info dropdown's Status
+                // line.
                 break;
             }
             case ModAssetLibraryDoctorStatusReadyToDownload: {
@@ -3119,25 +3447,20 @@ static UIView *gd_make_mods_entry_row(ModAssetLibraryEntry *entry, id target, SE
                 // stays ReadyToDownload for the whole thing (nothing to
                 // persist mid-flight, see that method's own header), so
                 // this is the one doctor-pipeline row state that isn't
-                // driven by entry.doctorStatus alone. Render the same
-                // non-interactive subtext style Uploading/Processing use
-                // rather than a disabled button, so it doesn't look like
-                // a still-tappable control that's simply not responding.
+                // driven by entry.doctorStatus alone.
+                // 3.3: previously rendered a "downloading…" subtext here,
+                // same non-interactive style Uploading/Processing used -
+                // also redundant with the Info dropdown's Status line
+                // (which now shows a live percent too, see
+                // gd_make_mods_entry_info_panel), so this slot is simply
+                // empty for the duration of the download instead.
                 if (downloadInFlight) {
-                    UILabel *progressLabel = [[UILabel alloc] init];
-                    progressLabel.translatesAutoresizingMaskIntoConstraints = NO;
-                    progressLabel.text = @"downloading…";
-                    progressLabel.font = [UIFont systemFontOfSize:10 weight:UIFontWeightMedium];
-                    progressLabel.textColor = gd_accent_green_color();
-                    progressLabel.textAlignment = NSTextAlignmentRight;
-                    objc_setAssociatedObject(row, "gd_label_doctorProgress", progressLabel, OBJC_ASSOCIATION_RETAIN);
-                    doctorView = progressLabel;
                     break;
                 }
                 doctorButton = [UIButton buttonWithType:UIButtonTypeSystem];
                 doctorButton.translatesAutoresizingMaskIntoConstraints = NO;
-                gd_style_button_as_native_glass(doctorButton, @"download", gd_accent_green_color());
-                doctorButton.titleLabel.font = [UIFont systemFontOfSize:kGDModsDoctorCapsuleFontSize weight:UIFontWeightSemibold];
+                gd_style_button_as_native_glass_with_font(doctorButton, @"download", gd_accent_green_color(),
+                    [UIFont systemFontOfSize:kGDModsDoctorCapsuleFontSize weight:UIFontWeightSemibold]);
                 [doctorButton addTarget:target action:downloadAction forControlEvents:UIControlEventTouchUpInside];
                 objc_setAssociatedObject(row, "gd_button_download", doctorButton, OBJC_ASSOCIATION_RETAIN);
                 doctorView = doctorButton;
@@ -3156,8 +3479,8 @@ static UIView *gd_make_mods_entry_row(ModAssetLibraryEntry *entry, id target, SE
                 doctorButton = [UIButton buttonWithType:UIButtonTypeSystem];
                 doctorButton.translatesAutoresizingMaskIntoConstraints = NO;
                 UIColor *failTint = [UIColor colorWithRed:1.0 green:0.42 blue:0.42 alpha:1.0];
-                gd_style_button_as_native_glass(doctorButton, @"retry", failTint);
-                doctorButton.titleLabel.font = [UIFont systemFontOfSize:kGDModsDoctorCapsuleFontSize weight:UIFontWeightSemibold];
+                gd_style_button_as_native_glass_with_font(doctorButton, @"retry", failTint,
+                    [UIFont systemFontOfSize:kGDModsDoctorCapsuleFontSize weight:UIFontWeightSemibold]);
                 [doctorButton addTarget:target action:retryAction forControlEvents:UIControlEventTouchUpInside];
                 objc_setAssociatedObject(row, "gd_button_retry", doctorButton, OBJC_ASSOCIATION_RETAIN);
                 doctorView = doctorButton;
@@ -3171,7 +3494,7 @@ static UIView *gd_make_mods_entry_row(ModAssetLibraryEntry *entry, id target, SE
         }
     }
 
-    UIView *labelTrailingNeighbor = doctorView ?: (deleteButton ?: row);
+    UIView *labelTrailingNeighbor = doctorView ?: (optionsButton ?: row);
     [NSLayoutConstraint activateConstraints:@[
         [icon.leadingAnchor constraintEqualToAnchor:row.leadingAnchor constant:22], // indented under the folder icon above
         [icon.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
@@ -3185,16 +3508,16 @@ static UIView *gd_make_mods_entry_row(ModAssetLibraryEntry *entry, id target, SE
         [row.bottomAnchor constraintEqualToAnchor:label.bottomAnchor constant:3],
     ]];
 
-    if (deleteButton) {
+    if (optionsButton) {
         [NSLayoutConstraint activateConstraints:@[
-            [deleteButton.trailingAnchor constraintEqualToAnchor:row.trailingAnchor],
-            [deleteButton.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
-            [deleteButton.widthAnchor constraintEqualToConstant:18],
-            [deleteButton.heightAnchor constraintEqualToConstant:18],
+            [optionsButton.trailingAnchor constraintEqualToAnchor:row.trailingAnchor],
+            [optionsButton.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
+            [optionsButton.widthAnchor constraintEqualToConstant:kGDModsOptionsButtonWidth],
+            [optionsButton.heightAnchor constraintEqualToConstant:kGDModsOptionsButtonHeight],
         ]];
         if (doctorView) {
             [NSLayoutConstraint activateConstraints:@[
-                [doctorView.trailingAnchor constraintEqualToAnchor:deleteButton.leadingAnchor constant:-3],
+                [doctorView.trailingAnchor constraintEqualToAnchor:optionsButton.leadingAnchor constant:-3],
             ]];
         }
     } else if (doctorView) {
@@ -3218,14 +3541,51 @@ static UIView *gd_make_mods_entry_row(ModAssetLibraryEntry *entry, id target, SE
     return row;
 }
 
+// One "Label: value" info row where only the value half scrolls when it
+// overflows - the static text (e.g. "Filepath:"/"Identifier:") sits in
+// its own fixed-width, required-hugging UILabel so it never gets
+// dragged along by the value's GDMarqueeLabel scrolling underneath it.
+// Previously both halves lived in a single GDMarqueeLabel's .text
+// string (@"Filepath: %@"), so the "Filepath:" prefix scrolled off
+// along with the path itself instead of staying put.
+static UIView *gd_make_marquee_info_row(NSString *labelText, NSString *value, NSString *marqueeKey, UIFont *font, UIColor *color) {
+    UIStackView *row = [[UIStackView alloc] init];
+    row.axis = UILayoutConstraintAxisHorizontal;
+    row.alignment = UIStackViewAlignmentFill;
+    row.spacing = 4;
+    row.translatesAutoresizingMaskIntoConstraints = NO;
+
+    UILabel *staticLabel = [[UILabel alloc] init];
+    staticLabel.text = labelText;
+    staticLabel.font = font;
+    staticLabel.textColor = color;
+    [staticLabel setContentHuggingPriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+    [staticLabel setContentCompressionResistancePriority:UILayoutPriorityRequired forAxis:UILayoutConstraintAxisHorizontal];
+
+    GDMarqueeLabel *valueLabel = [[GDMarqueeLabel alloc] init];
+    valueLabel.text = value;
+    valueLabel.font = font;
+    valueLabel.textColor = color;
+    // Keyed by the caller so this marquee's scroll phase survives a
+    // -gd_rebuildModsLibrary triggered by some OTHER row's dropdown -
+    // see GDMarqueeLabel.marqueeKey.
+    valueLabel.marqueeKey = marqueeKey;
+    [valueLabel setContentHuggingPriority:UILayoutPriorityDefaultLow forAxis:UILayoutConstraintAxisHorizontal];
+
+    [row addArrangedSubview:staticLabel];
+    [row addArrangedSubview:valueLabel];
+    return row;
+}
+
 // Expandable "Info" panel for one entry - full on-disk library path,
 // bundle identity/platform (bundle-kind entries only), doctor-pipeline
 // install status (bundle-kind entries only - see isDoctorEligible's own
 // note in gd_make_mods_entry_row on why this class doesn't gate itself
 // on file kind but this panel does), human-readable size, and date
-// added. Path uses GDMarqueeLabel so a long value scrolls into view
-// instead of getting truncated.
-static UIView *gd_make_mods_entry_info_panel(ModAssetLibraryEntry *entry, BOOL downloadInFlight) {
+// added. Path/Identifier use gd_make_marquee_info_row so a long value
+// scrolls into view instead of getting truncated, without dragging the
+// "Filepath:"/"Identifier:" label along with it.
+static UIView *gd_make_mods_entry_info_panel(ModAssetLibraryEntry *entry, BOOL downloadInFlight, BOOL isStoredBundlesFolder) {
     UIView *container = [[UIView alloc] init];
     container.translatesAutoresizingMaskIntoConstraints = NO;
     objc_setAssociatedObject(container, "gd_modsEntry", entry, OBJC_ASSOCIATION_RETAIN);
@@ -3241,21 +3601,44 @@ static UIView *gd_make_mods_entry_info_panel(ModAssetLibraryEntry *entry, BOOL d
     UIFont *subtextFont = [UIFont systemFontOfSize:9.5 weight:UIFontWeightRegular];
     UIColor *subtextColor = [UIColor colorWithWhite:1 alpha:0.4];
 
-    // entry.path is this file's own on-disk library copy - shown as-is,
-    // whether or not it's ever been swapped into the game. (This used to
-    // show entry.livePathDescription - "where this would live within the
-    // game's own files" - with a "not automatically routed" placeholder
-    // for anything that field couldn't resolve; that's gone in favor of
-    // always showing the one path this class actually knows for certain.)
-    GDMarqueeLabel *pathLabel = [[GDMarqueeLabel alloc] init];
-    pathLabel.text = [NSString stringWithFormat:@"Filepath: %@", entry.path];
-    pathLabel.font = subtextFont;
-    pathLabel.textColor = subtextColor;
-    // Keyed by entry path so this marquee's scroll phase survives a
-    // -gd_rebuildModsLibrary triggered by some OTHER row's dropdown -
-    // see GDMarqueeLabel.marqueeKey.
-    pathLabel.marqueeKey = [entry.path stringByAppendingString:@"|path"];
-    [panel addArrangedSubview:pathLabel];
+    // 3.4 "Add remark": surfaced at the very top of the panel, before
+    // Filepath, per spec. Plain wrapping UILabel - not specified as
+    // scrolling, so no marquee treatment unlike Filepath/Identifier
+    // below. Only added when non-empty; most entries have no remark.
+    if (entry.remark.length > 0) {
+        UILabel *remarkLabel = [[UILabel alloc] init];
+        remarkLabel.text = entry.remark;
+        remarkLabel.font = subtextFont;
+        remarkLabel.textColor = [UIColor colorWithWhite:1 alpha:0.7];
+        remarkLabel.numberOfLines = 0;
+        [panel addArrangedSubview:remarkLabel];
+    }
+
+    // entry.path is this file's own on-disk LIBRARY copy - it always
+    // exists, but per the person's 3.2 request that's the tweak's own
+    // ZModAssetLibrary tree, not the game's. So it's now only the
+    // fallback (see below), not what's shown first.
+    // 3.2 - prefer the real in-game destination (NSHomeDirectory-
+    // relative, e.g. "Documents/Assets/Sound/FMODBuilds/Mobile/x.bank")
+    // once it's knowable: always for a .bank entry (deterministic at
+    // import time), and for a bundle entry once it's been installed at
+    // least once (see livePathDescription's own header comment - a
+    // bundle has no fixed destination up front). Falls back to this
+    // file's own on-disk LIBRARY copy path for anything that hasn't
+    // resolved a live path yet, rather than showing nothing.
+    // 7: "the bundle's filepath will be hidden in this folder" - a
+    // Stored Bundles row has no live install to point at anyway (Cache
+    // just swapped it back to the original), so the row simply skips
+    // this line rather than showing entry.path (its own on-disk LIBRARY
+    // copy, which would be a confusing thing to surface here under the
+    // "Filepath" label people are used to reading as the in-game path).
+    if (!isStoredBundlesFolder) {
+        NSString *displayedPath = entry.livePathDescription ?: entry.path;
+        UIView *pathRow = gd_make_marquee_info_row(@"Filepath:", displayedPath,
+                                                    [entry.path stringByAppendingString:@"|path"],
+                                                    subtextFont, subtextColor);
+        [panel addArrangedSubview:pathRow];
+    }
 
     // Bundle-only fields - a .bank entry has no CAB id, no Unity target
     // platform, and no doctor-pipeline install status (see
@@ -3263,11 +3646,10 @@ static UIView *gd_make_mods_entry_info_panel(ModAssetLibraryEntry *entry, BOOL d
     // meaningless for anything that never enters the doctor pipeline).
     if (entry.isAssetBundle) {
         if (entry.cabIdentifier.length > 0) {
-            UILabel *identifierLabel = [[UILabel alloc] init];
-            identifierLabel.text = [NSString stringWithFormat:@"Identifier: %@", entry.cabIdentifier];
-            identifierLabel.font = subtextFont;
-            identifierLabel.textColor = subtextColor;
-            [panel addArrangedSubview:identifierLabel];
+            UIView *identifierRow = gd_make_marquee_info_row(@"Identifier:", entry.cabIdentifier,
+                                                               [entry.path stringByAppendingString:@"|cab"],
+                                                               subtextFont, subtextColor);
+            [panel addArrangedSubview:identifierRow];
         }
 
         if (entry.targetPlatform) {
@@ -3290,7 +3672,17 @@ static UIView *gd_make_mods_entry_info_panel(ModAssetLibraryEntry *entry, BOOL d
         // -gd_modsLibraryEntryDownloadTapped:'s and
         // -gd_doctorStartOrInstallForEntry:folderName:'s own headers), so
         // those just say what's happening instead of a percentage.
+        // 7: "the status will display 'Stored'" - overrides the ordinary
+        // doctorStatus-driven text below entirely while sitting in
+        // Stored Bundles, same as the Filepath row being skipped above -
+        // the row's actual doctorStatus is left untouched on the
+        // manifest (still Installed, from before it was cached) so
+        // -gd_restoreStoredBundleEntry:inFolder: has something correct
+        // to fall back to once it's moved back into a real folder.
         NSString *statusText;
+        if (isStoredBundlesFolder) {
+            statusText = @"Stored";
+        } else
         switch (entry.doctorStatus) {
             case ModAssetLibraryDoctorStatusUploading: {
                 NSInteger percent = (NSInteger)round(MAX(0.0, MIN(1.0, entry.doctorUploadProgress)) * 100.0);
@@ -3303,7 +3695,18 @@ static UIView *gd_make_mods_entry_info_panel(ModAssetLibraryEntry *entry, BOOL d
                 break;
             }
             case ModAssetLibraryDoctorStatusReadyToDownload:
-                statusText = downloadInFlight ? @"Downloading…" : @"Not installed";
+                if (downloadInFlight) {
+                    // 3.3: this used to just say "Downloading…" with no
+                    // percent, unlike the Uploaded/Processed lines right
+                    // above it - now backed by entry.doctorDownloadProgress
+                    // (see -gd_doctorHandleDownloadProgress:forEntryPath:inFolder:
+                    // and BundleDoctorService's download-side progress
+                    // delegate), same "XX% Downloading" shape as the rest.
+                    NSInteger percent = (NSInteger)round(MAX(0.0, MIN(1.0, entry.doctorDownloadProgress)) * 100.0);
+                    statusText = [NSString stringWithFormat:@"%ld%% Downloading", (long)percent];
+                } else {
+                    statusText = @"Not installed";
+                }
                 break;
             case ModAssetLibraryDoctorStatusNotDispatched:
                 statusText = downloadInFlight ? @"Installing…" : @"Not installed";
@@ -3347,6 +3750,122 @@ static UIView *gd_make_mods_entry_info_panel(ModAssetLibraryEntry *entry, BOOL d
         errorLabel.textColor = [UIColor colorWithRed:1.0 green:0.5 blue:0.5 alpha:0.85];
         errorLabel.marqueeKey = [entry.path stringByAppendingString:@"|doctorError"];
         [panel addArrangedSubview:errorLabel];
+    }
+
+    [NSLayoutConstraint activateConstraints:@[
+        [panel.topAnchor constraintEqualToAnchor:container.topAnchor],
+        [panel.leadingAnchor constraintEqualToAnchor:container.leadingAnchor],
+        [panel.trailingAnchor constraintEqualToAnchor:container.trailingAnchor],
+        [panel.bottomAnchor constraintEqualToAnchor:container.bottomAnchor],
+    ]];
+
+    return container;
+}
+
+#pragma mark - Mods Library "Processed Bundles" rows (6)
+//
+// The immutable folder's own file rows/info panel - deliberately NOT
+// gd_make_mods_entry_row/gd_make_mods_entry_info_panel reused with a
+// dummy ModAssetLibraryEntry, since a BundleDoctorProcessedRelease
+// isn't a library-tracked file at all (no on-disk copy, no doctor-
+// pipeline state machine, no options dropdown per the person's 6 spec)
+// - forcing it through that machinery would mean faking half of
+// ModAssetLibraryEntry's fields for no real benefit. This is a much
+// smaller, read-only pair of builders instead: a row (icon + name,
+// whole-row-tappable, no trailing controls at all) and an info panel
+// (Size / Upload date / Checksum only).
+
+// Keyed by a release's own tagName (stable and unique across a rebuild,
+// same "path is the key, not the object" reasoning
+// modsLibraryExpandedInfoEntries already uses for real entries).
+static UIView *gd_make_processed_bundle_row(BundleDoctorProcessedRelease *release, id target, SEL tapAction) {
+    UIView *row = [[UIView alloc] init];
+    row.translatesAutoresizingMaskIntoConstraints = NO;
+    objc_setAssociatedObject(row, "gd_processedRelease", release, OBJC_ASSOCIATION_RETAIN);
+
+    UIImageSymbolConfiguration *iconConfig = [UIImageSymbolConfiguration configurationWithPointSize:12 weight:UIImageSymbolWeightRegular];
+    UIImageView *icon = [[UIImageView alloc] initWithImage:
+        [UIImage systemImageNamed:@"shippingbox.fill" withConfiguration:iconConfig]];
+    icon.translatesAutoresizingMaskIntoConstraints = NO;
+    icon.tintColor = [UIColor colorWithWhite:1 alpha:0.6];
+    icon.contentMode = UIViewContentModeCenter;
+    [row addSubview:icon];
+
+    UILabel *label = [[UILabel alloc] init];
+    label.translatesAutoresizingMaskIntoConstraints = NO;
+    label.text = release.displayName;
+    label.font = [UIFont systemFontOfSize:11 weight:UIFontWeightRegular];
+    label.textColor = [UIColor colorWithWhite:1 alpha:0.75];
+    label.lineBreakMode = NSLineBreakByTruncatingMiddle;
+    [row addSubview:label];
+
+    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:target action:tapAction];
+    [row addGestureRecognizer:tap];
+
+    [NSLayoutConstraint activateConstraints:@[
+        [icon.leadingAnchor constraintEqualToAnchor:row.leadingAnchor constant:22], // same indent as a real entry row's own doc icon
+        [icon.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
+        [icon.widthAnchor constraintEqualToConstant:16],
+
+        [label.leadingAnchor constraintEqualToAnchor:icon.trailingAnchor constant:5],
+        [label.trailingAnchor constraintLessThanOrEqualToAnchor:row.trailingAnchor constant:-8], // no options pill to stop short of - per spec, these rows don't have one
+        [label.centerYAnchor constraintEqualToAnchor:row.centerYAnchor],
+
+        [row.topAnchor constraintEqualToAnchor:label.topAnchor constant:-3],
+        [row.bottomAnchor constraintEqualToAnchor:label.bottomAnchor constant:3],
+    ]];
+
+    return row;
+}
+
+// Expandable info panel for one Processed Bundles row - Size / Upload
+// date / Checksum only, per the person's 6 spec (no Filepath/Identifier/
+// Status/remark - there's no on-disk copy or install state for a release
+// that hasn't been downloaded). Checksum uses gd_make_marquee_info_row
+// since a full "sha256:<64 hex chars>" string is always wider than the
+// panel - same reasoning as Filepath/Identifier already scrolling in
+// gd_make_mods_entry_info_panel. Size/Upload date stay plain UILabels,
+// same as that function's own Size/Date Added rows, for the same reason
+// (short enough to never need it).
+static UIView *gd_make_processed_bundle_info_panel(BundleDoctorProcessedRelease *release) {
+    UIView *container = [[UIView alloc] init];
+    container.translatesAutoresizingMaskIntoConstraints = NO;
+    objc_setAssociatedObject(container, "gd_processedRelease", release, OBJC_ASSOCIATION_RETAIN);
+
+    UIStackView *panel = [[UIStackView alloc] init];
+    panel.axis = UILayoutConstraintAxisVertical;
+    panel.spacing = 2;
+    panel.translatesAutoresizingMaskIntoConstraints = NO;
+    panel.layoutMarginsRelativeArrangement = YES;
+    panel.layoutMargins = UIEdgeInsetsMake(2, 38, 2, 4); // lines up under the entry name, past the folder/doc icon indent - same as gd_make_mods_entry_info_panel
+    [container addSubview:panel];
+
+    UIFont *subtextFont = [UIFont systemFontOfSize:9.5 weight:UIFontWeightRegular];
+    UIColor *subtextColor = [UIColor colorWithWhite:1 alpha:0.4];
+
+    UILabel *sizeLabel = [[UILabel alloc] init];
+    sizeLabel.text = [NSString stringWithFormat:@"Size: %@", [NSByteCountFormatter stringFromByteCount:(long long)release.byteSize countStyle:NSByteCountFormatterCountStyleFile]];
+    sizeLabel.font = subtextFont;
+    sizeLabel.textColor = subtextColor;
+    [panel addArrangedSubview:sizeLabel];
+
+    UILabel *dateLabel = [[UILabel alloc] init];
+    dateLabel.text = [NSString stringWithFormat:@"Upload date: %@", release.uploadedAt.length ? release.uploadedAt : @"unknown"];
+    dateLabel.font = subtextFont;
+    dateLabel.textColor = subtextColor;
+    [panel addArrangedSubview:dateLabel];
+
+    // release.checksum can be nil (see BundleDoctorProcessedRelease.h's
+    // own header on when GitHub's response omits it) - the row is simply
+    // left out rather than shown as "Checksum: unknown", since unlike
+    // Upload date this isn't a value that's just missing from an
+    // otherwise-normal response; it means this GitHub instance/asset
+    // never had one to report in the first place.
+    if (release.checksum.length > 0) {
+        UIView *checksumRow = gd_make_marquee_info_row(@"Checksum:", release.checksum,
+                                                         [release.tagName stringByAppendingString:@"|checksum"],
+                                                         subtextFont, subtextColor);
+        [panel addArrangedSubview:checksumRow];
     }
 
     [NSLayoutConstraint activateConstraints:@[
@@ -3591,6 +4110,27 @@ static UIView *gd_make_title_block(void) {
 @property (nonatomic, strong) UITextField *authRepoLinkField;
 @property (nonatomic, strong) UITextField *authTokenField;
 @property (nonatomic, strong) UIButton *authVerifyButton; // "Verify" - see -gd_authVerifyTapped:
+// Small subtext row directly under the PAT field - replaces the old
+// "Credentials Verified"/"Verification Failed" popups for the success
+// case (still an alert for a manual Verify-tap failure, unchanged) and
+// carries the persistent "no longer valid" message for the boot-time
+// auto-check. Hidden (empty text) whenever there's nothing to say - see
+// -gd_setAuthStatusLabelText:color:.
+@property (nonatomic, strong) UILabel *authStatusLabel;
+// YES once credentials have been confirmed (manually or via the
+// boot-time auto-check, valid OR stale - see -gd_authEnterVerifiedState/
+// -gd_authEnterStaleState) - the fields are locked and authVerifyButton
+// is in its hold-to-confirm "Remove" mode for as long as this is YES.
+// Gates -gd_authVerifyTapped: (a no-op while YES - there's nothing to
+// verify with the fields locked) rather than removing/re-adding its
+// touchUpInside target every transition.
+@property (nonatomic, assign) BOOL authInRemoveMode;
+// YES only for the "was valid, boot-time re-check says it no longer is"
+// case - drives the red vs. green -gd_setAuthStatusLabelText:color: copy
+// and gates dispatch/download (see -gd_doctorBeginDispatchForEntry:/
+// -gd_modsLibraryEntryDownloadTapped:) with an error haptic per spec.
+// Cleared the moment -gd_authRemoveCredentialsConfirmed runs.
+@property (nonatomic, assign) BOOL authCredentialsStale;
 
 // Config section's "Re-Encoding format" picker - a custom-built expanding
 // control now (NOT Apple's UIMenu/.showsMenuAsPrimaryAction - see the
@@ -3608,6 +4148,28 @@ static UIView *gd_make_title_block(void) {
 @property (nonatomic, strong) UIView *reencodeDropdownOverlay;
 @property (nonatomic, strong) UIControl *reencodeDropdownScrim;
 @property (nonatomic, assign) BOOL reencodeDropdownOpen;
+
+// Mods Library file row's "..." options dropdown (3.4) - same
+// overlay/scrim/open shape as reencodeDropdownOverlay/Scrim/Open just
+// above (see -gd_openModsOptionsDropdownForButton:/
+// -gd_closeModsOptionsDropdownAnimated:), parallel-named rather than
+// shared since the two dropdowns are independent controls that could in
+// principle both exist mid-transition. modsOptionsDropdownButton is the
+// "..." button the currently-open dropdown grew out of (weak - the
+// button itself is still owned by its row in modsLibraryStack; this is
+// only kept so the close animation knows which frame to shrink back
+// into and so a second tap on the SAME button closes rather than
+// re-opens). modsOptionsDropdownEntry/FolderName are the entry + folder
+// the open dropdown's rows should act on - stashed here (rather than
+// re-read from the button's own "gd_modsEntry" association on every
+// row tap) purely so -gd_modsOptionsDropdownRowTapped: doesn't need a
+// sender argument shaped like the button.
+@property (nonatomic, weak) UIButton *modsOptionsDropdownButton;
+@property (nonatomic, strong) UIView *modsOptionsDropdownOverlay;
+@property (nonatomic, strong) UIControl *modsOptionsDropdownScrim;
+@property (nonatomic, assign) BOOL modsOptionsDropdownOpen;
+@property (nonatomic, strong) ModAssetLibraryEntry *modsOptionsDropdownEntry;
+@property (nonatomic, copy) NSString *modsOptionsDropdownFolderName;
 
 // Load Mods is a single button that routes each picked file to its own
 // pipeline by kind (see -gd_handleLoadModsPickedURLs:intoFolder:): a
@@ -3653,6 +4215,26 @@ static UIView *gd_make_title_block(void) {
 @property (nonatomic, weak) UIDocumentPickerViewController *libraryImportPicker;
 @property (nonatomic, copy) NSString *libraryImportTargetFolder;
 
+// 6: the immutable "Processed Bundles" folder's own state - NOT backed
+// by ModAssetLibrary (see gd_make_processed_bundle_row's own header),
+// so it needs its own little cache/loading/error trio instead of just
+// re-reading a manifest on every rebuild the way a real folder does.
+// processedBundlesReleases is nil until the first successful fetch (see
+// -gd_fetchProcessedBundles), then holds the last-fetched listing until
+// the folder is collapsed and re-expanded (see
+// -gd_modsLibraryFolderRowTapped:, which re-fetches on every
+// collapsed->expanded transition - there's no other signal, like a
+// local file write, that would tell this to refresh otherwise, since
+// the releases themselves only ever change on GitHub's side).
+@property (nonatomic, strong) NSArray<BundleDoctorProcessedRelease *> *processedBundlesReleases;
+@property (nonatomic, assign) BOOL processedBundlesLoading;
+@property (nonatomic, copy) NSString *processedBundlesErrorMessage; // localizedDescription of the last fetch failure, if any - nil once a fetch succeeds
+// Keyed by BundleDoctorProcessedRelease.tagName (stable across a
+// rebuild the way the object itself isn't - same reasoning as
+// modsLibraryExpandedInfoEntries using entry.path instead of the entry
+// object).
+@property (nonatomic, strong) NSMutableSet<NSString *> *modsLibraryExpandedProcessedBundles;
+
 // Section 3 runtime state for the doctor-pipeline dispatch/poll flow
 // (see "#pragma mark Mods (doctor pipeline)" below) - none of this is
 // persisted itself (doctorStatus/doctorUploadProgress/etc. on the
@@ -3677,6 +4259,13 @@ static UIView *gd_make_title_block(void) {
 // write plus a full accordion rebuild.
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *doctorUploadProgressLastPercent;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *doctorProcessProgressLastPercent;
+// Same throttling purpose as the two above, for
+// -gd_doctorHandleDownloadProgress:forEntryPath:inFolder:'s
+// entry.doctorDownloadProgress writes (see BundleDoctorService's
+// download-side progress delegate) - added alongside the 3.3 fix that
+// gave the Info dropdown's "Downloading…" status line a real percent
+// instead of none at all.
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *doctorDownloadProgressLastPercent;
 // Entries (by path) whose "download" tap is currently being handled -
 // fetch from GitHub, then (CAB match failing) a target-file pick, then
 // install, all of which is NOT a manifest-persisted doctorStatus the
@@ -3686,10 +4275,15 @@ static UIView *gd_make_title_block(void) {
 // state needs -gd_recoverStaleDoctorStateForThisLaunch to handle - the
 // row just falls back to a plain, re-tappable "download" capsule if the
 // app dies mid-flight). Purely in-memory, same purpose as
-// doctorUploadProgressLastPercent above: gd_make_mods_entry_row checks
-// this set to render a non-interactive "downloading…" label instead of
-// the button while a path is in it, and -gd_modsLibraryEntryDownloadTapped:
-// checks it first to ignore a second tap on the same row mid-flight.
+// doctorUploadProgressLastPercent above: -gd_modsLibraryEntryDownloadTapped:
+// checks this set first to ignore a second tap on the same row
+// mid-flight, and gd_make_mods_entry_info_panel checks it (via the
+// downloadInFlight parameter threaded down from -gd_rebuildModsLibrary)
+// to know when entry.doctorDownloadProgress is actually live versus
+// just a leftover value from the last attempt. As of 3.3,
+// gd_make_mods_entry_row itself no longer renders anything from this
+// set - the row-level "downloading…" subtext was removed as redundant
+// with the dropdown; see that function's own comments.
 @property (nonatomic, strong) NSMutableSet<NSString *> *doctorDownloadInFlightPaths;
 // Target-bundle picker for the download/install flow's manual fallback
 // (see -gd_presentDoctorInstallTargetPickerForDoctoredURL:entryPath:
@@ -3741,6 +4335,22 @@ static UIView *gd_make_title_block(void) {
 @property (nonatomic, weak) NSLayoutConstraint *authFieldFloatingBottomConstraint;
 @property (nonatomic, assign) CGRect gd_lastKeyboardFrame;
 
+// 10 "Add remark": a standalone floating field opened straight from a
+// file's options dropdown in Mod asset library - unlike the Auth fields
+// above, it has no existing row anywhere to lift from/restore into, so
+// it's built fresh directly in the key window each time and torn down
+// completely on commit. modsRemarkFloatingBackdrop is a full-screen,
+// effectively-invisible tap target behind it (tapping outside the field
+// resigns it, same as Return does - see -gd_modsRemarkBackdropTapped).
+// modsRemarkFloatingEntry/FolderName identify what gets saved once the
+// field resigns; both nil whenever the field isn't up.
+@property (nonatomic, strong) UIView *modsRemarkFloatingBackdrop;
+@property (nonatomic, strong) UIView *modsRemarkFloatingContainer;
+@property (nonatomic, strong) UITextField *modsRemarkFloatingField;
+@property (nonatomic, weak) NSLayoutConstraint *modsRemarkFloatingBottomConstraint;
+@property (nonatomic, strong) ModAssetLibraryEntry *modsRemarkFloatingEntry;
+@property (nonatomic, copy) NSString *modsRemarkFloatingFolderName;
+
 // Same idea as the block above, but for wide pill/text buttons that
 // confirm a hold with a left-to-right fill sweeping across the whole
 // button - i.e. literally the Syslog button's own hold mechanism (see
@@ -3765,7 +4375,7 @@ static UIView *gd_make_title_block(void) {
 @property (nonatomic, strong) CALayer *syslogButtonFillLayer;   // red hold-progress fill, drawn directly on syslogButton.layer so it survives gd_style_button_as_native_glass rebuilding the button's UIButtonConfiguration-owned subviews
 @property (nonatomic, strong) CADisplayLink *syslogHoldDisplayLink;
 @property (nonatomic, assign) NSTimeInterval syslogHoldStartTime;
-@property (nonatomic, assign) BOOL syslogHoldTriggered; // set once the 3s hold fires, so the touchUpInside from finger-lift doesn't also run the normal tap handler
+@property (nonatomic, assign) BOOL syslogHoldTriggered; // set once the 1s hold fires (9: was 3s), so the touchUpInside from finger-lift doesn't also run the normal tap handler
 
 // refs needed outside the generic builder (their actions do more than
 // update a label).
@@ -4417,9 +5027,29 @@ static const CGFloat kContentFadeHeight = 22;
                                                             @"Blacklist keywords");
     UIButton *syslogButton = objc_getAssociatedObject(syslogRow, "gd_button");
     self.syslogButton = syslogButton;
+    // 9: square-ish (6pt corner) per spec, same treatment as the Auth
+    // section's Verify button - see gd_configure_glass_button_fixed_corner_radius's
+    // own header for why a plain cornerConfiguration set doesn't stick
+    // on a configuration-driven glass button. Re-applied at both
+    // restyle call sites too (-gd_enterSyslogVerboseMode/
+    // -gd_resetSyslogVerboseMode), since each one rebuilds this
+    // button's UIButtonConfiguration from scratch same as Verify's own
+    // "Verifying…"/"Verify" swap does.
+    gd_configure_glass_button_fixed_corner_radius(syslogButton, kGDAuthFieldCornerRadius);
+    if (!gd_has_liquid_glass()) {
+        syslogButton.layer.cornerRadius = kGDAuthFieldCornerRadius;
+        syslogButton.clipsToBounds = YES;
+    }
+    SEL syslogSetUpdateHandler = NSSelectorFromString(@"setConfigurationUpdateHandler:");
+    if ([syslogButton respondsToSelector:syslogSetUpdateHandler]) {
+        void (^syslogReassertCorners)(__kindof UIButton *) = ^(__kindof UIButton *btn) {
+            gd_configure_glass_button_fixed_corner_radius(btn, kGDAuthFieldCornerRadius);
+        };
+        ((void (*)(id, SEL, id))objc_msgSend)(syslogButton, syslogSetUpdateHandler, syslogReassertCorners);
+    }
     [syslogButton addTarget:self action:@selector(toggleSyslogTapped) forControlEvents:UIControlEventTouchUpInside];
 
-    // Hold-for-3-seconds -> Verbose mode. minimumPressDuration is 0
+    // Hold-for-1-second (9: was 3s) -> Verbose mode. minimumPressDuration is 0
     // on purpose - see -handleSyslogButtonLongPress:'s comment for why
     // this recognizer owns the timing itself instead of using the
     // recognizer's own duration threshold. cancelsTouchesInView must be
@@ -4516,6 +5146,7 @@ static const CGFloat kContentFadeHeight = 22;
     // rebuilds.
     self.modsLibraryExpandedFolders = [NSMutableSet set];
     self.modsLibraryExpandedInfoEntries = [NSMutableSet set];
+    self.modsLibraryExpandedProcessedBundles = [NSMutableSet set]; // 6 - see that property's own header comment
     self.modsLibraryStack = [[UIStackView alloc] init];
     self.modsLibraryStack.axis = UILayoutConstraintAxisVertical;
     self.modsLibraryStack.spacing = 2;
@@ -4563,6 +5194,20 @@ static const CGFloat kContentFadeHeight = 22;
     self.authTokenField = objc_getAssociatedObject(authTokenRow, "gd_textfield");
     self.authTokenField.delegate = self;
     [self.stack addArrangedSubview:authTokenRow];
+    [self.stack setCustomSpacing:4 afterView:authTokenRow];
+
+    // Small confirmation/error subtext (Section 4) - replaces the old
+    // "Credentials Verified" popup on a successful manual Verify, and is
+    // the only surface for the boot-time auto-check's "no longer valid"
+    // message (that check never shows an alert - see
+    // -gd_authRunBootVerification). Hidden by default; toggled via
+    // -gd_setAuthStatusLabelText:color:.
+    self.authStatusLabel = [[UILabel alloc] init];
+    self.authStatusLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    self.authStatusLabel.font = [UIFont systemFontOfSize:10 weight:UIFontWeightRegular];
+    self.authStatusLabel.numberOfLines = 0;
+    self.authStatusLabel.hidden = YES;
+    [self.stack addArrangedSubview:self.authStatusLabel];
 
     // Both fields now exist - pre-fill from whatever's already stored
     // (JSON file for the repo link, Keychain for the token; see
@@ -4570,6 +5215,14 @@ static const CGFloat kContentFadeHeight = 22;
     // config even when nothing was ever saved, so this is safe to call
     // unconditionally on every panel build.
     [self gd_loadAuthFields];
+
+    // Auto-run the same credential check the Verify button does, once,
+    // right after the fields are populated - see
+    // -gd_authRunBootVerification's own header for the full spec (locks
+    // the fields + flips to Remove on success, red persistent subtext +
+    // dispatch/download block on failure, does nothing if nothing's been
+    // saved yet).
+    [self gd_authRunBootVerification];
 
     // --- Config ---
     // Native Liquid Glass, sized to match every other row/button on the
@@ -4655,6 +5308,26 @@ static const CGFloat kContentFadeHeight = 22;
         [weakSelf hardAssetsResetTapped];
     });
     [self.stack addArrangedSubview:hardResetRow];
+
+    // 8: "Delete Stored Bundles in Proxy" - full-width, below Hard
+    // Assets Reset. Purely a remote/GitHub-side cleanup (every release
+    // entry in the configured repo, per spec 8 - see
+    // +[BundleDoctorService deleteAllReleasesForConfig:completion:])
+    // - doesn't touch anything local (the Mod Asset Library, Stored
+    // Bundles, or the game's own files), so it doesn't share a row
+    // with Hard Assets Reset and doesn't call -gd_rebuildModsLibrary
+    // itself. Ordinary 1.5s hold (gd_attach_pill_hold_to_confirm, no
+    // duration override) per spec, same as most destructive controls
+    // in this panel - it's real but reversible-in-spirit (the repo is
+    // just a scratch relay for the doctor pipeline, not a store of
+    // anything unique to this device the way Hard Assets Reset's local
+    // wipe is).
+    GDRow *deleteProxyReleasesRow = gd_make_single_button_row(@"Delete Stored Bundles in Proxy", [UIColor colorWithRed:0.85 green:0.08 blue:0.08 alpha:1.0]);
+    UIButton *deleteProxyReleasesButton = objc_getAssociatedObject(deleteProxyReleasesRow, "gd_button");
+    gd_attach_pill_hold_to_confirm(deleteProxyReleasesButton, self, ^{
+        [weakSelf deleteStoredBundlesInProxyTapped:deleteProxyReleasesButton];
+    });
+    [self.stack addArrangedSubview:deleteProxyReleasesRow];
 
     [self layoutPanelForWindow:window];
 
@@ -4810,6 +5483,65 @@ static const CGFloat kContentFadeHeight = 22;
     [self gd_presentModsAlertWithTitle:@"Hard Assets Reset" message:message];
 }
 
+// 8: "delete stored bundles in proxy" - see
+// +[BundleDoctorService deleteAllReleasesForConfig:completion:]'s own
+// header for exactly what this clears (every release + tag ref in the
+// configured repo) and why a failed individual delete doesn't stop the
+// rest. Purely remote - unlike -hardAssetsResetTapped this never
+// touches local files, so there's no -gd_rebuildModsLibrary call here.
+// `button` (the row's own button, passed by the onConfirm block in
+// -buildPanel: rather than stashed as a new property - same "capture
+// the local var" shape -restoreOriginalsTapped's own wiring already
+// uses, just with the button itself instead of nothing) is disabled
+// and its title swapped to "Deleting\u2026" for the duration of the
+// network round-trip (same disable-during-flight shape as
+// -gd_authVerifyTapped:'s "Verifying\u2026") - the 1.5s hold itself is
+// already spent by the time this runs, so this guards against a
+// second hold firing mid-request, not against the hold gesture itself.
+- (void)deleteStoredBundlesInProxyTapped:(UIButton *)button {
+    BundleDoctorConfig *config = [BundleDoctorSettings loadConfig];
+    if (config.repoOwner.length == 0 || config.repoName.length == 0 || config.authToken.length == 0) {
+        UINotificationFeedbackGenerator *haptic = [UINotificationFeedbackGenerator new];
+        [haptic notificationOccurred:UINotificationFeedbackTypeError];
+        [self gd_presentModsAlertWithTitle:@"Auth Not Configured"
+                                    message:@"Set a GitHub Repository Link and Personal Access Token under Mods \u2192 Auth first."];
+        return;
+    }
+
+    NSString *originalTitle = [button titleForState:UIControlStateNormal];
+    button.enabled = NO;
+    [button setTitle:@"Deleting\u2026" forState:UIControlStateNormal];
+
+    __weak typeof(self) weakSelf = self;
+    [BundleDoctorService deleteAllReleasesForConfig:config completion:^(NSInteger deletedCount, NSError *error) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+
+        button.enabled = YES;
+        [button setTitle:originalTitle forState:UIControlStateNormal];
+
+        UINotificationFeedbackGenerator *haptic = [UINotificationFeedbackGenerator new];
+        if (error) {
+            [haptic notificationOccurred:UINotificationFeedbackTypeError];
+            [strongSelf gd_presentModsAlertWithTitle:@"Delete Failed"
+                                              message:error.localizedDescription ?: @"Couldn't reach the configured repository."];
+            return;
+        }
+
+        if (deletedCount == 0) {
+            [haptic notificationOccurred:UINotificationFeedbackTypeWarning];
+            [strongSelf gd_presentModsAlertWithTitle:@"Nothing to Delete"
+                                              message:@"No releases were found in the configured repository."];
+            return;
+        }
+
+        [haptic notificationOccurred:UINotificationFeedbackTypeSuccess];
+        [strongSelf gd_presentModsAlertWithTitle:@"Proxy Cleared"
+                                          message:[NSString stringWithFormat:@"Deleted %ld release%@ from the configured repository.",
+                                                    (long)deletedCount, deletedCount == 1 ? @"" : @"s"]];
+    }];
+}
+
 #pragma mark Mods (Load Mods - single entry point, routes by file kind)
 //
 // UI-side glue only. Two swap-in pipelines live behind this one
@@ -4923,34 +5655,35 @@ static const CGFloat kContentFadeHeight = 22;
     }
 }
 
-// Single entry point for everything Load Mods' picker returned.
-// Imports every submitted file into the Mod Asset Library folder named
-// moments earlier (tracked regardless of routing outcome - per spec,
-// anything submitted lands in that folder), then partitions the files
-// by kind: .bank files are swapped synchronously as one batch (see
-// -gd_processLoadModsBankURLs:), "__data" files get one summary line
-// noting they're sitting in the library ready to dispatch (dispatching
-// is now a manual per-entry action - see "#pragma mark Mods (doctor
-// pipeline)" below, there's no queue to feed here anymore), and
-// anything else is reported as unrecognized. All three sets land in
-// one combined end-of-run alert - see -gd_presentLoadModsFinalSummary.
+// Single entry point for every picked-file result that needs to land
+// in the Mod Asset Library and have any .bank among them swapped -
+// shared by both Load Mods (new folder) and "Add mod" on an existing
+// folder as of the 3.5 fix (see -gd_handlePickedLibraryImportURLs:
+// intoFolder: below, which now just forwards here). Classifies every
+// submitted file FIRST (see -gd_isRecognizedBundleURL:
+// below), then only hands the recognized ones to
+// +[ModAssetLibrary importFileURLs:intoFolder:error:] - an unrecognized
+// file never touches the library at all, and gets its own "not a
+// recognized bank or bundle" line in the end-of-run summary instead.
+// Of the recognized set: .bank files are swapped synchronously as one
+// batch (see -gd_processLoadModsBankURLs:), "__data" files get one
+// summary line noting they're sitting in the library ready to dispatch
+// (dispatching is now a manual per-entry action - see "#pragma mark
+// Mods (doctor pipeline)" below, there's no queue to feed here
+// anymore). All three sets land in one combined end-of-run alert - see
+// -gd_presentLoadModsFinalSummary.
 - (void)gd_handleLoadModsPickedURLs:(NSArray<NSURL *> *)urls intoFolder:(NSString *)folderName {
     if (urls.count == 0) return;
 
-    NSError *importError = nil;
-    BOOL imported = [ModAssetLibrary importFileURLs:urls intoFolder:folderName error:&importError];
-    if (!imported) {
-        ZLog(@"[Mods] couldn't add picked files to Mod Asset Library folder \"%@\": %@", folderName, importError);
-    }
-    [self gd_rebuildModsLibrary];
-
+    NSMutableArray<NSURL *> *validURLs = [NSMutableArray array];
     NSMutableArray<NSURL *> *bankURLs = [NSMutableArray array];
     NSMutableArray<NSString *> *summaryLines = [NSMutableArray array];
 
     for (NSURL *url in urls) {
         if ([url.pathExtension caseInsensitiveCompare:@"bank"] == NSOrderedSame) {
             [bankURLs addObject:url];
-        } else if ([UnityBundleCAB isUnityFSBundleAtPath:url.path]) {
+            [validURLs addObject:url];
+        } else if ([self gd_isRecognizedBundleURL:url]) {
             // Identified by the file's own UnityFS header bytes, not its
             // name - any file can be handed to this picker regardless of
             // what it's called, and this project no longer requires an
@@ -4958,15 +5691,49 @@ static const CGFloat kContentFadeHeight = 22;
             // recognized as one (see ModAssetLibrary.m's importer, which
             // uses the same check and gives each bundle its own
             // CAB-named subfolder).
+            [validURLs addObject:url];
             [summaryLines addObject:[NSString stringWithFormat:@"%@: added to Mods Library - tap Dispatch when ready to send it for processing", url.lastPathComponent]];
         } else {
+            // Not imported at all - see -gd_isRecognizedBundleURL: for
+            // why this has to be checked with its own security-scoped
+            // access rather than reusing whatever +importFileURLs:...
+            // does internally (that access is long gone by the time a
+            // second pass over the same URL would try to read it again).
             [summaryLines addObject:[NSString stringWithFormat:@"%@: not a recognized bank or bundle", url.lastPathComponent]];
         }
+    }
+
+    if (validURLs.count > 0) {
+        NSError *importError = nil;
+        BOOL imported = [ModAssetLibrary importFileURLs:validURLs intoFolder:folderName error:&importError];
+        if (!imported) {
+            ZLog(@"[Mods] couldn't add picked files to Mod Asset Library folder \"%@\": %@", folderName, importError);
+        }
+        [self gd_rebuildModsLibrary];
     }
 
     self.loadModsSummaryLines = summaryLines;
 
     [self gd_processLoadModsBankURLs:bankURLs];
+}
+
+// Content-based bundle check for a picker URL, safe to call before that
+// URL has been (or after it's already been) handed to
+// +[ModAssetLibrary importFileURLs:intoFolder:error:]. A picker URL is a
+// security-scoped resource - access has to be explicitly started before
+// any file API can read its bytes, and importFileURLs already opens and
+// closes its own start/stop pair per URL internally while copying it in.
+// Calling +[UnityBundleCAB isUnityFSBundleAtPath:] on the same URL again
+// afterwards, without opening a fresh access window here, reads against
+// a resource whose access has already been revoked - the read silently
+// comes back empty and the bundle is misreported as unrecognized. This
+// wraps the sniff in its own start/stop pair so it works standalone,
+// independent of import order.
+- (BOOL)gd_isRecognizedBundleURL:(NSURL *)url {
+    BOOL accessing = [url startAccessingSecurityScopedResource];
+    BOOL isBundle = [UnityBundleCAB isUnityFSBundleAtPath:url.path];
+    if (accessing) [url stopAccessingSecurityScopedResource];
+    return isBundle;
 }
 
 // Swaps every picked .bank on a background queue as one batch, appends
@@ -5258,6 +6025,17 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
 // thing once it's reset the entry, instead of just dropping back to the
 // dispatch capsule and waiting for a second tap.
 - (void)gd_doctorBeginDispatchForEntry:(ModAssetLibraryEntry *)entry folderName:(NSString *)folderName {
+    // Section 4 spec: a boot-time check that found the saved credentials
+    // no longer valid (self.authCredentialsStale) blocks dispatch with
+    // just an error haptic - no alert - until Remove clears them. Checked
+    // ahead of the "Not Configured" alert below since a stale token is by
+    // definition still present/configured, just no longer good.
+    if (self.authCredentialsStale) {
+        UINotificationFeedbackGenerator *haptic = [UINotificationFeedbackGenerator new];
+        [haptic notificationOccurred:UINotificationFeedbackTypeError];
+        return;
+    }
+
     BundleDoctorConfig *config = [BundleDoctorSettings loadConfig];
     if (config.repoOwner.length == 0 || config.repoName.length == 0 || config.authToken.length == 0) {
         [self gd_presentModsAlertWithTitle:@"Auth Not Configured"
@@ -5368,7 +6146,10 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
 // flips to Failed with the error surfaced via doctorLastError (full
 // text goes in the entry's info-panel Error line - see
 // gd_make_mods_entry_info_panel - the compact row itself just shows a
-// "retry" capsule).
+// "retry" capsule). Section 5: when handle.alreadyComplete is YES (a
+// cache hit against an already-doctored release for this exact bundle),
+// there's no run to process at all - goes straight to ReadyToDownload
+// instead, see below.
 - (void)gd_doctorDispatchCompletedForEntryPath:(NSString *)entryPath
                                         inFolder:(NSString *)folderName
                                           handle:(BundleDoctorHandle *)handle
@@ -5377,6 +6158,34 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
 
     if (!handle) {
         [self gd_doctorFailEntryAtPath:entryPath inFolder:folderName error:error];
+        return;
+    }
+
+    // Section 5 cache hit: +dispatchBundleAtURL:... found an already-
+    // doctored release under this bundle's own CAB+sha256 tag and skipped
+    // the upload/branch/dispatch steps entirely - see BundleDoctorHandle's
+    // alreadyComplete. No run was ever created, so there's nothing to poll:
+    // land straight on ReadyToDownload, exactly like a normal submission's
+    // phase 3 reporting BundleDoctorRunStatusSucceeded further down in
+    // -gd_pollDoctorRunForEntryPath:inFolder:.
+    if (handle.alreadyComplete) {
+        NSError *stateError = nil;
+        ModAssetLibraryEntry *updated = [ModAssetLibrary updateDoctorStateForEntry:gd_mods_entry_placeholder_for_path(entryPath)
+                                                                            inFolder:folderName
+                                                                          applyBlock:^(ModAssetLibraryEntry *entryToMutate) {
+            entryToMutate.doctorStatus = ModAssetLibraryDoctorStatusReadyToDownload;
+            entryToMutate.doctorUploadProgress = 1.0;
+            entryToMutate.doctorProcessProgress = 1.0;
+            entryToMutate.doctorScratchBranch = handle.scratchBranch;
+            entryToMutate.doctorRunID = nil;
+            entryToMutate.doctorRunURL = nil;
+        }
+                                                                               error:&stateError];
+        if (!updated) {
+            ZLog(@"[Mods Library] cache-hit dispatch finished for %@ but its manifest entry is gone (deleted mid-upload?).", entryPath.lastPathComponent);
+            return;
+        }
+        [self gd_rebuildModsLibrary];
         return;
     }
 
@@ -5750,6 +6559,17 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
 - (void)gd_rebuildModsLibrary {
     if (!self.modsLibraryStack) return;
 
+    // 3.4: a rebuild can be triggered by something other than the
+    // dropdown's own row taps (e.g. a background doctor-poll tick's
+    // progress update elsewhere in this file) while the options
+    // dropdown is still open. Its button lives inside the row about to
+    // be torn down below, so close it first, unanimated - once that row
+    // view is gone there'd be nothing left to shrink the overlay back
+    // into.
+    if (self.modsOptionsDropdownOpen) {
+        [self gd_closeModsOptionsDropdownAnimated:NO];
+    }
+
     // One-shot per launch, not per rebuild - see
     // -gd_recoverStaleDoctorStateForThisLaunch's own header comment for
     // why re-running it on every rebuild would be wrong (it would
@@ -5775,33 +6595,45 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
         [view removeFromSuperview];
     }
 
-    NSArray<NSString *> *folders = [ModAssetLibrary folderNames];
+    // 7: Stored Bundles is a real ModAssetLibrary folder under the hood
+    // (unlike Processed Bundles, which is purely a UI concept) - so it
+    // comes back from +folderNames like any other folder and has to be
+    // pulled out here, or it'd render twice: once mid-alphabet in the
+    // loop below, once again in its own pinned section further down.
+    // Same exclusion the folder-picker action sheet already applies
+    // (see -gd_finishRestoringStoredBundleEntry:stockURL:intoFolder:'s
+    // `pickable` list) - a person should never see it as a normal
+    // library folder in either place.
+    NSMutableArray<NSString *> *folders = [[ModAssetLibrary folderNames] mutableCopy];
+    [folders removeObject:kGDStoredBundlesFolderName];
     if (folders.count == 0) {
         UILabel *empty = [[UILabel alloc] init];
         empty.text = @"No mod folders yet.";
         empty.font = [UIFont systemFontOfSize:11 weight:UIFontWeightRegular];
         empty.textColor = [UIColor colorWithWhite:1 alpha:0.45];
         [self.modsLibraryStack addArrangedSubview:empty];
-        return;
+        // 6: unlike before this method had an immutable folder to add,
+        // an empty real library used to just stop here - now falls
+        // through instead, since "Processed Bundles" still belongs at
+        // the bottom of the accordion even with zero real folders above
+        // it.
     }
-
-    __weak typeof(self) weakSelf = self;
 
     for (NSString *folderName in folders) {
         BOOL expanded = [self.modsLibraryExpandedFolders containsObject:folderName];
-        UIView *folderRow = gd_make_mods_folder_row(folderName, expanded, self,
+        // 3.4.5: the old Add("+")/Rename(pencil)/Delete(X) icon trio
+        // (and its hold-to-confirm wiring for Delete, which used to
+        // live right here) is gone - replaced by the same single "..."
+        // options pill + dropdown treatment the file rows got in 3.4.
+        // See gd_make_mods_folder_row's own header for what's inside
+        // that dropdown now, and -gd_modsOptionsDropdownRowTapped: for
+        // where Add mod/Cache folder/Add remark/Delete actually get
+        // dispatched once picked.
+        NSString *folderRemark = [ModAssetLibrary remarkForFolder:folderName];
+        UIView *folderRow = gd_make_mods_folder_row(folderName, folderRemark, expanded, self,
             @selector(gd_modsLibraryFolderRowTapped:),
-            @selector(gd_modsLibraryFolderAddTapped:),
-            @selector(gd_modsLibraryFolderRenameTapped:));
+            @selector(gd_modsLibraryFolderOptionsTapped:));
         [self.modsLibraryStack addArrangedSubview:folderRow];
-
-        // Delete lives on the always-visible header row itself, so this
-        // is wired for every folder row, not just expanded ones.
-        UIButton *folderDeleteButton = objc_getAssociatedObject(folderRow, "gd_button_delete");
-        NSString *folderNameForDelete = [folderName copy]; // own copy for the block below, independent of the loop variable
-        gd_attach_hold_to_confirm(folderDeleteButton, self, self.sliderGlassContent, ^{
-            [weakSelf gd_deleteModFolderConfirmed:folderNameForDelete];
-        });
 
         if (!expanded) continue;
 
@@ -5823,35 +6655,166 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
 
         for (ModAssetLibraryEntry *entry in sortedEntries) {
             BOOL entryExpanded = [self.modsLibraryExpandedInfoEntries containsObject:entry.path];
-            // Delete is gated to only exist while the dropdown is open
-            // (entryExpanded), so it isn't reachable until you've
-            // actually looked at the file's info first. The doctor-
-            // pipeline dispatch/upload/process/download slot (bundle-
-            // kind rows only) is NOT gated the same way - it renders
-            // regardless of entryExpanded, since it's non-destructive
-            // and is meant to be the row's normal at-rest affordance -
-            // see gd_make_mods_entry_row's own header comment.
+            // The "..." options pill is gated to only exist while the
+            // dropdown is open (entryExpanded), same as the old delete X
+            // it replaced - it isn't reachable until you've actually
+            // looked at the file's info first. The doctor-pipeline
+            // dispatch/upload/process/download slot (bundle-kind rows
+            // only) is NOT gated the same way - it renders regardless of
+            // entryExpanded, since it's non-destructive and is meant to
+            // be the row's normal at-rest affordance - see
+            // gd_make_mods_entry_row's own header comment.
+            //
+            // 3.4: unlike the old delete X, the options pill is wired
+            // directly inside gd_make_mods_entry_row itself (same
+            // addTarget:action: pattern the dispatch/download/retry
+            // capsules already use) - there's no separate
+            // gd_attach_hold_to_confirm pass needed here anymore, since
+            // Delete's own confirmation now happens as a destructive
+            // alert once it's picked from the open dropdown (see
+            // -gd_confirmDeleteModEntry:inFolder:), not a press-and-hold
+            // capsule on the row itself.
             UIView *entryRow = gd_make_mods_entry_row(entry, self,
                 @selector(gd_modsLibraryEntryInfoTapped:),
                 @selector(gd_modsLibraryEntryDispatchTapped:),
                 @selector(gd_modsLibraryEntryDownloadTapped:),
                 @selector(gd_modsLibraryEntryRetryTapped:),
+                @selector(gd_modsLibraryEntryOptionsTapped:),
                 entryExpanded,
-                [self.doctorDownloadInFlightPaths containsObject:entry.path]);
+                [self.doctorDownloadInFlightPaths containsObject:entry.path],
+                NO);
             [self.modsLibraryStack addArrangedSubview:entryRow];
 
             if (entryExpanded) {
-                UIButton *entryDeleteButton = objc_getAssociatedObject(entryRow, "gd_button_delete");
-                ModAssetLibraryEntry *entryForDelete = entry;
-                NSString *folderNameForEntry = [folderName copy];
-                gd_attach_hold_to_confirm(entryDeleteButton, self, self.sliderGlassContent, ^{
-                    [weakSelf gd_deleteModEntryConfirmed:entryForDelete inFolder:folderNameForEntry];
-                });
-
                 UIView *infoPanel = gd_make_mods_entry_info_panel(entry,
-                    [self.doctorDownloadInFlightPaths containsObject:entry.path]);
+                    [self.doctorDownloadInFlightPaths containsObject:entry.path], NO);
                 [self.modsLibraryStack addArrangedSubview:infoPanel];
             }
+        }
+    }
+
+    // 7: "Stored Bundles" - immutable pinned folder, between the real
+    // A-Z folders above and Processed Bundles below. IS a real
+    // ModAssetLibrary folder (its rows come from local manifest state
+    // via +entriesInFolder:error:, same as any real folder) - that's
+    // why this reuses -gd_modsLibraryFolderRowTapped: as-is below with
+    // no fetch branch, unlike Processed Bundles' GitHub refetch.
+    // optionsAction is NULL, same reasoning as Processed Bundles -
+    // nothing to Add mod/Rename/Cache/Delete at the folder level here,
+    // only its files' own Restore/Delete
+    // (gd_mods_stored_bundle_file_options(), wired inside
+    // gd_make_mods_entry_row/-gd_openModsOptionsDropdownForButton:entry:
+    // folderName: via the isStoredBundlesRow check there).
+    BOOL storedExpanded = [self.modsLibraryExpandedFolders containsObject:kGDStoredBundlesFolderName];
+    UIView *storedFolderRow = gd_make_mods_folder_row(kGDStoredBundlesFolderName,
+        kGDStoredBundlesFolderSubtext, storedExpanded, self,
+        @selector(gd_modsLibraryFolderRowTapped:), NULL);
+    [self.modsLibraryStack addArrangedSubview:storedFolderRow];
+
+    if (storedExpanded) {
+        NSError *storedError = nil;
+        NSArray<ModAssetLibraryEntry *> *storedEntries =
+            [ModAssetLibrary entriesInFolder:kGDStoredBundlesFolderName error:&storedError];
+
+        if (!storedEntries || storedEntries.count == 0) {
+            UILabel *emptyStored = [[UILabel alloc] init];
+            emptyStored.text = @"  Empty.";
+            emptyStored.font = [UIFont systemFontOfSize:11 weight:UIFontWeightRegular];
+            emptyStored.textColor = [UIColor colorWithWhite:1 alpha:0.4];
+            [self.modsLibraryStack addArrangedSubview:emptyStored];
+        } else {
+            // Same A-Z display sort as a real folder's entries (not
+            // Processed Bundles' newest-first release order) - per
+            // spec 7, "the Bundle's name and description will remain
+            // mostly unchanged".
+            NSArray<ModAssetLibraryEntry *> *sortedStoredEntries =
+                [storedEntries sortedArrayUsingComparator:^NSComparisonResult(ModAssetLibraryEntry *a, ModAssetLibraryEntry *b) {
+                    return [a.fileName localizedStandardCompare:b.fileName];
+                }];
+
+            for (ModAssetLibraryEntry *entry in sortedStoredEntries) {
+                BOOL entryExpanded = [self.modsLibraryExpandedInfoEntries containsObject:entry.path];
+                // isStoredBundlesFolder:YES - suppresses the doctor
+                // dispatch/download/retry capsule, hides Filepath, and
+                // forces the info panel's Status to "Stored" (see both
+                // helpers' own header comments). downloadInFlight is
+                // irrelevant here since isDoctorEligible is already
+                // forced off for a Stored Bundles row, but NO is passed
+                // for clarity rather than consulting
+                // doctorDownloadInFlightPaths for a row that can never
+                // be mid-download.
+                UIView *entryRow = gd_make_mods_entry_row(entry, self,
+                    @selector(gd_modsLibraryEntryInfoTapped:),
+                    @selector(gd_modsLibraryEntryDispatchTapped:),
+                    @selector(gd_modsLibraryEntryDownloadTapped:),
+                    @selector(gd_modsLibraryEntryRetryTapped:),
+                    @selector(gd_modsLibraryEntryOptionsTapped:),
+                    entryExpanded,
+                    NO,
+                    YES);
+                [self.modsLibraryStack addArrangedSubview:entryRow];
+
+                if (entryExpanded) {
+                    UIView *infoPanel = gd_make_mods_entry_info_panel(entry, NO, YES);
+                    [self.modsLibraryStack addArrangedSubview:infoPanel];
+                }
+            }
+        }
+    }
+
+    // 6: "Processed Bundles" - immutable, always the very last row in
+    // the accordion regardless of A-Z (it isn't even in `folders` -
+    // ModAssetLibrary doesn't know about it at all, see this folder's
+    // own kGDProcessedBundlesFolderName comment). optionsAction is NULL
+    // (no "..." pill - nothing here to Add mod/Rename/Cache/Delete).
+    BOOL processedExpanded = [self.modsLibraryExpandedFolders containsObject:kGDProcessedBundlesFolderName];
+    UIView *processedFolderRow = gd_make_mods_folder_row(kGDProcessedBundlesFolderName,
+        kGDProcessedBundlesFolderSubtext, processedExpanded, self,
+        @selector(gd_modsLibraryFolderRowTapped:), NULL);
+    [self.modsLibraryStack addArrangedSubview:processedFolderRow];
+
+    if (!processedExpanded) return;
+
+    if (self.processedBundlesLoading) {
+        UILabel *loading = [[UILabel alloc] init];
+        loading.text = @"  Loading\u2026";
+        loading.font = [UIFont systemFontOfSize:11 weight:UIFontWeightRegular];
+        loading.textColor = [UIColor colorWithWhite:1 alpha:0.4];
+        [self.modsLibraryStack addArrangedSubview:loading];
+        return;
+    }
+
+    if (self.processedBundlesErrorMessage.length > 0) {
+        UILabel *errorLabel = [[UILabel alloc] init];
+        errorLabel.text = [NSString stringWithFormat:@"  %@", self.processedBundlesErrorMessage];
+        errorLabel.numberOfLines = 0;
+        errorLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightRegular];
+        errorLabel.textColor = [UIColor colorWithRed:1.0 green:0.5 blue:0.5 alpha:0.85];
+        [self.modsLibraryStack addArrangedSubview:errorLabel];
+        return;
+    }
+
+    if (self.processedBundlesReleases.count == 0) {
+        UILabel *emptyFolder = [[UILabel alloc] init];
+        emptyFolder.text = @"  No processed bundles yet.";
+        emptyFolder.font = [UIFont systemFontOfSize:11 weight:UIFontWeightRegular];
+        emptyFolder.textColor = [UIColor colorWithWhite:1 alpha:0.4];
+        [self.modsLibraryStack addArrangedSubview:emptyFolder];
+        return;
+    }
+
+    // Already sorted newest-first by +[BundleDoctorService
+    // listProcessedReleasesForConfig:completion:] - this is just render
+    // order, not another manifest-style rewrite the way the real
+    // folders' A-Z sort above is purely a display concern too.
+    for (BundleDoctorProcessedRelease *release in self.processedBundlesReleases) {
+        BOOL releaseExpanded = [self.modsLibraryExpandedProcessedBundles containsObject:release.tagName];
+        UIView *releaseRow = gd_make_processed_bundle_row(release, self, @selector(gd_processedBundleRowTapped:));
+        [self.modsLibraryStack addArrangedSubview:releaseRow];
+
+        if (releaseExpanded) {
+            UIView *releaseInfoPanel = gd_make_processed_bundle_info_panel(release);
+            [self.modsLibraryStack addArrangedSubview:releaseInfoPanel];
         }
     }
 }
@@ -5862,50 +6825,100 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
 - (void)gd_modsLibraryFolderRowTapped:(UITapGestureRecognizer *)gesture {
     NSString *folderName = objc_getAssociatedObject(gesture.view, "gd_modsFolderName");
     if (!folderName) return;
-    if ([self.modsLibraryExpandedFolders containsObject:folderName]) {
+    BOOL wasExpanded = [self.modsLibraryExpandedFolders containsObject:folderName];
+    if (wasExpanded) {
         [self.modsLibraryExpandedFolders removeObject:folderName];
     } else {
         [self.modsLibraryExpandedFolders addObject:folderName];
     }
     [self gd_rebuildModsLibrary];
+
+    // 6: collapsed->expanded transition on the immutable folder is what
+    // (re)fetches its listing - there's no local manifest to just read
+    // back the way a real folder's -entriesInFolder:error: does, so
+    // this is the one place that has to reach out to GitHub. Refetches
+    // every time (not just the first time this launch) since the only
+    // thing that changes a release's presence/absence is something
+    // happening on GitHub's own side, which this app has no other way
+    // of learning about - collapsing and re-expanding is the person's
+    // own "refresh" gesture here, same spirit as pull-to-refresh
+    // elsewhere.
+    if (!wasExpanded && [folderName isEqualToString:kGDProcessedBundlesFolderName]) {
+        [self gd_fetchProcessedBundles];
+    }
 }
 
-// Wired to a folder row's "Add" pill - the folder already exists, so
-// this skips straight to the picker (see
-// -gd_presentModImportPickerForFolder:) rather than prompting for a
-// name again.
-- (void)gd_modsLibraryFolderAddTapped:(UIButton *)sender {
-    NSString *folderName = objc_getAssociatedObject(sender, "gd_modsFolderName");
-    if (!folderName) return;
-    [self gd_presentModImportPickerForFolder:folderName];
-}
+// 6: the actual GET - see -gd_modsLibraryFolderRowTapped: for the one
+// call site (folder row tap, collapsed->expanded only). Sets
+// processedBundlesLoading before the async call so the very next
+// -gd_rebuildModsLibrary (right above, from the tap that triggered
+// this) already renders "Loading…" instead of a stale/empty list.
+- (void)gd_fetchProcessedBundles {
+    self.processedBundlesLoading = YES;
+    self.processedBundlesErrorMessage = nil;
+    [self gd_rebuildModsLibrary];
 
-// Wired to a folder row's pencil button - prompts for a new name (same
-// compact prompt "New Folder" uses) and renames the folder's directory
-// in place via +[ModAssetLibrary renameFolderNamed:to:error:].
-- (void)gd_modsLibraryFolderRenameTapped:(UIButton *)sender {
-    NSString *folderName = objc_getAssociatedObject(sender, "gd_modsFolderName");
-    if (!folderName) return;
+    BundleDoctorConfig *config = [BundleDoctorSettings loadConfig];
+    if (config.repoOwner.length == 0 || config.repoName.length == 0 || config.authToken.length == 0) {
+        self.processedBundlesLoading = NO;
+        self.processedBundlesErrorMessage = @"Set a GitHub Repository Link and Personal Access Token under Mods \u2192 Auth first.";
+        [self gd_rebuildModsLibrary];
+        return;
+    }
+
     __weak typeof(self) weakSelf = self;
-    [self gd_promptForModFolderNameWithTitle:@"Rename Folder"
-                                  actionTitle:@"Rename"
-                                   completion:^(NSString *trimmedName) {
-        [weakSelf gd_renameModFolderNamed:folderName to:trimmedName];
+    [BundleDoctorService listProcessedReleasesForConfig:config
+        completion:^(NSArray<BundleDoctorProcessedRelease *> * _Nullable releases, NSError * _Nullable error) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        strongSelf.processedBundlesLoading = NO;
+        if (!releases) {
+            strongSelf.processedBundlesErrorMessage = error.localizedDescription ?: @"Couldn't load processed bundles.";
+            strongSelf.processedBundlesReleases = nil;
+        } else {
+            strongSelf.processedBundlesErrorMessage = nil;
+            strongSelf.processedBundlesReleases = releases;
+        }
+        // The folder could have been collapsed again (or torn down
+        // entirely) while this was in flight - -gd_rebuildModsLibrary
+        // itself already no-ops harmlessly if modsLibraryStack is gone,
+        // and simply won't render any of this if the folder's no longer
+        // in modsLibraryExpandedFolders, so no extra guard is needed
+        // here beyond the weak-self check above.
+        [strongSelf gd_rebuildModsLibrary];
     }];
 }
 
-- (void)gd_renameModFolderNamed:(NSString *)folderName to:(NSString *)newName {
-    NSError *error = nil;
-    if (![ModAssetLibrary renameFolderNamed:folderName to:newName error:&error]) {
-        [self gd_presentModsAlertWithTitle:@"Couldn't Rename Folder" message:error.localizedDescription ?: @"Unknown error."];
-        return;
-    }
-    if ([self.modsLibraryExpandedFolders containsObject:folderName]) {
-        [self.modsLibraryExpandedFolders removeObject:folderName];
-        [self.modsLibraryExpandedFolders addObject:newName];
+// Wired to a Processed Bundles row's whole-row tap gesture (see
+// gd_make_processed_bundle_row) - toggles that one release's info
+// dropdown (Size/Upload date/Checksum, see
+// gd_make_processed_bundle_info_panel) open or closed, keyed by the
+// release's own tagName the same way -gd_modsLibraryEntryInfoTapped:
+// keys off entry.path.
+- (void)gd_processedBundleRowTapped:(UITapGestureRecognizer *)gesture {
+    BundleDoctorProcessedRelease *release = objc_getAssociatedObject(gesture.view, "gd_processedRelease");
+    if (!release) return;
+    if ([self.modsLibraryExpandedProcessedBundles containsObject:release.tagName]) {
+        [self.modsLibraryExpandedProcessedBundles removeObject:release.tagName];
+    } else {
+        [self.modsLibraryExpandedProcessedBundles addObject:release.tagName];
     }
     [self gd_rebuildModsLibrary];
 }
+
+// 3.4.5: this used to be where the folder row's standalone "Add" pill
+// and pencil (Rename) buttons were wired
+// (-gd_modsLibraryFolderAddTapped:/-gd_modsLibraryFolderRenameTapped:/
+// -gd_renameModFolderNamed:to:) - all gone now that a folder row's
+// trailing controls collapse into the single "..." options dropdown
+// (see gd_make_mods_folder_row and gd_mods_folder_options()). Add mod
+// is still exactly the same -gd_presentModImportPickerForFolder: call,
+// and Rename is still exactly the same +[ModAssetLibrary
+// renameFolderNamed:to:error:] call via the same
+// -gd_promptForModFolderNameWithTitle:actionTitle:completion: prompt
+// "New Folder" also uses (see -gd_promptForModFolderRenameForFolder:/
+// -gd_renameModFolder:to:) - both just reached as dropdown rows instead
+// of standalone icons now (see -gd_modsOptionsDropdownRowTapped:).
 
 // Wired to an entry row's own tap gesture (see gd_make_mods_entry_row) -
 // toggles that one entry's dropdown (path/size/added, see
@@ -5922,6 +6935,813 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
         [self.modsLibraryExpandedInfoEntries addObject:entry.path];
     }
     [self gd_rebuildModsLibrary];
+}
+
+#pragma mark Mods Library file options dropdown (3.4)
+//
+// Instance-method half of the "..." options control built in
+// gd_make_mods_entry_row/gd_make_mods_options_row_button (see that
+// pragma mark's header comment for the overall shape). Mirrors
+// -gd_openReencodeDropdown/-gd_closeReencodeDropdownAnimated:/
+// -gd_reencodeDropdownScrimTapped: almost line for line - same
+// grow-out-of-the-button glass morph, same scrim-closes-on-outside-tap
+// behavior - just anchored to a per-row button instead of the single
+// Config-section one, and with a fixed 3-row action list instead of a
+// format list.
+
+// Wired to every entry row's "..." button (see gd_make_mods_entry_row's
+// optionsAction param). sender carries its entry via the same
+// "gd_modsEntry" associated-object convention every other per-row
+// control in this file uses. A second tap on the SAME button while its
+// own dropdown is open closes it (mirrors
+// -gd_reencodeFormatButtonTapped:'s guard); tapping a DIFFERENT row's
+// "..." while one is already open just closes the old one first - two
+// options dropdowns open at once isn't a state this file needs to
+// support, and gd_rebuildModsLibrary's per-toggle rebuild would orphan
+// the old one's overlay/scrim otherwise.
+- (void)gd_modsLibraryEntryOptionsTapped:(UIButton *)sender {
+    ModAssetLibraryEntry *entry = objc_getAssociatedObject(sender, "gd_modsEntry");
+    if (!entry) return;
+
+    if (self.modsOptionsDropdownOpen && self.modsOptionsDropdownButton == sender) {
+        [self gd_closeModsOptionsDropdownAnimated:YES];
+        return;
+    }
+    if (self.modsOptionsDropdownOpen) {
+        [self gd_closeModsOptionsDropdownAnimated:NO];
+    }
+
+    [self gd_openModsOptionsDropdownForButton:sender entry:entry folderName:gd_mods_folder_name_for_entry(entry)];
+}
+
+// 3.4.5 folder-row counterpart of -gd_modsLibraryEntryOptionsTapped:
+// just above - wired to a folder row's own "..." button (see
+// gd_make_mods_folder_row's optionsAction param), keyed off the
+// "gd_modsFolderName" associated object every folder-row control uses
+// instead of an entry. Passes entry:nil through to the shared open
+// method below - that's what tells it (and
+// -gd_modsOptionsDropdownRowTapped:) to use gd_mods_folder_options()
+// instead of gd_mods_file_options(). Same same-button-closes /
+// different-button-swaps guard as the file variant.
+- (void)gd_modsLibraryFolderOptionsTapped:(UIButton *)sender {
+    NSString *folderName = objc_getAssociatedObject(sender, "gd_modsFolderName");
+    if (!folderName) return;
+
+    if (self.modsOptionsDropdownOpen && self.modsOptionsDropdownButton == sender) {
+        [self gd_closeModsOptionsDropdownAnimated:YES];
+        return;
+    }
+    if (self.modsOptionsDropdownOpen) {
+        [self gd_closeModsOptionsDropdownAnimated:NO];
+    }
+
+    [self gd_openModsOptionsDropdownForButton:sender entry:nil folderName:folderName];
+}
+
+// Builds modsOptionsDropdownOverlay: one row per option (gd_mods_file_
+// options() when entry is non-nil - a FILE row's dropdown - or
+// gd_mods_folder_options() when entry is nil - a FOLDER row's, per
+// 3.4.5), same collapsed-frame-grows-into-expanded-frame choreography
+// as -gd_openReencodeDropdown (see that method's own header comment for
+// why the overlay lives in self.contentOverlay rather than the stack,
+// why the real button is hidden rather than removed, and why the glass
+// vs. flat-fill fork exists). kGDModsOptionsDropdownWidth is wider than
+// the button itself, so unlike the reencode dropdown (which keeps the
+// button's own width) this expands both right AND down from the
+// button's top-trailing corner - anchoring off the button's trailing
+// edge specifically, per the constant's own header comment, since a
+// button sitting at a row's trailing-most position would otherwise grow
+// the wider overlay off the right edge of the screen. folderName is
+// always required (both modes need it - a file's dropdown needs it to
+// act on that file's own manifest, a folder's dropdown needs it to act
+// on itself) - callers pass it explicitly rather than this method
+// re-deriving it, since a folder-mode call has no entry to derive it
+// from in the first place.
+- (void)gd_openModsOptionsDropdownForButton:(UIButton *)button entry:(nullable ModAssetLibraryEntry *)entry folderName:(NSString *)folderName {
+    if (!button || !self.contentOverlay || self.modsOptionsDropdownOpen || !folderName) return;
+
+    // 7: a file-mode dropdown (entry non-nil) opened for a row sitting
+    // inside "Stored Bundles" gets the Restore/Delete-only list instead
+    // of the ordinary Cache bundle/Add remark/Delete one - see
+    // gd_mods_stored_bundle_file_options()'s own header.
+    BOOL isStoredBundlesRow = entry && [folderName isEqualToString:kGDStoredBundlesFolderName];
+    NSArray<NSDictionary<NSString *, id> *> *options = entry
+        ? (isStoredBundlesRow ? gd_mods_stored_bundle_file_options() : gd_mods_file_options())
+        : gd_mods_folder_options();
+    if (options.count == 0) return;
+
+    CGRect buttonFrame = [button convertRect:button.bounds toView:self.contentOverlay];
+    // Trailing-anchored: same top-trailing corner as the collapsed
+    // button, but kGDModsOptionsDropdownWidth wide - see this method's
+    // own header comment above.
+    CGRect collapsedFrame = CGRectMake(CGRectGetMaxX(buttonFrame) - kGDModsOptionsDropdownWidth,
+                                        CGRectGetMinY(buttonFrame),
+                                        kGDModsOptionsDropdownWidth,
+                                        CGRectGetHeight(buttonFrame));
+
+    UIControl *scrim = [[UIControl alloc] initWithFrame:self.contentOverlay.bounds];
+    scrim.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    scrim.backgroundColor = UIColor.clearColor;
+    [scrim addTarget:self action:@selector(gd_modsOptionsDropdownScrimTapped:) forControlEvents:UIControlEventTouchUpInside];
+    [self.contentOverlay addSubview:scrim];
+    self.modsOptionsDropdownScrim = scrim;
+
+    UIView *overlay;
+    UIVisualEffectView *glassOverlay = nil;
+    if (gd_has_liquid_glass()) {
+        glassOverlay = [[UIVisualEffectView alloc] initWithEffect:gd_make_glass_effect(YES)];
+        glassOverlay.frame = collapsedFrame;
+        glassOverlay.clipsToBounds = YES;
+        gd_configure_glass_corners(glassOverlay, kGDAuthFieldCornerRadius, NO);
+        glassOverlay.layer.borderWidth = 1;
+        glassOverlay.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.18].CGColor;
+        overlay = glassOverlay;
+    } else {
+        overlay = [[UIView alloc] initWithFrame:collapsedFrame];
+        overlay.clipsToBounds = YES;
+        overlay.layer.cornerRadius = kGDAuthFieldCornerRadius;
+        overlay.layer.cornerCurve = kCACornerCurveContinuous;
+        overlay.layer.borderWidth = 1;
+        overlay.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.18].CGColor;
+        overlay.backgroundColor = [UIColor colorWithWhite:0.11 alpha:0.98];
+    }
+    [self.contentOverlay addSubview:overlay];
+    self.modsOptionsDropdownOverlay = overlay;
+
+    UIView *rowHost = glassOverlay ? glassOverlay.contentView : overlay;
+
+    for (NSInteger i = 0; i < (NSInteger)options.count; i++) {
+        UIButton *rowButton = gd_make_mods_options_row_button(options[i], i, self,
+                                                                @selector(gd_modsOptionsDropdownRowTapped:));
+        rowButton.frame = CGRectMake(0, i * kGDModsOptionsRowHeight,
+                                      kGDModsOptionsDropdownWidth, kGDModsOptionsRowHeight);
+        rowButton.alpha = 0;
+        [rowHost addSubview:rowButton];
+
+        if (i > 0) {
+            CGFloat hairline = 1.0 / MAX(UIScreen.mainScreen.scale, (CGFloat)1.0);
+            UIView *divider = [[UIView alloc] initWithFrame:CGRectMake(0, i * kGDModsOptionsRowHeight - hairline,
+                                                                        kGDModsOptionsDropdownWidth, hairline)];
+            divider.backgroundColor = [UIColor colorWithWhite:0.6 alpha:0.5];
+            divider.alpha = 0;
+            [rowHost addSubview:divider];
+        }
+    }
+
+    button.hidden = YES;
+    self.modsOptionsDropdownButton = button;
+    self.modsOptionsDropdownEntry = entry;
+    self.modsOptionsDropdownFolderName = folderName;
+    self.modsOptionsDropdownOpen = YES;
+
+    CGFloat expandedHeight = kGDModsOptionsRowHeight * options.count;
+    CGRect expandedFrame = CGRectMake(CGRectGetMinX(collapsedFrame), CGRectGetMinY(collapsedFrame),
+                                       kGDModsOptionsDropdownWidth, expandedHeight);
+    [UIView animateWithDuration:0.22
+                          delay:0
+         usingSpringWithDamping:0.86
+          initialSpringVelocity:0
+                        options:UIViewAnimationOptionCurveEaseOut
+                     animations:^{
+        overlay.frame = expandedFrame;
+        for (UIView *subview in rowHost.subviews) {
+            subview.alpha = 1;
+        }
+    } completion:nil];
+
+    UISelectionFeedbackGenerator *haptic = [UISelectionFeedbackGenerator new];
+    [haptic selectionChanged];
+}
+
+// Tears modsOptionsDropdownOverlay/Scrim down - see
+// -gd_closeReencodeDropdownAnimated:'s own header for the shrink-back-
+// into-the-button choreography this mirrors. animated:NO is used when a
+// different row's "..." is tapped while this one is still open (see
+// -gd_modsLibraryEntryOptionsTapped:) and by -gd_rebuildModsLibrary
+// callers that need the overlay gone immediately (a Delete/Add remark
+// action already triggers its own full rebuild - see
+// -gd_modsOptionsDropdownRowTapped: below - so there's no button left in
+// the tree to shrink back into by the time this would run animated).
+- (void)gd_closeModsOptionsDropdownAnimated:(BOOL)animated {
+    if (!self.modsOptionsDropdownOpen) return;
+
+    UIView *overlay = self.modsOptionsDropdownOverlay;
+    UIControl *scrim = self.modsOptionsDropdownScrim;
+    UIButton *button = self.modsOptionsDropdownButton;
+    self.modsOptionsDropdownOverlay = nil;
+    self.modsOptionsDropdownScrim = nil;
+    self.modsOptionsDropdownButton = nil;
+    self.modsOptionsDropdownEntry = nil;
+    self.modsOptionsDropdownFolderName = nil;
+    self.modsOptionsDropdownOpen = NO;
+
+    // The button this dropdown grew out of may already be gone by the
+    // time this runs (e.g. a rebuild just happened because Delete/Add
+    // remark landed) - in that case there's nothing to shrink back into
+    // or un-hide, so just tear the overlay/scrim down directly.
+    if (!button || !button.superview) {
+        [overlay removeFromSuperview];
+        [scrim removeFromSuperview];
+        return;
+    }
+
+    CGRect collapsedFrame = [button convertRect:button.bounds toView:self.contentOverlay];
+    CGRect collapsedDropdownFrame = CGRectMake(CGRectGetMaxX(collapsedFrame) - kGDModsOptionsDropdownWidth,
+                                                CGRectGetMinY(collapsedFrame),
+                                                kGDModsOptionsDropdownWidth,
+                                                CGRectGetHeight(collapsedFrame));
+
+    void (^finish)(void) = ^{
+        [overlay removeFromSuperview];
+        [scrim removeFromSuperview];
+        button.hidden = NO;
+    };
+
+    if (!animated) {
+        finish();
+        return;
+    }
+
+    UIView *rowHost = [overlay isKindOfClass:[UIVisualEffectView class]]
+        ? ((UIVisualEffectView *)overlay).contentView
+        : overlay;
+    for (UIView *subview in rowHost.subviews) {
+        subview.alpha = 0;
+    }
+
+    [UIView animateWithDuration:0.18
+                          delay:0
+                        options:UIViewAnimationOptionCurveEaseIn
+                     animations:^{
+        overlay.frame = collapsedDropdownFrame;
+    } completion:^(BOOL finished) {
+        finish();
+    }];
+}
+
+// Wired to every options row's UIControlEventTouchUpInside (see
+// gd_make_mods_options_row_button) - sender.tag is that row's index
+// into whichever options array was actually shown (gd_mods_file_
+// options() or gd_mods_folder_options() - see
+// -gd_openModsOptionsDropdownForButton:entry:folderName:, which is what
+// decided that). Stashes the entry/folder this dropdown was opened for
+// locally before closing it (closing nils out modsOptionsDropdownEntry/
+// FolderName), since Add remark's prompt and Delete's confirm alert
+// both need them after the dropdown itself is gone.
+//
+// 3.4.5: modsOptionsDropdownEntry being nil is exactly what marks this
+// as a folder-mode dropdown (see gd_make_mods_folder_row's own options
+// button, wired through -gd_modsLibraryFolderOptionsTapped: with
+// entry:nil) - a file-mode dropdown always has a non-nil entry, since
+// there's no way to open one without tapping a specific file's own row.
+// modsOptionsDropdownFolderName is set either way (a file-mode open
+// derives it from the entry itself; a folder-mode one already IS the
+// folder), so it alone can't be used to tell the two apart.
+- (void)gd_modsOptionsDropdownRowTapped:(UIButton *)sender {
+    ModAssetLibraryEntry *entry = self.modsOptionsDropdownEntry;
+    NSString *folderName = self.modsOptionsDropdownFolderName;
+    BOOL isFolderMode = (entry == nil);
+    BOOL isStoredBundlesRow = !isFolderMode && [folderName isEqualToString:kGDStoredBundlesFolderName];
+    NSArray<NSDictionary<NSString *, id> *> *options = isFolderMode ? gd_mods_folder_options()
+        : (isStoredBundlesRow ? gd_mods_stored_bundle_file_options() : gd_mods_file_options());
+    if (sender.tag < 0 || sender.tag >= (NSInteger)options.count) {
+        [self gd_closeModsOptionsDropdownAnimated:YES];
+        return;
+    }
+
+    [self gd_closeModsOptionsDropdownAnimated:YES];
+    if (!folderName) return;
+    if (!isFolderMode && !entry) return; // defensive - file mode requires an entry, shouldn't be reachable
+
+    NSString *title = options[sender.tag][@"title"];
+
+    if (isFolderMode) {
+        if ([title isEqualToString:@"Add mod"]) {
+            [self gd_presentModImportPickerForFolder:folderName];
+        } else if ([title isEqualToString:@"Rename"]) {
+            [self gd_promptForModFolderRenameForFolder:folderName];
+        } else if ([title isEqualToString:@"Cache folder"]) {
+            [self gd_presentModsAlertWithTitle:@"Coming Soon"
+                                        message:@"Caching folders isn't implemented yet."];
+        } else if ([title isEqualToString:@"Add remark"]) {
+            [self gd_promptForModFolderRemarkForFolder:folderName];
+        } else if ([title isEqualToString:@"Delete"]) {
+            [self gd_confirmDeleteModFolder:folderName];
+        }
+        return;
+    }
+
+    if ([title isEqualToString:@"Cache bundle"]) {
+        [self gd_cacheBundleEntry:entry inFolder:folderName];
+    } else if ([title isEqualToString:@"Restore"]) {
+        [self gd_restoreStoredBundleEntry:entry inFolder:folderName];
+    } else if ([title isEqualToString:@"Add remark"]) {
+        [self gd_promptForModRemarkForEntry:entry inFolder:folderName];
+    } else if ([title isEqualToString:@"Delete"]) {
+        [self gd_confirmDeleteModEntry:entry inFolder:folderName];
+    }
+}
+
+// Wired to modsOptionsDropdownScrim - any tap outside the open overlay
+// closes it without acting on any row.
+- (void)gd_modsOptionsDropdownScrimTapped:(UIControl *)sender {
+    [self gd_closeModsOptionsDropdownAnimated:YES];
+}
+
+// 7 - entry.livePathDescription is stored NSHomeDirectory()-relative for
+// a bundle (see +[ModAssetLibrary liveGamePathDescriptionForInstalledURL:]
+// / mal_sandboxRelativePath:), so this is just that relationship run in
+// reverse: the one way to get back to the real, absolute in-game path
+// Cache/Restore actually need to touch. nil for anything that was never
+// installed (livePathDescription unset) - "Cache bundle" is only ever
+// offered once doctorStatus is Installed, which is the same thing that
+// sets this field in the first place, so that shouldn't happen in
+// practice; checked anyway rather than assumed.
+static NSURL *gd_mods_live_stock_url_for_entry(ModAssetLibraryEntry *entry) {
+    if (entry.livePathDescription.length == 0) return nil;
+    NSString *absolute = [NSHomeDirectory() stringByAppendingPathComponent:entry.livePathDescription];
+    return [NSURL fileURLWithPath:absolute];
+}
+
+// 7 "Cache bundle" - the live half: swaps the live, currently-doctored
+// game file back to the backed-up original (+[BundleDoctorInstaller
+// cacheOriginalBackForStockBundleURL:error:]), then the library half:
+// moves this entry out of whatever real folder it's sitting in and into
+// the immutable "Stored Bundles" folder (created lazily here if this is
+// the first bundle ever cached), copying the CURRENTLY LIVE bytes (i.e.
+// the doctored ones, read a moment ago before they got swapped back) in
+// as the stored copy's own contents rather than carrying over this
+// entry's existing on-disk library copy - see
+// +[ModAssetLibrary moveEntry:fromFolder:toFolder:replacementBytesURL:
+// error:]'s own header for why (the library's own copy has held the
+// PRE-doctor original, untouched, since import - see
+// -gd_doctorInstallDoctoredURL:toStockBundleURL:entryPath:inFolder:'s
+// "entryToMutate.path: untouched, on purpose" - so it's the one copy
+// that's actively WRONG to hand back on Restore).
+// cachedFromFolder is stamped with the entry's real folder before the
+// move so -gd_restoreStoredBundleEntry:inFolder: knows where to put it
+// back.
+- (void)gd_cacheBundleEntry:(ModAssetLibraryEntry *)entry inFolder:(NSString *)folderName {
+    if (!entry.isAssetBundle || entry.doctorStatus != ModAssetLibraryDoctorStatusInstalled) {
+        [self gd_presentModsAlertWithTitle:@"Can't Cache"
+                                    message:@"Only an installed bundle can be cached."];
+        return;
+    }
+    NSURL *stockURL = gd_mods_live_stock_url_for_entry(entry);
+    if (!stockURL) {
+        [self gd_presentModsAlertWithTitle:@"Can't Cache"
+                                    message:@"This entry's live location isn't known."];
+        return;
+    }
+
+    // Snapshot the live (doctored) bytes into a temp file BEFORE
+    // swapping the live file back to the original - this is what
+    // +moveEntry:...replacementBytesURL: copies into "Stored Bundles" as
+    // the entry's own new contents, so it has to be taken before
+    // -cacheOriginalBackForStockBundleURL:error: overwrites stockURL.
+    NSString *tempPath = [NSTemporaryDirectory() stringByAppendingPathComponent:[NSUUID UUID].UUIDString];
+    NSError *snapshotErr = nil;
+    BOOL scoped = [stockURL startAccessingSecurityScopedResource];
+    BOOL snapshotted = [NSFileManager.defaultManager copyItemAtURL:stockURL toURL:[NSURL fileURLWithPath:tempPath] error:&snapshotErr];
+    if (scoped) [stockURL stopAccessingSecurityScopedResource];
+    if (!snapshotted) {
+        [self gd_presentModsAlertWithTitle:@"Cache Failed"
+                                    message:snapshotErr.localizedDescription ?: @"Couldn't read the live bundle."];
+        return;
+    }
+
+    NSError *cacheErr = nil;
+    if (![BundleDoctorInstaller cacheOriginalBackForStockBundleURL:stockURL error:&cacheErr]) {
+        [NSFileManager.defaultManager removeItemAtPath:tempPath error:nil];
+        [self gd_presentModsAlertWithTitle:@"Cache Failed"
+                                    message:cacheErr.localizedDescription ?: @"Unknown error."];
+        return;
+    }
+
+    // "Stored Bundles" is created on demand, the first time anything's
+    // ever cached - +createFolderNamed:error: failing because it
+    // already exists is exactly what "on demand" means from the second
+    // call onward, so that particular failure is swallowed rather than
+    // surfaced.
+    NSError *createErr = nil;
+    if (![ModAssetLibrary createFolderNamed:kGDStoredBundlesFolderName error:&createErr]
+        && createErr.code != ModAssetLibraryErrorFolderAlreadyExists) {
+        [NSFileManager.defaultManager removeItemAtPath:tempPath error:nil];
+        [self gd_presentModsAlertWithTitle:@"Cache Failed"
+                                    message:createErr.localizedDescription ?: @"Couldn't prepare Stored Bundles."];
+        return;
+    }
+
+    entry.cachedFromFolder = folderName;
+    NSError *moveErr = nil;
+    ModAssetLibraryEntry *moved = [ModAssetLibrary moveEntry:entry
+                                                    fromFolder:folderName
+                                                      toFolder:kGDStoredBundlesFolderName
+                                           replacementBytesURL:[NSURL fileURLWithPath:tempPath]
+                                                         error:&moveErr];
+    [NSFileManager.defaultManager removeItemAtPath:tempPath error:nil];
+    if (!moved) {
+        // The live file is already swapped back to original at this
+        // point and there's no clean way to un-cache it from here - log
+        // it plainly rather than pretending this half failed too.
+        ZLog(@"[Mods Library] cached %@'s live file back to original but couldn't move its library entry into Stored Bundles: %@", entry.fileName, moveErr.localizedDescription);
+        [self gd_presentModsAlertWithTitle:@"Cache Partly Failed"
+                                    message:@"The live bundle was restored, but the entry couldn't be moved into Stored Bundles. See syslog."];
+        [self gd_rebuildModsLibrary];
+        return;
+    }
+
+    UINotificationFeedbackGenerator *haptic = [UINotificationFeedbackGenerator new];
+    [haptic notificationOccurred:UINotificationFeedbackTypeSuccess];
+    [self gd_rebuildModsLibrary];
+}
+
+// 7 "Restore" (Stored Bundles row) - the library half: moves the entry
+// back out of "Stored Bundles" into entry.cachedFromFolder, falling
+// back to the person's own folder pick (or a freshly-created one) if
+// that folder's gone; the live half: re-installs the entry's own
+// (doctored) library copy over the live game path via the ordinary
+// +installDoctoredBundleAtURL:toStockBundleURL:error:, which - since a
+// backup for this exact stockURL is already on file from the original
+// Cache-eligible install - just overwrites the live file without
+// touching the backup, i.e. "the original returns to its cache" per the
+// person's own spec wording; it was never moved out of there by
+// -gd_cacheBundleEntry:inFolder: in the first place.
+- (void)gd_restoreStoredBundleEntry:(ModAssetLibraryEntry *)entry inFolder:(NSString *)folderName {
+    NSURL *stockURL = gd_mods_live_stock_url_for_entry(entry);
+    if (!stockURL) {
+        [self gd_presentModsAlertWithTitle:@"Can't Restore"
+                                    message:@"This entry's original live location isn't known."];
+        return;
+    }
+
+    NSArray<NSString *> *realFolders = [[ModAssetLibrary folderNames] mutableCopy];
+    NSString *targetFolder = entry.cachedFromFolder;
+    BOOL targetStillExists = targetFolder.length > 0 && [realFolders containsObject:targetFolder];
+    if (targetStillExists) {
+        [self gd_finishRestoringStoredBundleEntry:entry stockURL:stockURL intoFolder:targetFolder];
+        return;
+    }
+
+    // Original folder is gone - per spec, offer a picker among whatever
+    // real folders are left (Stored Bundles itself excluded, obviously),
+    // or if none exist, skip straight to "create a folder, then drop the
+    // bundle in immediately" with no picker at all.
+    NSMutableArray<NSString *> *pickable = [realFolders mutableCopy];
+    [pickable removeObject:kGDStoredBundlesFolderName];
+
+    if (pickable.count == 0) {
+        [self gd_promptForModFolderNameWithTitle:@"Choose a Folder"
+                                      actionTitle:@"Create & Restore"
+                                       completion:^(NSString *trimmedName) {
+            NSError *createErr = nil;
+            if (![ModAssetLibrary createFolderNamed:trimmedName error:&createErr]) {
+                [self gd_presentModsAlertWithTitle:@"Couldn't Create Folder" message:createErr.localizedDescription ?: @"Unknown error."];
+                return;
+            }
+            [self gd_finishRestoringStoredBundleEntry:entry stockURL:stockURL intoFolder:trimmedName];
+        }];
+        return;
+    }
+
+    UIViewController *presenter = gd_key_window().rootViewController;
+    if (!presenter) return;
+    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"Restore Into Which Folder?"
+                                                                      message:[NSString stringWithFormat:@"\"%@\" no longer exists.", targetFolder ?: @"its original folder"]
+                                                               preferredStyle:UIAlertControllerStyleActionSheet];
+    for (NSString *candidate in pickable) {
+        [sheet addAction:[UIAlertAction actionWithTitle:candidate style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+            [self gd_finishRestoringStoredBundleEntry:entry stockURL:stockURL intoFolder:candidate];
+        }]];
+    }
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [presenter presentViewController:sheet animated:YES completion:nil];
+}
+
+// Shared tail end of -gd_restoreStoredBundleEntry:inFolder: once the
+// destination folder is known to exist (whether that's
+// entry.cachedFromFolder unchanged, a person's own pick, or one just
+// created for this) - re-installs the doctored bytes live, then moves
+// the manifest row back.
+- (void)gd_finishRestoringStoredBundleEntry:(ModAssetLibraryEntry *)entry stockURL:(NSURL *)stockURL intoFolder:(NSString *)destFolder {
+    NSError *installErr = nil;
+    if (![BundleDoctorInstaller installDoctoredBundleAtURL:[NSURL fileURLWithPath:entry.path]
+                                          toStockBundleURL:stockURL
+                                                      error:&installErr]) {
+        [self gd_presentModsAlertWithTitle:@"Restore Failed"
+                                    message:installErr.localizedDescription ?: @"Unknown error."];
+        return;
+    }
+
+    entry.cachedFromFolder = nil;
+    NSError *moveErr = nil;
+    ModAssetLibraryEntry *moved = [ModAssetLibrary moveEntry:entry
+                                                    fromFolder:kGDStoredBundlesFolderName
+                                                      toFolder:destFolder
+                                           replacementBytesURL:nil
+                                                         error:&moveErr];
+    if (!moved) {
+        ZLog(@"[Mods Library] restored %@'s live file but couldn't move its library entry back into \"%@\": %@", entry.fileName, destFolder, moveErr.localizedDescription);
+        [self gd_presentModsAlertWithTitle:@"Restore Partly Failed"
+                                    message:@"The live bundle was restored, but the entry couldn't be moved out of Stored Bundles. See syslog."];
+        [self gd_rebuildModsLibrary];
+        return;
+    }
+
+    UINotificationFeedbackGenerator *haptic = [UINotificationFeedbackGenerator new];
+    [haptic notificationOccurred:UINotificationFeedbackTypeSuccess];
+    [self gd_rebuildModsLibrary];
+}
+
+// "Add remark" (10) - no longer a UIAlertController prompt (see the old
+// comment this replaces, kept in spirit below): the keyboard now comes
+// up straight over a floating wide rectangular field, built fresh in
+// the key window and pinned just above the keyboard the same way the
+// Auth section's fields float (-gd_floatAuthField:), but full-width
+// within the safe area (minus margins) rather than narrow/right-aligned
+// - "wide rectangular" per spec - and with no row anywhere to restore
+// into afterward, since this one isn't parented in the scrolling panel
+// to begin with. Pre-filled with the entry's existing remark (if any)
+// so editing doesn't mean retyping it from scratch. Committing (Return,
+// tapping outside the field, or the keyboard otherwise going away) saves
+// via the same -gd_saveModRemark:forEntry:inFolder: this always used,
+// which rebuilds the library so the new remark shows up at the very top
+// of this file's dropdown (see gd_make_mods_entry_info_panel's own 3.4
+// comment - that placement was already correct and untouched here). An
+// empty submission clears the remark, same nil-not-empty-string
+// convention as before.
+- (void)gd_promptForModRemarkForEntry:(ModAssetLibraryEntry *)entry inFolder:(NSString *)folderName {
+    UIWindow *window = gd_key_window();
+    if (!window || !entry) return;
+    if (self.modsRemarkFloatingField) {
+        // Shouldn't normally happen (the dropdown that reaches this is
+        // gone once one of these is up), but don't strand a previous one
+        // un-saved if it does - same defensive shape as
+        // -gd_floatAuthField:'s own stray-field check.
+        [self gd_commitModsRemarkFloatingField];
+    }
+
+    self.modsRemarkFloatingEntry = entry;
+    self.modsRemarkFloatingFolderName = folderName;
+
+    UIView *backdrop = [[UIView alloc] init];
+    backdrop.translatesAutoresizingMaskIntoConstraints = NO;
+    backdrop.backgroundColor = UIColor.clearColor; // just a tap target, not a visible dim - the field floating above everything is cue enough
+    backdrop.userInteractionEnabled = YES;
+    [backdrop addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(gd_modsRemarkBackdropTapped)]];
+    [window addSubview:backdrop];
+    self.modsRemarkFloatingBackdrop = backdrop;
+    [NSLayoutConstraint activateConstraints:@[
+        [backdrop.leadingAnchor constraintEqualToAnchor:window.leadingAnchor],
+        [backdrop.trailingAnchor constraintEqualToAnchor:window.trailingAnchor],
+        [backdrop.topAnchor constraintEqualToAnchor:window.topAnchor],
+        [backdrop.bottomAnchor constraintEqualToAnchor:window.bottomAnchor],
+    ]];
+
+    UITextField *field = [[UITextField alloc] init];
+    field.text = entry.remark;
+    field.placeholder = @"Remark";
+    field.textColor = UIColor.whiteColor;
+    field.font = [UIFont systemFontOfSize:15 weight:UIFontWeightRegular];
+    field.returnKeyType = UIReturnKeyDone;
+    field.autocapitalizationType = UITextAutocapitalizationTypeSentences;
+    field.clearButtonMode = UITextFieldViewModeWhileEditing;
+    field.delegate = self;
+    self.modsRemarkFloatingField = field;
+
+    // Same real-glass-vs-flat-fallback wrapper the Auth fields use -
+    // gd_wrap_field_in_native_glass returns nil pre-iOS-26, in which
+    // case `field` itself (already flat-styled by that call) IS the
+    // container.
+    UIVisualEffectView *glass = gd_wrap_field_in_native_glass(field, kGDAuthFieldCornerRadius);
+    UIView *container = glass ?: field;
+    container.translatesAutoresizingMaskIntoConstraints = NO;
+    [window addSubview:container];
+    [window bringSubviewToFront:container];
+    self.modsRemarkFloatingContainer = container;
+
+    container.alpha = 0;
+    NSLayoutConstraint *bottom = [container.bottomAnchor constraintEqualToAnchor:window.bottomAnchor constant:-8];
+    self.modsRemarkFloatingBottomConstraint = bottom;
+    [NSLayoutConstraint activateConstraints:@[
+        [container.leadingAnchor constraintEqualToAnchor:window.safeAreaLayoutGuide.leadingAnchor constant:16],
+        [container.trailingAnchor constraintEqualToAnchor:window.safeAreaLayoutGuide.trailingAnchor constant:-16],
+        bottom,
+        [container.heightAnchor constraintEqualToConstant:44],
+    ]];
+
+    // gd_lastKeyboardFrame is normally already correct by the time this
+    // runs (kept warm by every prior -gd_keyboardWillChangeFrame:, same
+    // as -gd_floatAuthField: relies on) - the fallback only matters if
+    // this is somehow the very first keyboard appearance of the session.
+    CGFloat bottomInset = window.safeAreaInsets.bottom + 291;
+    if (!CGRectIsEmpty(self.gd_lastKeyboardFrame)) {
+        CGFloat inset = CGRectGetHeight(window.bounds) - CGRectGetMinY(self.gd_lastKeyboardFrame);
+        if (inset >= 8) bottomInset = inset;
+    }
+    bottom.constant = -(bottomInset + 8);
+    [window layoutIfNeeded];
+
+    [UIView animateWithDuration:0.15 animations:^{
+        container.alpha = 1;
+    }];
+
+    [field becomeFirstResponder];
+}
+
+// Tears down the floating remark field/backdrop and, unless `saving` is
+// NO (only the stray-field defensive path above passes NO - Cancel
+// isn't otherwise reachable, per spec there's no Cancel button here),
+// persists whatever's currently typed via the same
+// -gd_saveModRemark:forEntry:inFolder: the old alert-based Save button
+// used. Reads entry/folderName/text into locals before tearing down
+// (which nils the properties) so the save still has what it needs.
+- (void)gd_commitModsRemarkFloatingFieldSaving:(BOOL)saving {
+    ModAssetLibraryEntry *entry = self.modsRemarkFloatingEntry;
+    NSString *folderName = self.modsRemarkFloatingFolderName;
+    NSString *trimmed = [(self.modsRemarkFloatingField.text ?: @"")
+        stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+
+    UIView *backdrop = self.modsRemarkFloatingBackdrop;
+    UIView *container = self.modsRemarkFloatingContainer;
+    self.modsRemarkFloatingBackdrop = nil;
+    self.modsRemarkFloatingContainer = nil;
+    self.modsRemarkFloatingField = nil;
+    self.modsRemarkFloatingBottomConstraint = nil;
+    self.modsRemarkFloatingEntry = nil;
+    self.modsRemarkFloatingFolderName = nil;
+
+    [UIView animateWithDuration:0.15 animations:^{
+        backdrop.alpha = 0;
+        container.alpha = 0;
+    } completion:^(BOOL finished) {
+        [backdrop removeFromSuperview];
+        [container removeFromSuperview];
+    }];
+
+    if (saving && entry) {
+        [self gd_saveModRemark:(trimmed.length > 0 ? trimmed : nil) forEntry:entry inFolder:folderName];
+    }
+}
+
+// Convenience for the normal (saving) teardown path - see the BOOL
+// overload above for the one defensive exception that skips saving.
+- (void)gd_commitModsRemarkFloatingField {
+    [self gd_commitModsRemarkFloatingFieldSaving:YES];
+}
+
+// Tapping anywhere outside the floating field resigns it, which reaches
+// -textFieldDidEndEditing: below and commits exactly like Return does -
+// there's no separate "tap outside to cancel" per spec (no Cancel
+// button was specified for this field, unlike the old alert's).
+- (void)gd_modsRemarkBackdropTapped {
+    [self.modsRemarkFloatingField resignFirstResponder];
+}
+
+// Persists the remark via the same updateDoctorStateForEntry:inFolder:
+// applyBlock:error: pattern every other manifest mutation in this file
+// uses (see e.g. the 3.0 target-platform/size/date-added refresh in
+// -gd_doctorInstallDoctoredURL:toStockBundleURL:entryPath:inFolder:),
+// then rebuilds so the info panel picks up the new remark immediately.
+- (void)gd_saveModRemark:(nullable NSString *)remark forEntry:(ModAssetLibraryEntry *)entry inFolder:(NSString *)folderName {
+    NSError *error = nil;
+    ModAssetLibraryEntry *updated = [ModAssetLibrary updateDoctorStateForEntry:entry
+                                                                        inFolder:folderName
+                                                                      applyBlock:^(ModAssetLibraryEntry *entryToMutate) {
+        entryToMutate.remark = remark;
+    }
+                                                                           error:&error];
+    if (!updated) {
+        [self gd_presentModsAlertWithTitle:@"Couldn't Save Remark" message:error.localizedDescription ?: @"Unknown error."];
+        return;
+    }
+    [self gd_rebuildModsLibrary];
+}
+
+// "Delete" (3.4) - destructive confirm alert reached from the options
+// dropdown now instead of the old press-and-hold X (see
+// gd_make_mods_entry_row's own header comment on why: a dropdown row
+// has no room to grow a fill capsule). On confirm, calls the EXISTING
+// -gd_deleteModEntryConfirmed:inFolder: unchanged - same underlying
+// delete-and-restore-original behavior as before, just reached
+// differently.
+- (void)gd_confirmDeleteModEntry:(ModAssetLibraryEntry *)entry inFolder:(NSString *)folderName {
+    UIViewController *presenter = gd_key_window().rootViewController;
+    if (!presenter) return;
+
+    UIAlertController *confirm = [UIAlertController alertControllerWithTitle:@"Delete File?"
+                                                                       message:[NSString stringWithFormat:@"\u201C%@\u201D will be removed from the Mod Asset Library and the original will be restored in the game's files.", entry.fileName]
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+    [confirm addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    __weak typeof(self) weakSelf = self;
+    [confirm addAction:[UIAlertAction actionWithTitle:@"Delete" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
+        [weakSelf gd_deleteModEntryConfirmed:entry inFolder:folderName];
+    }]];
+    [presenter presentViewController:confirm animated:YES completion:nil];
+}
+
+// "Rename" (3.4.5, restored per the person's confirmation - see
+// gd_mods_folder_options()'s own header comment). Reuses the exact
+// prompt the old standalone pencil button used to drive
+// (-gd_promptForModFolderNameWithTitle:actionTitle:completion: - no
+// pre-fill support, same blank-field behavior "New Folder" has always
+// had) rather than a new dedicated prompt, and the untouched
+// +[ModAssetLibrary renameFolderNamed:to:error:] model method that was
+// deliberately left in place for exactly this. On success, carries the
+// folder's expand state over to its new name (a plain remove+add on
+// modsLibraryExpandedFolders - renaming an expanded folder shouldn't
+// silently collapse it) before rebuilding.
+- (void)gd_promptForModFolderRenameForFolder:(NSString *)folderName {
+    __weak typeof(self) weakSelf = self;
+    [self gd_promptForModFolderNameWithTitle:@"Rename Folder"
+                                  actionTitle:@"Rename"
+                                   completion:^(NSString *trimmedName) {
+        [weakSelf gd_renameModFolder:folderName to:trimmedName];
+    }];
+}
+
+- (void)gd_renameModFolder:(NSString *)folderName to:(NSString *)newName {
+    NSError *error = nil;
+    BOOL ok = [ModAssetLibrary renameFolderNamed:folderName to:newName error:&error];
+
+    UINotificationFeedbackGenerator *haptic = [UINotificationFeedbackGenerator new];
+    [haptic notificationOccurred:ok ? UINotificationFeedbackTypeSuccess : UINotificationFeedbackTypeError];
+    if (!ok) {
+        [self gd_presentModsAlertWithTitle:@"Couldn't Rename Folder" message:error.localizedDescription ?: @"Unknown error."];
+        return;
+    }
+
+    if ([self.modsLibraryExpandedFolders containsObject:folderName]) {
+        [self.modsLibraryExpandedFolders removeObject:folderName];
+        [self.modsLibraryExpandedFolders addObject:newName];
+    }
+    [self gd_rebuildModsLibrary];
+}
+
+// "Add remark" (3.4.5) - folder equivalent of
+// -gd_promptForModRemarkForEntry:inFolder: above. Pre-filled with the
+// folder's existing remark via +[ModAssetLibrary remarkForFolder:] (see
+// that method's own header in ModAssetLibrary.h for why it's a sibling
+// remark.txt rather than a manifest.json field). Same terse title-only
+// shape, same empty-submission-clears-it convention as the file-row
+// version.
+- (void)gd_promptForModFolderRemarkForFolder:(NSString *)folderName {
+    UIViewController *presenter = gd_key_window().rootViewController;
+    if (!presenter) return;
+
+    UIAlertController *prompt = [UIAlertController alertControllerWithTitle:@"Add Remark"
+                                                                      message:nil
+                                                               preferredStyle:UIAlertControllerStyleAlert];
+    [prompt addTextFieldWithConfigurationHandler:^(UITextField *field) {
+        field.placeholder = @"Remark";
+        field.text = [ModAssetLibrary remarkForFolder:folderName];
+        field.autocapitalizationType = UITextAutocapitalizationTypeSentences;
+    }];
+    [prompt addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    __weak typeof(self) weakSelf = self;
+    [prompt addAction:[UIAlertAction actionWithTitle:@"Save" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        NSString *trimmed = [(prompt.textFields.firstObject.text ?: @"")
+            stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        [weakSelf gd_saveModFolderRemark:(trimmed.length > 0 ? trimmed : nil) forFolder:folderName];
+    }]];
+    [presenter presentViewController:prompt animated:YES completion:nil];
+}
+
+// Persists via +[ModAssetLibrary setRemark:forFolder:error:] (the
+// sibling remark.txt writer/remover - see that method's own comment),
+// then rebuilds so the row's subtext picks up the change immediately.
+// Mirrors -gd_saveModRemark:forEntry:inFolder:'s error-alert-on-failure
+// shape.
+- (void)gd_saveModFolderRemark:(nullable NSString *)remark forFolder:(NSString *)folderName {
+    NSError *error = nil;
+    BOOL ok = [ModAssetLibrary setRemark:remark forFolder:folderName error:&error];
+    if (!ok) {
+        [self gd_presentModsAlertWithTitle:@"Couldn't Save Remark" message:error.localizedDescription ?: @"Unknown error."];
+        return;
+    }
+    [self gd_rebuildModsLibrary];
+}
+
+// "Delete" (3.4.5) - destructive confirm alert reached from the
+// folder's options dropdown now instead of the old press-and-hold X,
+// same reasoning as the file row's own -gd_confirmDeleteModEntry:
+// inFolder: above. On confirm, calls the EXISTING
+// -gd_deleteModFolderConfirmed: unchanged - that method's own behavior
+// (best-effort restore every entry, then delete the folder) needed no
+// changes, only how it's reached did.
+- (void)gd_confirmDeleteModFolder:(NSString *)folderName {
+    UIViewController *presenter = gd_key_window().rootViewController;
+    if (!presenter) return;
+
+    UIAlertController *confirm = [UIAlertController alertControllerWithTitle:@"Delete Folder?"
+                                                                       message:[NSString stringWithFormat:@"\u201C%@\u201D and every mod inside it will be removed. Each mod's original will be restored in the game's files first.", folderName]
+                                                                preferredStyle:UIAlertControllerStyleAlert];
+    [confirm addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    __weak typeof(self) weakSelf = self;
+    [confirm addAction:[UIAlertAction actionWithTitle:@"Delete" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *action) {
+        [weakSelf gd_deleteModFolderConfirmed:folderName];
+    }]];
+    [presenter presentViewController:confirm animated:YES completion:nil];
 }
 
 // --- Doctor-pipeline download handler (Section 3, second half) ---
@@ -5948,6 +7768,16 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
 //      target is known - auto-match or manual pick, either one goes
 //      straight to install.
 - (void)gd_modsLibraryEntryDownloadTapped:(UIButton *)sender {
+    // Section 4 spec - same stale-credentials gate as
+    // -gd_doctorBeginDispatchForEntry:, checked first and before the
+    // ordinary tap haptic below so a blocked download plays only the
+    // error haptic, not both.
+    if (self.authCredentialsStale) {
+        UINotificationFeedbackGenerator *errorHaptic = [UINotificationFeedbackGenerator new];
+        [errorHaptic notificationOccurred:UINotificationFeedbackTypeError];
+        return;
+    }
+
     UIImpactFeedbackGenerator *haptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
     [haptic impactOccurred];
 
@@ -5982,10 +7812,19 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
 
     NSString *entryPath = entry.path; // captured now, same reasoning as the dispatch handler's own entryPath capture
     [self.doctorDownloadInFlightPaths addObject:entryPath];
+    [self.doctorDownloadProgressLastPercent removeObjectForKey:entryPath]; // stale % from a previous attempt, if any
+    NSError *resetError = nil;
+    [ModAssetLibrary updateDoctorStateForEntry:entry inFolder:folderName applyBlock:^(ModAssetLibraryEntry *entryToMutate) {
+        entryToMutate.doctorDownloadProgress = 0.0;
+    } error:&resetError];
     [self gd_rebuildModsLibrary];
 
     __weak typeof(self) weakSelf = self;
-    [BundleDoctorService fetchDoctoredBundleForHandle:handle config:config completion:^(NSURL * _Nullable doctoredBundleURL, NSError * _Nullable error) {
+    [BundleDoctorService fetchDoctoredBundleForHandle:handle config:config
+        progress:^(double fractionComplete) {
+            [weakSelf gd_doctorHandleDownloadProgress:fractionComplete forEntryPath:entryPath inFolder:folderName];
+        }
+        completion:^(NSURL * _Nullable doctoredBundleURL, NSError * _Nullable error) {
         typeof(self) strongSelf = weakSelf;
         if (!strongSelf) return;
         if (!doctoredBundleURL) {
@@ -5994,6 +7833,29 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
         }
         [strongSelf gd_doctorLocateInstallTargetForDoctoredURL:doctoredBundleURL entryPath:entryPath inFolder:folderName];
     }];
+}
+
+// Throttled write-back for the download step's progress callback - same
+// "skip the read-modify-write + rebuild unless the rounded percent
+// actually moved" reasoning as -gd_doctorHandleUploadProgress:...
+// above, added as part of the 3.3 fix that gave the Info dropdown's
+// "Downloading…" status line a real percent.
+- (void)gd_doctorHandleDownloadProgress:(double)fractionComplete forEntryPath:(NSString *)entryPath inFolder:(NSString *)folderName {
+    NSInteger percent = (NSInteger)round(MAX(0.0, MIN(1.0, fractionComplete)) * 100.0);
+    if (!self.doctorDownloadProgressLastPercent) self.doctorDownloadProgressLastPercent = [NSMutableDictionary dictionary];
+    NSNumber *last = self.doctorDownloadProgressLastPercent[entryPath];
+    if (last && last.integerValue == percent) return;
+    self.doctorDownloadProgressLastPercent[entryPath] = @(percent);
+
+    NSError *error = nil;
+    ModAssetLibraryEntry *updated = [ModAssetLibrary updateDoctorStateForEntry:gd_mods_entry_placeholder_for_path(entryPath)
+                                                                        inFolder:folderName
+                                                                      applyBlock:^(ModAssetLibraryEntry *entryToMutate) {
+        entryToMutate.doctorDownloadProgress = fractionComplete;
+    }
+                                                                           error:&error];
+    if (!updated) return; // entry deleted mid-download - nothing left to show progress on
+    [self gd_rebuildModsLibrary];
 }
 
 // Shared failure tail for the download/install flow - clears the
@@ -6021,22 +7883,73 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
 // bundle's directory-table CAB, so either file reads the same one -
 // doctoredURL is what's actually about to be installed, so reading its
 // own CAB is one fewer file this has to reason about being in sync.
+//
+// The actual search (+[UnityCacheLocator cabForBundleAtPath:error:] +
+// +locateBundlePathForCAB:error:] walks Library/UnityCache/Shared and
+// runs UnityBundleCAB's header parse against every regular file under
+// it) used to run synchronously right here, on whatever queue this
+// method was called on - which per -gd_modsLibraryEntryDownloadTapped:
+// is +[BundleDoctorService fetchDoctoredBundleForHandle:...]'s
+// completion, i.e. the main queue. A cache directory with any real
+// number of entries turns that into the multi-second freeze item 2
+// reported. Fixed the same way -gd_processLoadModsBankURLs: already
+// handles its own "Swapping Files..." background work: present a
+// small non-blocking "Indexing..." spinner alert first, do the actual
+// search on a background queue, then hop back to main to either
+// install (match found) or fall back to the manual picker (no match /
+// unreadable CAB) once it's done. This method itself must still be
+// called on the main queue (it presents UI); the search work it kicks
+// off is what moves off of it.
 - (void)gd_doctorLocateInstallTargetForDoctoredURL:(NSURL *)doctoredURL entryPath:(NSString *)entryPath inFolder:(NSString *)folderName {
-    NSError *cabError = nil;
-    NSString *cab = [UnityCacheLocator cabForBundleAtPath:doctoredURL.path error:&cabError];
-    if (cab) {
-        NSError *locateError = nil;
-        NSString *matchPath = [UnityCacheLocator locateBundlePathForCAB:cab error:&locateError];
-        if (matchPath) {
-            [self gd_doctorInstallDoctoredURL:doctoredURL toStockBundleURL:[NSURL fileURLWithPath:matchPath] entryPath:entryPath inFolder:folderName];
-            return;
-        }
-        ZLog(@"[Mods Library] no UnityCache match for %@'s CAB (%@) - falling back to the manual picker: %@", entryPath.lastPathComponent, cab, locateError.localizedDescription);
-    } else {
-        ZLog(@"[Mods Library] couldn't read a CAB off the doctored bundle for %@ - falling back to the manual picker: %@", entryPath.lastPathComponent, cabError.localizedDescription);
-    }
+    UIViewController *presenter = gd_key_window().rootViewController;
+    UIAlertController *indexing = [UIAlertController alertControllerWithTitle:@"Indexing\u2026"
+                                                                        message:@"Looking for a matching stock bundle in the Unity cache."
+                                                                 preferredStyle:UIAlertControllerStyleAlert];
+    UIActivityIndicatorView *spinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
+    spinner.translatesAutoresizingMaskIntoConstraints = NO;
+    [indexing.view addSubview:spinner];
+    [spinner startAnimating];
+    [NSLayoutConstraint activateConstraints:@[
+        [spinner.centerXAnchor constraintEqualToAnchor:indexing.view.centerXAnchor],
+        [spinner.bottomAnchor constraintEqualToAnchor:indexing.view.bottomAnchor constant:-16],
+    ]];
+    if (presenter) [presenter presentViewController:indexing animated:YES completion:nil];
 
-    [self gd_presentDoctorInstallTargetPickerForDoctoredURL:doctoredURL entryPath:entryPath inFolder:folderName];
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSError *cabError = nil;
+        NSString *cab = [UnityCacheLocator cabForBundleAtPath:doctoredURL.path error:&cabError];
+
+        NSString *matchPath = nil;
+        NSError *locateError = nil;
+        if (cab) {
+            matchPath = [UnityCacheLocator locateBundlePathForCAB:cab error:&locateError];
+        }
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            typeof(self) strongSelf = weakSelf;
+            if (!strongSelf) return;
+
+            void (^afterDismiss)(void) = ^{
+                if (matchPath) {
+                    [strongSelf gd_doctorInstallDoctoredURL:doctoredURL toStockBundleURL:[NSURL fileURLWithPath:matchPath] entryPath:entryPath inFolder:folderName];
+                    return;
+                }
+                if (cab) {
+                    ZLog(@"[Mods Library] no UnityCache match for %@'s CAB (%@) - falling back to the manual picker: %@", entryPath.lastPathComponent, cab, locateError.localizedDescription);
+                } else {
+                    ZLog(@"[Mods Library] couldn't read a CAB off the doctored bundle for %@ - falling back to the manual picker: %@", entryPath.lastPathComponent, cabError.localizedDescription);
+                }
+                [strongSelf gd_presentDoctorInstallTargetPickerForDoctoredURL:doctoredURL entryPath:entryPath inFolder:folderName];
+            };
+
+            if (indexing.presentingViewController) {
+                [indexing dismissViewControllerAnimated:YES completion:afterDismiss];
+            } else {
+                afterDismiss();
+            }
+        });
+    });
 }
 
 // Manual fallback for step 2 - same picker shape as
@@ -6124,11 +8037,54 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
         return;
     }
 
+    // 3.0 - the row's displayed target platform / size / date added were
+    // previously set once at import time and never touched again, so a
+    // re-encoded bundle kept showing its PRE-doctor stats (e.g.
+    // StandaloneWindows64(19)) forever. installedURL is a copy of the
+    // exact bytes now sitting at stockBundleURL (see
+    // +[BundleDoctorInstaller installDoctoredBundleAtURL:...], which
+    // writes doctoredURL's bytes there as-is), so read this bundle's
+    // fresh header/size straight off doctoredURL rather than re-opening
+    // stockBundleURL - same content, and doctoredURL is already a plain
+    // (non-security-scoped) local file this process owns outright.
+    // Filepath and CAB identifier are deliberately left untouched here
+    // per the spec - a re-encode changes the bundle's *contents*, not
+    // where the library's own copy lives or its own identity.
+    int32_t freshPlatform = 0;
+    NSError *platformErr = nil;
+    BOOL gotPlatform = [UnityBundleCAB targetPlatform:&freshPlatform forBundleAtPath:doctoredURL.path error:&platformErr];
+    NSNumber *freshPlatformNumber = gotPlatform ? @(freshPlatform) : nil;
+    if (!gotPlatform) {
+        // Don't clobber a previously-known value with nil just because
+        // this particular re-read failed - leave whatever's already on
+        // the manifest row alone in that case (applyBlock below only
+        // assigns freshPlatformNumber when it's non-nil).
+        ZLog(@"[Mods Library] couldn't re-read target platform from the doctored bundle for %@, leaving the row's existing value: %@", entryPath.lastPathComponent, platformErr.localizedDescription);
+    }
+    NSDictionary<NSFileAttributeKey, id> *doctoredAttrs = [NSFileManager.defaultManager attributesOfItemAtPath:doctoredURL.path error:nil];
+    unsigned long long freshByteSize = doctoredAttrs.fileSize;
+
+    NSDateFormatter *iso = [NSDateFormatter new];
+    iso.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+    iso.dateFormat = @"yyyy-MM-dd'T'HH:mm:ss'Z'";
+    iso.timeZone = [NSTimeZone timeZoneForSecondsFromGMT:0];
+    NSString *nowISO = [iso stringFromDate:[NSDate date]];
+
     NSError *stateError = nil;
     ModAssetLibraryEntry *updated = [ModAssetLibrary updateDoctorStateForEntry:gd_mods_entry_placeholder_for_path(entryPath)
                                                                         inFolder:folderName
                                                                       applyBlock:^(ModAssetLibraryEntry *entryToMutate) {
         entryToMutate.doctorStatus = ModAssetLibraryDoctorStatusInstalled;
+        if (freshPlatformNumber) entryToMutate.targetPlatform = freshPlatformNumber;
+        if (freshByteSize > 0) entryToMutate.byteSize = freshByteSize;
+        entryToMutate.dateAdded = nowISO;
+        // 3.2 - stockBundleURL is the real, picked location this bundle
+        // now lives at inside the game's own sandbox; that's only ever
+        // knowable once an install has actually happened (see
+        // ModAssetLibrary.h's livePathDescription comment), so this is
+        // the one place a bundle entry's live path ever gets set.
+        entryToMutate.livePathDescription = [ModAssetLibrary liveGamePathDescriptionForInstalledURL:stockBundleURL];
+        // entryToMutate.path / .cabIdentifier: untouched, on purpose.
     }
                                                                            error:&stateError];
     if (!updated) {
@@ -6432,7 +8388,10 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
     [self gd_rebuildModsLibrary];
 }
 
-// Fires once a folder row's X has been held for the full 1.5s -
+// Fires once "Delete" is picked from a folder row's options dropdown
+// and confirmed in the destructive alert (see
+// -gd_confirmDeleteModFolder: above - 3.4.5 moved this off the old
+// press-and-hold X, this method's own body didn't need to change) -
 // best-effort restores every entry still tracked in the folder (see
 // -gd_restoreModEntryBestEffort:), then deletes the folder itself
 // (manifest and every file under it) via
@@ -6458,14 +8417,16 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
     [self gd_rebuildModsLibrary];
 }
 
-// "Add Asset" picker flow - bookkeeping only, see ModAssetLibrary.h.
-// Deliberately separate from Load Mods' own picker (different
-// UIDocumentPickerViewController instance, tracked via
-// libraryImportPicker rather than loadModsPicker)
-// so -documentPicker:didPickDocumentsAtURLs: can route the result here
-// instead of into either swap-in pipeline. No registered UTI
-// restriction, same reasoning as Load Mods' own picker: a mod file can
-// be anything.
+// "Add Asset" picker flow - see -gd_handlePickedLibraryImportURLs:
+// intoFolder: below for what happens to a picked file. Deliberately a
+// separate UIDocumentPickerViewController instance from Load Mods' own
+// picker (tracked via libraryImportPicker rather than loadModsPicker)
+// purely so -documentPicker:didPickDocumentsAtURLs: can tell the two
+// apart and route to the right target folder - as of 3.5 the two
+// entry points' picked-URL handling itself is unified (see below), so
+// this split exists only for picker-instance/routing reasons, not a
+// behavioral one. No registered UTI restriction, same reasoning as
+// Load Mods' own picker: a mod file can be anything.
 - (void)gd_presentModImportPickerForFolder:(NSString *)folderName {
     UIDocumentPickerViewController *picker;
     if (@available(iOS 14.0, *)) {
@@ -6487,27 +8448,37 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
     [presenter presentViewController:picker animated:YES completion:nil];
 }
 
-// Handles the result of -gd_presentModImportPickerForFolder: - copies
-// every picked file into the target folder via +[ModAssetLibrary
-// importFileURLs:intoFolder:error:] and re-renders. See
-// -documentPicker:didPickDocumentsAtURLs: for how this gets routed here
-// instead of -gd_handleLoadModsPickedURLs:intoFolder:.
+// Handles the result of -gd_presentModImportPickerForFolder: - a
+// folder's "Add mod" (this file's own picker, tracked via
+// libraryImportPicker rather than loadModsPicker so
+// -documentPicker:didPickDocumentsAtURLs: can route the two apart).
+//
+// 3.5 fix: this used to just copy every picked file straight into the
+// target folder via +[ModAssetLibrary importFileURLs:intoFolder:error:]
+// and stop there - deliberately skipping both of Load Mods' own
+// pipelines (recognized-bundle-only import gating AND the .bank
+// transplant/swap step). That's exactly why a .bank added to an
+// existing folder through "Add mod" never actually got swapped into
+// the game's live FMOD build, and why no "Swapping Files…" prompt ever
+// appeared for it - the bank-swap code path this alert belongs to was
+// never being reached from this entry point at all, not silently
+// failing inside it. Now delegates straight to
+// -gd_handleLoadModsPickedURLs:intoFolder: - the exact same
+// classify-then-import-then-swap pipeline "Add mod"'s sibling entry
+// point (Load Mods, used for a brand-new folder) already got right,
+// so a .bank picked through either one now swaps the same way, with
+// the same "Swapping Files…" prompt and the same end-of-run summary
+// alert. No functional reason for these two entry points to diverge
+// beyond which picker instance delivered the URLs - see
+// -gd_presentModImportPickerForFolder: below.
 - (void)gd_handlePickedLibraryImportURLs:(NSArray<NSURL *> *)urls intoFolder:(NSString *)folderName {
-    NSError *error = nil;
-    BOOL ok = [ModAssetLibrary importFileURLs:urls intoFolder:folderName error:&error];
-
-    UINotificationFeedbackGenerator *haptic = [UINotificationFeedbackGenerator new];
-    [haptic notificationOccurred:ok ? UINotificationFeedbackTypeSuccess : UINotificationFeedbackTypeError];
-    if (!ok) {
-        [self gd_presentModsAlertWithTitle:@"Couldn't Add File(s)" message:error.localizedDescription ?: @"Unknown error."];
-    }
-    [self gd_rebuildModsLibrary];
+    [self gd_handleLoadModsPickedURLs:urls intoFolder:folderName];
 }
 
 #pragma mark Syslog
 
 - (void)toggleSyslogTapped {
-    // A completed 3-second hold on this same button already switched it
+    // A completed 1-second hold (9: was 3s) on this same button already switched it
     // into Verbose mode (see -handleSyslogButtonLongPress:); the
     // touchUpInside that fires when the finger finally lifts is just the
     // tail end of that same touch, not a separate tap, so swallow it
@@ -6545,19 +8516,21 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
 }
 
 // Drives the red hold-progress fill on the Debug section's Syslog
-// button. minimumPressDuration is deliberately 0 (not 3.0) so -Began
-// fires on touch-down and this method owns the 3-second timing itself
-// via CADisplayLink - see kSyslogHoldDuration. A UILongPressGestureRecognizer
-// with minimumPressDuration:3.0 would only ever tell us the hold
-// *completed*, with no per-frame progress to animate a fill against.
+// button. minimumPressDuration is deliberately 0 (not 1.0) so -Began
+// fires on touch-down and this method owns the 1-second timing itself
+// via CADisplayLink - see kSyslogHoldDuration in -gd_syslogHoldTick:
+// below, which is the one that actually gates the trigger (this
+// method only owns Began/Ended bookkeeping and the fill layer's
+// creation/snap-back, not the elapsed/duration math). A
+// UILongPressGestureRecognizer with minimumPressDuration:1.0 would
+// only ever tell us the hold *completed*, with no per-frame progress
+// to animate a fill against.
 //
 // cancelsTouchesInView is set to NO on this gesture recognizer (see
 // where it's attached in -buildPanel:) so the button's own touchUpInside
 // still fires normally alongside this - -toggleSyslogTapped is what
 // actually swallows/handles the resulting tap, via syslogHoldTriggered.
 - (void)handleSyslogButtonLongPress:(UILongPressGestureRecognizer *)gesture {
-    static const NSTimeInterval kSyslogHoldDuration = 1.0;
-
     switch (gesture.state) {
         case UIGestureRecognizerStateBegan: {
             self.syslogHoldStartTime = CACurrentMediaTime();
@@ -6571,14 +8544,12 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
                 // filling up" red.
                 fill.backgroundColor = [UIColor colorWithRed:1.0 green:0.08 blue:0.08 alpha:0.85].CGColor;
                 fill.anchorPoint = CGPointMake(0, 0);
-                // Rounded to match the button's own pill silhouette -
-                // without this the fill's square corners poke out past
-                // the button's rounded ends since a raw CALayer doesn't
-                // inherit the native glass configuration's corner shape.
-                // Corrected to bounds.size.height/2 on every tick below
-                // (button height isn't known for certain until the first
-                // real bounds is available here at touch-down).
-                fill.cornerRadius = self.syslogButton.bounds.size.height / 2.0;
+                // 9: matches the button's own square-ish 6pt corner now
+                // (kGDAuthFieldCornerRadius, same as Auth's Verify
+                // button) instead of the old height/2 pill radius -
+                // without this the fill's corners would mismatch the
+                // button's new squared-off silhouette.
+                fill.cornerRadius = kGDAuthFieldCornerRadius;
                 fill.cornerCurve = kCACornerCurveContinuous;
                 // Inserted directly as a sublayer (not addSubview:) so it
                 // sits behind whatever UIButtonConfiguration's native
@@ -6604,12 +8575,12 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
             self.syslogHoldDisplayLink = nil;
 
             if (!self.syslogHoldTriggered) {
-                // Released before the 3s mark - snap the fill back down
+                // Released before the 1s mark - snap the fill back down
                 // instead of leaving it stranded partway.
                 [CATransaction begin];
                 [CATransaction setAnimationDuration:0.18];
                 self.syslogButtonFillLayer.frame = CGRectMake(0, 0, 0, self.syslogButton.bounds.size.height);
-                self.syslogButtonFillLayer.cornerRadius = self.syslogButton.bounds.size.height / 2.0;
+                self.syslogButtonFillLayer.cornerRadius = kGDAuthFieldCornerRadius;
                 [CATransaction commit];
             }
             break;
@@ -6620,7 +8591,8 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
 }
 
 - (void)gd_syslogHoldTick:(CADisplayLink *)link {
-    static const NSTimeInterval kSyslogHoldDuration = 3.0;
+    // 9: 3s \u2192 1s per spec.
+    static const NSTimeInterval kSyslogHoldDuration = 1.0;
     NSTimeInterval elapsed = CACurrentMediaTime() - self.syslogHoldStartTime;
     CGFloat pct = (CGFloat)MIN(1.0, elapsed / kSyslogHoldDuration);
 
@@ -6628,7 +8600,7 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
     [CATransaction begin];
     [CATransaction setDisableActions:YES]; // no implicit animation - the per-tick updates ARE the animation
     self.syslogButtonFillLayer.frame = CGRectMake(0, 0, bounds.size.width * pct, bounds.size.height);
-    self.syslogButtonFillLayer.cornerRadius = bounds.size.height / 2.0;
+    self.syslogButtonFillLayer.cornerRadius = kGDAuthFieldCornerRadius; // 9: square-ish, not height/2 pill
     [CATransaction commit];
 
     if (pct >= 1.0 && !self.syslogHoldTriggered) {
@@ -6639,7 +8611,7 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
     }
 }
 
-// Entered once the 3-second hold on the Syslog button completes. Turns
+// Entered once the 1-second hold (9: was 3s) on the Syslog button completes. Turns
 // the button red (fill layer only - title text stays white, see the
 // tint color passed below) and shows "Verbose". Forces the SYSLOG/
 // VERBOSE pull tab open if it wasn't already: holding the button is now
@@ -6653,6 +8625,7 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
     // White (not red) title text per spec - the red fill layer alone is
     // what signals "Verbose is active" now.
     gd_style_button_as_native_glass(self.syslogButton, @"Verbose", [UIColor colorWithWhite:1 alpha:0.95]);
+    gd_configure_glass_button_fixed_corner_radius(self.syslogButton, kGDAuthFieldCornerRadius); // 9: square-ish, matches Auth's Verify button - see -buildPanel:'s syslogButton setup
 
     self.syslogTabEnabled = YES;
     self.syslogHandle.hidden = NO;
@@ -6683,6 +8656,7 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
 - (void)gd_resetSyslogVerboseMode {
     self.syslogVerboseEnabled = NO;
     gd_style_button_as_native_glass(self.syslogButton, @"Syslog", [UIColor colorWithWhite:1 alpha:0.88]);
+    gd_configure_glass_button_fixed_corner_radius(self.syslogButton, kGDAuthFieldCornerRadius); // 9: square-ish, matches Auth's Verify button - see -buildPanel:'s syslogButton setup
 
     self.syslogHandleLabel.text = @"SYSLOG";
     [self gd_updateSyslogHandleLabelLayout];
@@ -6690,7 +8664,7 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
     self.syslogButtonFillLayer.frame = CGRectMake(0, 0, 0, self.syslogButton.bounds.size.height);
-    self.syslogButtonFillLayer.cornerRadius = self.syslogButton.bounds.size.height / 2.0;
+    self.syslogButtonFillLayer.cornerRadius = kGDAuthFieldCornerRadius; // 9: square-ish, not height/2 pill
     [CATransaction commit];
 
     UIWindow *window = gd_key_window();
@@ -6924,6 +8898,131 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
     if (![BundleDoctorSettings saveConfig:config error:&error]) {
         ZLog(@"[GraphicsDebugOverlay] Auth: failed to save BundleDoctor config: %@", error);
     }
+}
+
+// Shows/clears authStatusLabel - the single small subtext row under the
+// PAT field that now carries both the "Credentials confirmed." message
+// (green, replaces the old success popup) and the persistent "no longer
+// valid" one (red, boot-time auto-check only). `text` of nil or empty
+// hides the row entirely rather than leaving an empty line in the stack.
+- (void)gd_setAuthStatusLabelText:(NSString *)text color:(UIColor *)color {
+    self.authStatusLabel.text = text ?: @"";
+    self.authStatusLabel.textColor = color;
+    self.authStatusLabel.hidden = (text.length == 0);
+}
+
+// Locks the Auth section into its "credentials confirmed" state: fields
+// non-interactable, authVerifyButton crossfades to a red 1s
+// hold-to-confirm "Remove" (reusing the same gd_attach_pill_hold_to_confirm_duration
+// mechanism as Syslog/Restore Originals/Hard Assets Reset - see that
+// function's header), green confirmation subtext. Reached two ways: a
+// successful manual -gd_authVerifyTapped:, and a passing boot-time
+// -gd_authRunBootVerification - both land here so there's exactly one
+// place that defines what "verified" looks like.
+- (void)gd_authEnterVerifiedState {
+    self.authCredentialsStale = NO;
+    self.authInRemoveMode = YES;
+    self.authRepoLinkField.enabled = NO;
+    self.authTokenField.enabled = NO;
+
+    gd_remove_pill_hold_to_confirm_gestures(self.authVerifyButton); // defensive - see that function's own header
+    __weak typeof(self) weakSelf = self;
+    gd_attach_pill_hold_to_confirm_duration(self.authVerifyButton, self, 1.0, ^{
+        [weakSelf gd_authRemoveCredentialsConfirmed];
+    });
+    self.authVerifyButton.enabled = YES;
+    gd_crossfade_auth_button_to_remove(self.authVerifyButton);
+
+    [self gd_setAuthStatusLabelText:@"Credentials confirmed." color:gd_accent_green_color()];
+}
+
+// Same locked-fields/hold-to-confirm-Remove shape as
+// -gd_authEnterVerifiedState above, but for the boot-time check finding
+// a previously-good token/repo that no longer validates (revoked PAT,
+// renamed/deleted repo, etc.) - red persistent subtext instead of green,
+// and authCredentialsStale is set so -gd_doctorBeginDispatchForEntry:/
+// -gd_modsLibraryEntryDownloadTapped: refuse to run (error haptic only,
+// per spec) until the stale credentials are wiped via Remove. Fields stay
+// locked here too - Remove is the one sanctioned way back to an editable
+// state, same as the verified case, so there's no back door that leaves a
+// stale token sitting in Keychain while the fields quietly accept a new
+// one typed over it.
+- (void)gd_authEnterStaleState {
+    self.authCredentialsStale = YES;
+    self.authInRemoveMode = YES;
+    self.authRepoLinkField.enabled = NO;
+    self.authTokenField.enabled = NO;
+
+    gd_remove_pill_hold_to_confirm_gestures(self.authVerifyButton);
+    __weak typeof(self) weakSelf = self;
+    gd_attach_pill_hold_to_confirm_duration(self.authVerifyButton, self, 1.0, ^{
+        [weakSelf gd_authRemoveCredentialsConfirmed];
+    });
+    self.authVerifyButton.enabled = YES;
+    gd_crossfade_auth_button_to_remove(self.authVerifyButton);
+
+    [self gd_setAuthStatusLabelText:@"Your credentials are no longer valid."
+                               color:[UIColor colorWithRed:1.0 green:0.42 blue:0.42 alpha:1.0]];
+}
+
+// Wired as the hold-to-confirm onConfirm block by both
+// -gd_authEnterVerifiedState and -gd_authEnterStaleState. Wipes
+// BundleDoctorSettings' JSON file + Keychain item, blanks both fields,
+// unlocks them, and crossfades authVerifyButton back to plain "Verify" -
+// the person is left with a clean slate to type fresh credentials into,
+// per spec. Proceeds with the UI reset even if the Keychain/file wipe
+// itself reports an error (logged, not surfaced) - leaving the fields
+// locked around a token that's already known-bad (stale case) or that
+// the person explicitly asked to remove would strand them with no way
+// to fix it, which is worse than a best-effort wipe that might leave a
+// stray Keychain item behind.
+- (void)gd_authRemoveCredentialsConfirmed {
+    NSError *error = nil;
+    if (![BundleDoctorSettings clearAllWithError:&error]) {
+        ZLog(@"[GraphicsDebugOverlay] Auth: failed to wipe stored credentials: %@", error);
+    }
+
+    self.authInRemoveMode = NO;
+    self.authCredentialsStale = NO;
+    gd_remove_pill_hold_to_confirm_gestures(self.authVerifyButton);
+
+    self.authRepoLinkField.text = @"";
+    self.authTokenField.text = @"";
+    self.authRepoLinkField.enabled = YES;
+    self.authTokenField.enabled = YES;
+
+    self.authVerifyButton.enabled = YES;
+    gd_crossfade_auth_button_to_verify(self.authVerifyButton);
+
+    [self gd_setAuthStatusLabelText:nil color:nil];
+}
+
+// Called once, right after -gd_loadAuthFields, at the end of every
+// -buildPanel: (i.e. on every tweak boot - see -installIfNeeded). Does
+// nothing at all if nothing's been saved yet (fresh install - stays on
+// the default unlocked "Verify" state, no subtext). Otherwise silently
+// re-checks the saved config exactly like a manual Verify tap would,
+// landing on -gd_authEnterVerifiedState or -gd_authEnterStaleState
+// depending on the result - never an alert, per spec ("just an error
+// haptic, nothing else" is about dispatch/download being blocked
+// afterward, not about this check itself surfacing anything on boot).
+- (void)gd_authRunBootVerification {
+    BundleDoctorConfig *config = [BundleDoctorSettings loadConfig];
+    if (config.repoOwner.length == 0 || config.repoName.length == 0 || config.authToken.length == 0) {
+        return;
+    }
+
+    __weak typeof(self) weakSelf = self;
+    [BundleDoctorService verifyCredentialsForConfig:config completion:^(BOOL valid, NSError *verifyError) {
+        __strong typeof(weakSelf) strongSelf = weakSelf;
+        if (!strongSelf) return;
+
+        if (valid) {
+            [strongSelf gd_authEnterVerifiedState];
+        } else {
+            [strongSelf gd_authEnterStaleState];
+        }
+    }];
 }
 
 #pragma mark Re-Encoding format
@@ -7197,14 +9296,27 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
 }
 
 // Wired to the PAT field's "Verify" button (see -buildPanel:'s Auth
-// section above). Persists whatever's currently in the fields first
-// (same as a blur would) so this always checks exactly what's actually
-// saved, then asks BundleDoctorService to confirm the repo link + token
-// authenticate against the GitHub API - see
+// section above). No-ops while the button is already in its Remove mode
+// (self.authInRemoveMode) - a stray touchUpInside can still land
+// alongside the hold-to-confirm gesture recognizer on a quick tap (see
+// -gd_handlePillHoldToConfirmGesture:'s own "early release" handling for
+// that gesture's half of the story), and there's nothing to verify with
+// the fields locked anyway. Otherwise: persists whatever's currently in
+// the fields first (same as a blur would) so this always checks exactly
+// what's actually saved, then asks BundleDoctorService to confirm the
+// repo link + token authenticate against the GitHub API - see
 // +[BundleDoctorService verifyCredentialsForConfig:completion:]. Button
 // is disabled and relabeled for the duration of the check so a second
-// tap can't stack a duplicate request on top of the first.
+// tap can't stack a duplicate request on top of the first. A pass no
+// longer shows a popup - it hands off to -gd_authEnterVerifiedState,
+// which locks the fields, flips this button to hold-to-confirm "Remove",
+// and shows the green confirmation subtext instead (per spec). A failure
+// here (an explicit, manual check) still shows the old alert - that's
+// unchanged; only the boot-time automatic check
+// (-gd_authRunBootVerification) uses the silent red-subtext path instead.
 - (void)gd_authVerifyTapped:(UIButton *)sender {
+    if (self.authInRemoveMode) return;
+
     [self gd_persistAuthFields];
 
     BundleDoctorConfig *config = [BundleDoctorSettings loadConfig];
@@ -7222,13 +9334,11 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
         __strong typeof(weakSelf) strongSelf = weakSelf;
         if (!strongSelf) return;
 
-        sender.enabled = YES;
-        gd_crossfade_auth_verify_button_title(sender, @"Verify");
-
         if (valid) {
-            [strongSelf gd_presentModsAlertWithTitle:@"Credentials Verified"
-                                              message:@"The GitHub Repository Link and Personal Access Token are valid."];
+            [strongSelf gd_authEnterVerifiedState];
         } else {
+            sender.enabled = YES;
+            gd_crossfade_auth_verify_button_title(sender, @"Verify");
             [strongSelf gd_presentModsAlertWithTitle:@"Verification Failed"
                                               message:verifyError.localizedDescription ?: @"Couldn't verify the repository link and token."];
         }
@@ -7256,10 +9366,10 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
     self.gd_lastKeyboardFrame = endFrameInWindow;
 
     BOOL keyboardVisible = CGRectGetMinY(endFrameInWindow) < CGRectGetMaxY(window.bounds);
+    NSTimeInterval duration = [note.userInfo[UIKeyboardAnimationDurationUserInfoKey] doubleValue];
+    if (duration <= 0) duration = 0.25;
 
     if (self.authFieldCurrentlyFloated && keyboardVisible) {
-        NSTimeInterval duration = [note.userInfo[UIKeyboardAnimationDurationUserInfoKey] doubleValue];
-        if (duration <= 0) duration = 0.25;
         CGFloat bottomInset = CGRectGetHeight(window.bounds) - CGRectGetMinY(endFrameInWindow);
         self.authFieldFloatingBottomConstraint.constant = -(bottomInset + 8);
         [UIView animateWithDuration:duration animations:^{
@@ -7267,6 +9377,23 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
         }];
     } else if (self.authFieldCurrentlyFloated && !keyboardVisible) {
         [self gd_restoreAuthField:self.authFieldCurrentlyFloated];
+    }
+
+    // 10: same height-tracking for the standalone "Add remark" floating
+    // field - it has no row to restore into, so there's nothing to do
+    // here but keep it pinned above the keyboard while both are up.
+    // If the keyboard goes away out from under it (e.g. an external-
+    // keyboard toggle, or the "dismiss keyboard" swipe), resigning is
+    // the same commit path Return/tapping outside use - see
+    // -textFieldDidEndEditing:.
+    if (self.modsRemarkFloatingField && keyboardVisible) {
+        CGFloat bottomInset = CGRectGetHeight(window.bounds) - CGRectGetMinY(endFrameInWindow);
+        self.modsRemarkFloatingBottomConstraint.constant = -(bottomInset + 8);
+        [UIView animateWithDuration:duration animations:^{
+            [window layoutIfNeeded];
+        }];
+    } else if (self.modsRemarkFloatingField && !keyboardVisible) {
+        [self.modsRemarkFloatingField resignFirstResponder];
     }
 }
 
@@ -7400,6 +9527,14 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
     if (textField == self.authRepoLinkField || textField == self.authTokenField) {
         [self gd_restoreAuthField:textField];
         [self gd_persistAuthFields];
+        return;
+    }
+    if (textField == self.modsRemarkFloatingField) {
+        // 10: resigning is the commit for the floating remark field,
+        // same shape as the Auth fields' resign-to-persist above - see
+        // -gd_promptForModRemarkForEntry:inFolder:'s own header comment.
+        [self gd_commitModsRemarkFloatingField];
+        return;
     }
 }
 
@@ -7410,6 +9545,14 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
     // first responder is what actually triggers the save, via
     // -textFieldDidEndEditing: above (see -gd_persistAuthFields).
     if (textField == self.authRepoLinkField || textField == self.authTokenField) {
+        [textField resignFirstResponder];
+        return YES;
+    }
+    if (textField == self.modsRemarkFloatingField) {
+        // 10: Done just dismisses the keyboard - resigning first
+        // responder is what actually commits, via
+        // -textFieldDidEndEditing: above (matches the Auth fields'
+        // return-key shape immediately above this one).
         [textField resignFirstResponder];
         return YES;
     }

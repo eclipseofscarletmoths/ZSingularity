@@ -199,6 +199,49 @@ static NSString * const kManifestFileName = @"manifest.json";
     return [self restoreAllBackedUpBundlesForce:NO error:error];
 }
 
++ (BOOL)cacheOriginalBackForStockBundleURL:(NSURL *)stockBundleURL error:(NSError **)error {
+    NSString *dir = [self bundleBackupDirectory];
+    NSString *name = stockBundleURL.lastPathComponent;
+    NSString *backupPath = dir ? [dir stringByAppendingPathComponent:[name stringByAppendingString:kBackupSuffix]] : nil;
+
+    NSFileManager *fm = NSFileManager.defaultManager;
+    if (!backupPath || ![fm fileExistsAtPath:backupPath]) {
+        if (error) {
+            *error = [NSError errorWithDomain:BundleDoctorInstallerErrorDomain
+                                          code:BundleDoctorInstallerErrorBackupFailed
+                                      userInfo:@{NSLocalizedDescriptionKey: @"No backed-up original found for this bundle."}];
+        }
+        return NO;
+    }
+
+    NSData *backupData = [NSData dataWithContentsOfFile:backupPath];
+    if (!backupData) {
+        if (error) {
+            *error = [NSError errorWithDomain:BundleDoctorInstallerErrorDomain
+                                          code:BundleDoctorInstallerErrorBackupFailed
+                                      userInfo:@{NSLocalizedDescriptionKey: @"Couldn't read the backed-up original."}];
+        }
+        return NO;
+    }
+
+    BOOL scoped = [stockBundleURL startAccessingSecurityScopedResource];
+    NSError *writeError = nil;
+    BOOL wrote = [backupData writeToURL:stockBundleURL options:NSDataWritingAtomic error:&writeError];
+    if (scoped) [stockBundleURL stopAccessingSecurityScopedResource];
+
+    if (!wrote) {
+        if (error) {
+            *error = [NSError errorWithDomain:BundleDoctorInstallerErrorDomain
+                                          code:BundleDoctorInstallerErrorWriteFailed
+                                      userInfo:@{NSLocalizedDescriptionKey: writeError.localizedDescription ?: @"Couldn't write the original bundle back."}];
+        }
+        return NO;
+    }
+
+    ZLog(@"[BundleDoctorInstaller] cached %@ - live bytes swapped back to the backed-up original", name);
+    return YES;
+}
+
 // Same manifest walk as +restoreAllBackedUpBundlesWithError:, but
 // deletes the live file at each logged originalPath instead of
 // overwriting it with the backup's bytes, then deletes bundleBackupDirectory

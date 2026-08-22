@@ -113,14 +113,45 @@ typedef NS_ENUM(NSInteger, ModAssetLibraryDoctorStatus) {
 
 // Human-readable description of where this file lives (or would live)
 // WITHIN THE GAME's own files - i.e. wherever it was/would be swapped
-// into. Only ever resolvable for a .bank file (the one deterministic
-// +[BankTransplant mobileFMODBuildsDirectory]/<fileName>) - anything
-// else has no fixed destination this class can name anymore now that
-// CAB-based bundle matching is gone, and reads back nil.
+// into. Deterministically resolvable at import time for a .bank entry
+// (the one fixed +[BankTransplant mobileFMODBuildsDirectory]/<fileName>
+// destination), and resolvable for a bundle entry too, but only AFTER
+// it's actually been installed once via the doctor pipeline (a bundle
+// has no fixed destination up front - the person picks the real stock
+// file via the install flow's document picker - so this stays nil for
+// a bundle entry until +liveGamePathDescriptionForInstalledURL: gets
+// called with that picked location; see
+// -gd_doctorInstallDoctoredURL:toStockBundleURL:entryPath:inFolder: in
+// GraphicsDebugOverlay.m).
 //
-// Resolved exactly ONCE, at import time
-// (+importFileURLs:intoFolder:error:), and never recomputed after.
+// For a .bank entry: resolved exactly ONCE, at import time
+// (+importFileURLs:intoFolder:error:), and never recomputed after. For
+// a bundle entry: resolved on first successful install, and refreshed
+// on every subsequent one (same stock location each time in practice,
+// but re-set rather than assumed).
 @property (nonatomic, copy, nullable) NSString *livePathDescription;
+
+// Freeform note the person attaches via the file's own "..." options
+// dropdown's "Add remark" action (GraphicsDebugOverlay.m's
+// -gd_promptForModRemarkForEntry:inFolder:) - surfaced at the very top
+// of that entry's Info dropdown (gd_make_mods_entry_info_panel). nil
+// until the person sets one; setting an empty string clears it back to
+// nil rather than persisting a blank row. Purely cosmetic bookkeeping,
+// same scope as every other field on this class - see this header's own
+// top comment.
+@property (nonatomic, copy, nullable) NSString *remark;
+
+// 7 "Cache bundle": the real folder this entry was moved OUT of when it
+// got cached into the immutable "Stored Bundles" folder (see
+// GraphicsDebugOverlay.m's kGDStoredBundlesFolderName) - nil for any
+// entry that's never been cached, and irrelevant (left as whatever it
+// last was, but never read) once an entry sits back in a real folder
+// again. "Restore" reads this to know where to move the entry back to;
+// if that folder no longer exists (deleted by the person while the
+// entry sat in storage) they're prompted to pick or create a
+// replacement instead - see -gd_restoreStoredBundleEntry:inFolder: in
+// GraphicsDebugOverlay.m.
+@property (nonatomic, copy, nullable) NSString *cachedFromFolder;
 
 // --- Doctor-pipeline dispatch state (see ModAssetLibraryDoctorStatus above) ---
 // All of this is plain bookkeeping mirrored from BundleDoctorService
@@ -129,6 +160,13 @@ typedef NS_ENUM(NSInteger, ModAssetLibraryDoctorStatus) {
 @property (nonatomic, assign) ModAssetLibraryDoctorStatus doctorStatus;
 @property (nonatomic, assign) double doctorUploadProgress;   // 0.0-1.0; meaningful only while doctorStatus == Uploading
 @property (nonatomic, assign) double doctorProcessProgress;  // 0.0-1.0; meaningful only while doctorStatus == Processing
+// 0.0-1.0; meaningful only while doctorStatus == ReadyToDownload AND the
+// row's download is actually in flight (see GraphicsDebugOverlay's
+// doctorDownloadInFlightPaths - unlike Uploading/Processing, "downloading"
+// isn't its own doctorStatus value, so this field alone doesn't imply a
+// download is running). Reset to 0.0 at the start of each download
+// attempt, same convention as doctorUploadProgress.
+@property (nonatomic, assign) double doctorDownloadProgress;
 @property (nonatomic, copy, nullable) NSString *doctorScratchBranch; // BundleDoctorHandle.scratchBranch, once dispatched
 @property (nonatomic, copy, nullable) NSString *doctorRunID;         // filled in once +resolveRunForHandle:... finds it
 @property (nonatomic, copy, nullable) NSString *doctorRunURL;        // for surfacing "view run" on failure
@@ -136,6 +174,24 @@ typedef NS_ENUM(NSInteger, ModAssetLibraryDoctorStatus) {
 @end
 
 @interface ModAssetLibrary : NSObject
+
+// Rewrites an absolute on-disk path that's actually somewhere under this
+// app's sandbox (NSHomeDirectory()) into one rooted at that sandbox
+// home instead - e.g. the full
+// "/var/mobile/Containers/Data/Application/<UUID>/Documents/Assets/..."
+// a stock bundle/bank install target comes back as from a document
+// picker, turned into "Documents/Assets/...". This is the game's own
+// NSDirectory tree, since the tweak runs in-process with the game and
+// NSHomeDirectory() here already IS the game's sandbox home - no
+// separate container lookup needed. Used to populate
+// ModAssetLibraryEntry.livePathDescription for entry kinds that only
+// learn their real in-game location once something's actually been
+// installed there (bundles, via the doctor-install flow), as opposed
+// to .bank entries, which know their deterministic destination up
+// front at import time (+[BankTransplant mobileFMODBuildsDirectory]).
+// Returns the path unchanged if it isn't actually under the sandbox
+// home (shouldn't normally happen for anything this tweak installs).
++ (NSString *)liveGamePathDescriptionForInstalledURL:(NSURL *)installedURL;
 
 // Library/ZSingularityModsLibrary inside this app's sandbox - same
 // "own Library directory, not the game's caches/cache-scanned trees"
@@ -198,6 +254,37 @@ typedef NS_ENUM(NSInteger, ModAssetLibraryDoctorStatus) {
 // backup directory - this only forgets the library's own tracked copy.
 + (BOOL)removeEntry:(ModAssetLibraryEntry *)entry fromFolder:(NSString *)folderName error:(NSError **)error;
 
+// 7 - moves one entry's on-disk file (and manifest row) from fromFolder
+// into toFolder; toFolder must already exist (this does NOT create it -
+// callers that need it created lazily, e.g. "Stored Bundles", do that
+// themselves via +createFolderNamed:error: first, same as any other
+// folder). Same collision handling as +importFileURLs:intoFolder:error::
+// a bundle-kind entry (entry.isAssetBundle) gets a fresh CAB-named
+// subfolder under toFolder (unique-suffixed if that CAB id is already
+// taken there), everything else is placed flat and unique-suffixed by
+// name. entry.cabIdentifier/targetPlatform/isAssetBundle/remark carry
+// over unchanged; entry.path and .fileName are updated to the new
+// location on the returned entry.
+//
+// If replacementBytesURL is non-nil, the moved file's CONTENTS are
+// overwritten with that URL's bytes instead of carrying over the old
+// file's own bytes verbatim - used by "Cache bundle" to swap the
+// library's stale pre-doctor copy for whatever's actually live in the
+// game's files right now (see -gd_cacheBundleEntry:inFolder: in
+// GraphicsDebugOverlay.m), rather than silently "restoring" the
+// pre-doctor original into storage under the name of the modded file.
+// entry.byteSize on the returned entry reflects replacementBytesURL's
+// size in that case.
+//
+// Returns nil and fills error (ModAssetLibraryErrorFolderNotFound /
+// ModAssetLibraryErrorEntryNotFound / ModAssetLibraryErrorCopyFailed)
+// on failure; nothing is modified in fromFolder in that case.
++ (nullable ModAssetLibraryEntry *)moveEntry:(ModAssetLibraryEntry *)entry
+                                   fromFolder:(NSString *)fromFolder
+                                     toFolder:(NSString *)toFolder
+                          replacementBytesURL:(nullable NSURL *)replacementBytesURL
+                                        error:(NSError **)error;
+
 // Reads folderName's manifest, finds the row matching entry.path,
 // invokes applyBlock with a mutable copy of that row's current state
 // so the caller can set doctorStatus/doctorUploadProgress/etc, then
@@ -231,6 +318,31 @@ typedef NS_ENUM(NSInteger, ModAssetLibraryDoctorStatus) {
 // ModAssetLibraryErrorFolderAlreadyExists if newName already names a
 // different existing folder.
 + (BOOL)renameFolderNamed:(NSString *)folderName to:(NSString *)newName error:(NSError **)error;
+
+// Freeform note attached to a whole folder via its own "..." options
+// dropdown's "Add remark" action (3.4.5 - GraphicsDebugOverlay.m's
+// -gd_promptForModFolderRemarkForFolder:). Unlike a file's remark
+// (ModAssetLibraryEntry.remark, surfaced inside that one file's Info
+// dropdown), a folder's remark is meant to sit as a small always-visible
+// subtext line directly under the folder's own name in its header row -
+// so, unlike every other field on this class, it does NOT live in
+// manifest.json (which +entriesInFolder:error:/+mal_writeEntries:...
+// treat as a flat JSON *array* of entries - there's no dictionary slot
+// on that array to hang folder-level metadata off of without changing
+// that format for every existing manifest). Instead it's a small sibling
+// text file next to manifest.json inside the folder's own directory, so
+// +renameFolderNamed:to:'s plain directory move and +deleteFolderNamed:
+// error:'s directory delete already carry/remove it for free, with no
+// extra code in either. nil if folderName has no remark set, or doesn't
+// exist.
++ (nullable NSString *)remarkForFolder:(NSString *)folderName;
+
+// Sets (or, when remark is nil or all-whitespace, clears) folderName's
+// remark - trimmed first, same "empty clears back to unset rather than
+// persisting a blank note" convention as ModAssetLibraryEntry.remark.
+// Returns NO with ModAssetLibraryErrorFolderNotFound if folderName
+// doesn't exist.
++ (BOOL)setRemark:(nullable NSString *)remark forFolder:(NSString *)folderName error:(NSError **)error;
 
 // Deletes +modLibraryRootDirectory entirely - every folder, manifest,
 // and tracked file the library has ever recorded, root directory

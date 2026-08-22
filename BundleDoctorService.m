@@ -2,6 +2,7 @@
 #import "ZTweakLog.h"
 #import "UnityBundleCAB.h"
 #import "UnityCacheLocator.h"
+#import <CommonCrypto/CommonDigest.h>
 
 NSString * const BundleDoctorServiceErrorDomain = @"BundleDoctorServiceErrorDomain";
 NSString * const BundleDoctorServiceHTTPStatusKey = @"BundleDoctorServiceHTTPStatusKey";
@@ -51,6 +52,54 @@ static NSString *bds_compressionLabel(uint8_t type) {
         case 4: return @"LZHAM";
         default: return [NSString stringWithFormat:@"type-%u", type];
     }
+}
+
+// Full lowercase-hex SHA-256 digest of `data`. Used only to build the
+// deterministic release tag below (identity, not transport security),
+// so no chunked/streaming variant is needed - the bundles this runs on
+// are already fully resident in memory by the time this is called (see
+// +dispatchBundleAtURL:...'s own moddedData read).
+static NSString *bds_sha256Hex(NSData *data) {
+    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
+    CC_SHA256(data.bytes, (CC_LONG)data.length, digest);
+    NSMutableString *hex = [NSMutableString stringWithCapacity:CC_SHA256_DIGEST_LENGTH * 2];
+    for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) {
+        [hex appendFormat:@"%02x", digest[i]];
+    }
+    return hex;
+}
+
+// See BundleDoctorService.h's "Deterministic release naming" addendum -
+// this is the tag/branch string that used to be a fresh
+// "bundle-doctor/<uuid>" on every call. cabIdentifier is expected in the
+// @"CAB-<hash>" shape +[UnityBundleCAB primaryCABForBundleAtPath:error:]
+// returns; nil/empty falls back to the old random-UUID scheme, since a
+// bundle this class can't identify can't be deduplicated against a
+// future submission either.
+static NSString *bds_deterministicTagForCAB(NSString *cabIdentifier, NSData *moddedData) {
+    if (cabIdentifier.length == 0) {
+        return [NSString stringWithFormat:@"bundle-doctor/%@", [NSUUID UUID].UUIDString];
+    }
+    NSString *cabHash = [cabIdentifier hasPrefix:@"CAB-"] ? [cabIdentifier substringFromIndex:4] : cabIdentifier;
+    NSString *cabTrunc = [cabHash substringToIndex:MIN((NSUInteger)5, cabHash.length)];
+    NSString *sha256Hex = bds_sha256Hex(moddedData);
+    NSString *shaTrunc = [sha256Hex substringToIndex:MIN((NSUInteger)5, sha256Hex.length)];
+    return [NSString stringWithFormat:@"bundle-doctor/CAB-%@-sha256-%@", cabTrunc, shaTrunc];
+}
+
+// See BundleDoctorProcessedRelease.h's cabDisplayName header comment -
+// pulls the "CAB-<hex>" segment back out of a deterministic tag (e.g.
+// "bundle-doctor/CAB-38321-sha256-9f2a1" -> "CAB-38321"), i.e. the
+// person's 6 spec's "release's name, excluding the sha part". Returns
+// nil if tagName has no "CAB-" substring at all (the old random-UUID
+// fallback tag - see bds_deterministicTagForCAB above - which has
+// nothing to extract).
+static NSString *bds_cabDisplayNameFromTag(NSString *tagName) {
+    NSRange cabRange = [tagName rangeOfString:@"CAB-"];
+    if (cabRange.location == NSNotFound) return nil;
+    NSString *fromCAB = [tagName substringFromIndex:cabRange.location];
+    NSRange shaRange = [fromCAB rangeOfString:@"-sha256-"];
+    return (shaRange.location != NSNotFound) ? [fromCAB substringToIndex:shaRange.location] : fromCAB;
 }
 
 // Transport optimization only: GitHub sees a smaller release asset, while
@@ -150,16 +199,26 @@ static NSData *bds_prepareBundleDataForUpload(NSData *data, NSError **error) {
 
 @implementation BundleDoctorHandle {
     NSString *_scratchBranch;
+    BOOL _alreadyComplete;
 }
 
 - (instancetype)initWithScratchBranch:(NSString *)scratchBranch {
+    return [self initWithScratchBranch:scratchBranch alreadyComplete:NO];
+}
+
+// Private - only +dispatchBundleAtURL:...'s cache-hit path constructs one
+// of these with alreadyComplete == YES. Not exposed in the header since
+// callers only ever read the flag, never set it.
+- (instancetype)initWithScratchBranch:(NSString *)scratchBranch alreadyComplete:(BOOL)alreadyComplete {
     if ((self = [super init])) {
         _scratchBranch = [scratchBranch copy];
+        _alreadyComplete = alreadyComplete;
     }
     return self;
 }
 
 - (NSString *)scratchBranch { return _scratchBranch; }
+- (BOOL)alreadyComplete { return _alreadyComplete; }
 
 - (NSDictionary<NSString *, NSString *> *)dictionaryRepresentation {
     NSMutableDictionary<NSString *, NSString *> *d = [NSMutableDictionary dictionary];
@@ -224,6 +283,52 @@ totalBytesExpectedToSend:(int64_t)totalBytesExpectedToSend {
     if (!self.onProgress || totalBytesExpectedToSend <= 0) return;
     double fraction = (double)totalBytesSent / (double)totalBytesExpectedToSend;
     self.onProgress(MIN(MAX(fraction, 0.0), 1.0));
+}
+
+@end
+
+#pragma mark - BDSDownloadProgressDelegate
+
+// Download-side mirror of BDSUploadProgressDelegate above, for
+// +bds_downloadBinaryAtAbsoluteURLString:... (the release-asset GET that
+// pulls the doctored bundle back down - the one download in this whole
+// pipeline with an actual multi-second body). Unlike the upload side,
+// -URLSession:downloadTask:didWriteData:totalBytesWritten:
+// totalBytesExpectedToWrite: DOES still fire for a download task created
+// via the block-based -downloadTaskWithRequest:completionHandler: - it's
+// a task-level progress callback with no completion-handler equivalent
+// of its own (the completion handler only ever gets the finished file's
+// temp location), same category as didSendBodyData: on the upload side.
+// So, also unlike BDSUploadProgressDelegate, this doesn't need the
+// "read the body from the completion handler instead" workaround - a
+// download task's completion handler already hands back a location, not
+// accumulated data, so there was never a didReceiveData: substitute to
+// route around here.
+@interface BDSDownloadProgressDelegate : NSObject <NSURLSessionDownloadDelegate>
+@property (nonatomic, copy, nullable) void (^onProgress)(double fractionComplete);
+@end
+
+@implementation BDSDownloadProgressDelegate
+
+- (void)URLSession:(NSURLSession *)session
+      downloadTask:(NSURLSessionDownloadTask *)downloadTask
+      didWriteData:(int64_t)bytesWritten
+ totalBytesWritten:(int64_t)totalBytesWritten
+totalBytesExpectedToWrite:(int64_t)totalBytesExpectedToWrite {
+    if (!self.onProgress || totalBytesExpectedToWrite <= 0) return;
+    double fraction = (double)totalBytesWritten / (double)totalBytesExpectedToWrite;
+    self.onProgress(MIN(MAX(fraction, 0.0), 1.0));
+}
+
+// NSURLSessionDownloadDelegate's one @required method, so this class has
+// to implement it to conform - but for a task created via the block-based
+// -downloadTaskWithRequest:completionHandler:, Foundation never actually
+// invokes it (the completion handler's own `location` parameter is the
+// real, only place the finished temp file's URL shows up - see
+// +bds_downloadBinaryAtAbsoluteURLString:...). Intentionally empty.
+- (void)URLSession:(NSURLSession *)session
+      downloadTask:(NSURLSessionDownloadTask *)downloadTask
+didFinishDownloadingToURL:(NSURL *)location {
 }
 
 @end
@@ -348,7 +453,7 @@ totalBytesExpectedToSend:(int64_t)totalBytesExpectedToSend {
         report(@"Downloading doctored bundle\u2026");
         NSData *doctoredData = nil;
         if (![self bds_downloadReleaseAssetNamed:kBDSOutputAssetName fromReleaseTag:scratchBranch
-                                           config:config data:&doctoredData error:&error]) {
+                                           config:config progress:nil data:&doctoredData error:&error]) {
             [self bds_cleanupScratchSubmission:scratchBranch config:config];
             finish(nil, error);
             return;
@@ -466,9 +571,35 @@ totalBytesExpectedToSend:(int64_t)totalBytesExpectedToSend {
         // this data that has to stay exact.
         NSData *originalData = [self bds_findOriginalBundleDataForModdedBundleAtPath:moddedBundleURL.path];
 
-        NSString *scratchBranch = [NSString stringWithFormat:@"bundle-doctor/%@", [NSUUID UUID].UUIDString];
+        // See BundleDoctorService.h's "Deterministic release naming"
+        // addendum: the tag/branch is now derived from the modded
+        // bundle's own CAB + SHA-256 rather than a fresh random UUID, so
+        // an unchanged bundle re-dispatched later lands on the exact
+        // same tag a previous submission already used.
+        NSError *cabError = nil;
+        NSString *cabIdentifier = [UnityBundleCAB primaryCABForBundleAtPath:moddedBundleURL.path error:&cabError];
+        if (!cabIdentifier) {
+            ZLog(@"[BundleDoctorService] couldn't resolve a CAB identifier for %@ (%@) - falling back to a one-shot random tag, no cache dedup for this submission.",
+                 moddedBundleURL.path.lastPathComponent, cabError.localizedDescription);
+        }
+        NSString *scratchBranch = bds_deterministicTagForCAB(cabIdentifier, moddedData);
         ZLog(@"[BundleDoctorService] dispatching %@/%@, scratch branch %@ (original bundle for shader-restore: %@)",
               config.repoOwner, config.repoName, scratchBranch, originalData ? @"found" : @"not found");
+
+        // Section 5: an already-doctored release sitting under this exact
+        // tag means someone (possibly this same device, possibly a fellow
+        // agent sharing the repo) already ran this exact bundle through
+        // the pipeline - skip the upload/branch/dispatch steps entirely
+        // and hand back a handle the caller can fetch from directly. Only
+        // meaningful when the tag is actually deterministic - a
+        // random-UUID fallback (cabIdentifier == nil) can never already
+        // exist, so don't bother making the round trip for that case.
+        if (cabIdentifier.length > 0 && [self bds_releaseAtTagHasOutputAsset:scratchBranch config:config]) {
+            ZLog(@"[BundleDoctorService] cache hit on %@ - skipping upload/dispatch, caller should fetch directly.", scratchBranch);
+            BundleDoctorHandle *cachedHandle = [[BundleDoctorHandle alloc] initWithScratchBranch:scratchBranch alreadyComplete:YES];
+            finish(cachedHandle, nil);
+            return;
+        }
 
         NSString *baseCommitSHA = nil;
         if (![self bds_resolveBaseCommitSHA:&baseCommitSHA config:config error:&error]) {
@@ -489,30 +620,55 @@ totalBytesExpectedToSend:(int64_t)totalBytesExpectedToSend {
             return;
         }
 
+        // uploadProgress's contract used to be "the modded bundle's own
+        // body send" alone, forced to a clean 1.0 the moment that PUT
+        // finished - but when originalData is also going up right after
+        // (same scratch release, second asset, previously reported with
+        // progress:nil), that forced 1.0 was a lie: the caller's progress
+        // UI would sit at 100% while original.bundle's own multi-second
+        // upload was still happening underneath it. Now both assets share
+        // one 0.0-1.0 space, split by their relative byte sizes, so 100%
+        // means "both PUTs are actually done" - or, when there's no
+        // originalData at all (shader-restore lookup came up empty), the
+        // modded upload alone still spans the full range exactly as
+        // before.
+        unsigned long long moddedBytes = uploadData.length;
+        unsigned long long originalBytes = originalData.length;
+        double totalUploadBytes = (double)(moddedBytes + originalBytes);
+        double moddedShare = (originalData && totalUploadBytes > 0.0)
+            ? (double)moddedBytes / totalUploadBytes
+            : 1.0;
+        void (^reportModdedProgress)(double) = ^(double fraction) {
+            reportProgress(fraction * moddedShare);
+        };
+        void (^reportOriginalProgress)(double) = ^(double fraction) {
+            reportProgress(moddedShare + fraction * (1.0 - moddedShare));
+        };
+
         if (![self bds_uploadReleaseAssetData:uploadData name:kBDSInputAssetName
-                             uploadURLTemplate:uploadURLTemplate progress:reportProgress
+                             uploadURLTemplate:uploadURLTemplate progress:reportModdedProgress
                                         config:config error:&error]) {
             [self bds_cleanupScratchSubmission:scratchBranch config:config];
             finish(nil, error);
             return;
         }
-        reportProgress(1.0); // the asset upload is the entire uploadProgress contract - make sure callers land on a clean 100%
+        if (!originalData) reportProgress(1.0); // nothing more to send - land on a clean 100% same as before
 
-        // Second asset, no progress callback - uploadProgress's contract is
-        // "the modded bundle's own body send", already satisfied above, and
-        // this upload is typically small/fast relative to that one. A
-        // failure here is NOT fatal to the whole submission: it just means
-        // the workflow proceeds without original.bundle and BundleDoctor
-        // falls back to skipping the shader-restore pass, same as if
-        // originalData had been nil to begin with.
+        // A failure uploading original.bundle is NOT fatal to the whole
+        // submission: it just means the workflow proceeds without it and
+        // BundleDoctor falls back to skipping the shader-restore pass,
+        // same as if originalData had been nil to begin with - but the
+        // progress space it was allotted above still needs closing out to
+        // a clean 100% either way.
         if (originalData) {
             NSError *originalUploadError = nil;
             if (![self bds_uploadReleaseAssetData:originalData name:kBDSOriginalAssetName
-                                 uploadURLTemplate:uploadURLTemplate progress:nil
+                                 uploadURLTemplate:uploadURLTemplate progress:reportOriginalProgress
                                             config:config error:&originalUploadError]) {
                 ZLog(@"[BundleDoctorService] couldn't upload original.bundle (proceeding without shader-restore): %@",
                      originalUploadError.localizedDescription);
             }
+            reportProgress(1.0);
         }
 
         if (![self bds_dispatchWorkflowOnBranch:scratchBranch config:config error:&error]) {
@@ -663,7 +819,12 @@ totalBytesExpectedToSend:(int64_t)totalBytesExpectedToSend {
 
 + (void)fetchDoctoredBundleForHandle:(BundleDoctorHandle *)handle
                                 config:(BundleDoctorConfig *)rawConfig
+                              progress:(nullable void (^)(double fractionComplete))downloadProgress
                             completion:(void (^)(NSURL * _Nullable, NSError * _Nullable))completion {
+    void (^reportProgress)(double) = ^(double fraction) {
+        if (!downloadProgress) return;
+        dispatch_async(dispatch_get_main_queue(), ^{ downloadProgress(fraction); });
+    };
     void (^finish)(NSURL * _Nullable, NSError * _Nullable) = ^(NSURL * _Nullable url, NSError * _Nullable error) {
         dispatch_async(dispatch_get_main_queue(), ^{ completion(url, error); });
     };
@@ -679,12 +840,25 @@ totalBytesExpectedToSend:(int64_t)totalBytesExpectedToSend {
         NSError *error = nil;
         NSData *doctoredData = nil;
         if (![self bds_downloadReleaseAssetNamed:kBDSOutputAssetName fromReleaseTag:handle.scratchBranch
-                                           config:config data:&doctoredData error:&error]) {
+                                           config:config progress:reportProgress data:&doctoredData error:&error]) {
             finish(nil, error);
             return;
         }
+        reportProgress(1.0); // land on a clean 100% even if the last didWriteData: callback landed a hair short
 
-        [self bds_cleanupScratchSubmission:handle.scratchBranch config:config]; // best-effort, logged not surfaced - see header
+        // Deliberately NOT +bds_cleanupScratchSubmission:... anymore - that
+        // deleted the release itself, which was correct when the tag was a
+        // one-shot random UUID with nothing else ever able to reuse it.
+        // Now that the tag is deterministic (see this file's header), the
+        // release IS the cache +dispatchBundleAtURL:...'s own
+        // +bds_releaseAtTagHasOutputAsset:config: checks against - deleting
+        // it here would erase the cache entry on its own first successful
+        // read. Only the now-empty scratch branch (best-effort; a no-op
+        // when this handle came from a cache hit and no branch was ever
+        // created for it) gets cleaned up. Wiping the releases themselves
+        // is now a separate, explicit operation - see the Config section's
+        // "delete stored bundles in proxy".
+        [self bds_deleteBranch:handle.scratchBranch config:config]; // best-effort, logged not surfaced
 
         NSString *tempName = [NSString stringWithFormat:@"doctored-%@.bundle", [NSUUID UUID].UUIDString];
         NSURL *tempURL = [NSURL fileURLWithPath:[NSTemporaryDirectory() stringByAppendingPathComponent:tempName]];
@@ -728,6 +902,204 @@ totalBytesExpectedToSend:(int64_t)totalBytesExpectedToSend {
     });
 }
 
+#pragma mark - BundleDoctorProcessedRelease
+
+@implementation BundleDoctorProcessedRelease {
+    NSString *_tagName;
+    NSString *_cabDisplayName;
+    NSString *_displayName;
+    unsigned long long _byteSize;
+    NSString *_uploadedAt;
+    NSString *_checksum;
+}
+
+- (instancetype)initWithTagName:(NSString *)tagName
+                        byteSize:(unsigned long long)byteSize
+                      uploadedAt:(nullable NSString *)uploadedAt
+                        checksum:(nullable NSString *)checksum {
+    if ((self = [super init])) {
+        _tagName = [tagName copy] ?: @"";
+        _cabDisplayName = bds_cabDisplayNameFromTag(_tagName);
+        _displayName = _cabDisplayName.length > 0 ? _cabDisplayName : _tagName;
+        _byteSize = byteSize;
+        _uploadedAt = [uploadedAt copy];
+        _checksum = [checksum copy];
+    }
+    return self;
+}
+
+- (NSString *)tagName { return _tagName; }
+- (NSString *)cabDisplayName { return _cabDisplayName; }
+- (NSString *)displayName { return _displayName; }
+- (unsigned long long)byteSize { return _byteSize; }
+- (NSString *)uploadedAt { return _uploadedAt; }
+- (NSString *)checksum { return _checksum; }
+
+@end
+
+#pragma mark - Processed Bundles listing (6)
+
++ (void)listProcessedReleasesForConfig:(BundleDoctorConfig *)rawConfig
+                              completion:(void (^)(NSArray<BundleDoctorProcessedRelease *> * _Nullable, NSError * _Nullable))completion {
+    void (^finish)(NSArray<BundleDoctorProcessedRelease *> * _Nullable, NSError * _Nullable) =
+        ^(NSArray<BundleDoctorProcessedRelease *> *releases, NSError *error) {
+        dispatch_async(dispatch_get_main_queue(), ^{ completion(releases, error); });
+    };
+
+    BundleDoctorConfig *config = [rawConfig normalizedConfig];
+    if (config.repoOwner.length == 0 || config.repoName.length == 0 || config.authToken.length == 0) {
+        finish(nil, [self bds_errorWithCode:BundleDoctorServiceErrorInvalidConfig
+                                description:@"Set a GitHub repository link and Personal Access Token under Mods \u2192 Auth first."]);
+        return;
+    }
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        static const NSInteger kPerPage = 100; // GitHub's own max for this endpoint
+        NSMutableArray<BundleDoctorProcessedRelease *> *results = [NSMutableArray array];
+        NSInteger page = 1;
+        for (;;) {
+            NSString *path = [NSString stringWithFormat:@"/repos/%@/%@/releases?per_page=%ld&page=%ld",
+                               config.repoOwner, config.repoName, (long)kPerPage, (long)page];
+            NSError *error = nil;
+            id result = [self bds_getJSON:path config:config error:&error];
+            if (!result) {
+                finish(nil, error);
+                return;
+            }
+            NSArray *pageReleases = [result isKindOfClass:NSArray.class] ? result : @[];
+            for (NSDictionary *release in pageReleases) {
+                if (![release isKindOfClass:NSDictionary.class]) continue;
+                NSArray *assets = release[@"assets"];
+                if (![assets isKindOfClass:NSArray.class]) continue;
+
+                NSDictionary *outputAsset = nil;
+                for (NSDictionary *asset in assets) {
+                    if ([asset isKindOfClass:NSDictionary.class] && [asset[@"name"] isEqual:kBDSOutputAssetName]) {
+                        outputAsset = asset;
+                        break;
+                    }
+                }
+                // Same "only a finished release counts" rule as
+                // +bds_releaseAtTagHasOutputAsset:config: - a release
+                // still mid-flight (or abandoned before the workflow
+                // uploaded its output) has no output.bundle asset yet
+                // and is silently skipped rather than listed with
+                // nothing to show.
+                if (!outputAsset) continue;
+
+                NSString *tagName = [release[@"tag_name"] isKindOfClass:NSString.class] ? release[@"tag_name"] : @"";
+                id sizeValue = outputAsset[@"size"];
+                unsigned long long size = [sizeValue respondsToSelector:@selector(unsignedLongLongValue)] ? [sizeValue unsignedLongLongValue] : 0;
+                NSString *uploadedAt = [outputAsset[@"created_at"] isKindOfClass:NSString.class] ? outputAsset[@"created_at"] : nil;
+                NSString *digest = [outputAsset[@"digest"] isKindOfClass:NSString.class] ? outputAsset[@"digest"] : nil;
+
+                [results addObject:[[BundleDoctorProcessedRelease alloc] initWithTagName:tagName
+                                                                                  byteSize:size
+                                                                                uploadedAt:uploadedAt
+                                                                                  checksum:digest]];
+            }
+            if (pageReleases.count < kPerPage) break; // short page - this was the last one
+            page++;
+        }
+
+        [results sortUsingComparator:^NSComparisonResult(BundleDoctorProcessedRelease *a, BundleDoctorProcessedRelease *b) {
+            // Newest-uploaded-first. ISO 8601 UTC strings in this exact
+            // shape sort lexicographically identically to chronologically,
+            // so a plain NSString compare is enough - no date parsing
+            // needed just to order rows. A release whose asset carried no
+            // created_at (shouldn't normally happen - GitHub always sets
+            // this) sorts after everything that has one instead of
+            // undefined-ordering against nil.
+            if (!a.uploadedAt && !b.uploadedAt) return NSOrderedSame;
+            if (!a.uploadedAt) return NSOrderedDescending;
+            if (!b.uploadedAt) return NSOrderedAscending;
+            return [b.uploadedAt compare:a.uploadedAt];
+        }];
+
+        finish(results, nil);
+    });
+}
+
+#pragma mark - Delete every stored release (8)
+
++ (void)deleteAllReleasesForConfig:(BundleDoctorConfig *)rawConfig
+                          completion:(void (^)(NSInteger deletedCount, NSError * _Nullable error))completion {
+    void (^finish)(NSInteger, NSError * _Nullable) = ^(NSInteger deletedCount, NSError *error) {
+        dispatch_async(dispatch_get_main_queue(), ^{ completion(deletedCount, error); });
+    };
+
+    BundleDoctorConfig *config = [rawConfig normalizedConfig];
+    if (config.repoOwner.length == 0 || config.repoName.length == 0 || config.authToken.length == 0) {
+        finish(0, [self bds_errorWithCode:BundleDoctorServiceErrorInvalidConfig
+                                description:@"Set a GitHub repository link and Personal Access Token under Mods \u2192 Auth first."]);
+        return;
+    }
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        // Same pagination shape as +listProcessedReleasesForConfig:
+        // above, but nothing here filters on an output.bundle asset -
+        // every release in the repo gets collected, finished or not.
+        static const NSInteger kPerPage = 100;
+        NSMutableArray<NSDictionary *> *allReleases = [NSMutableArray array];
+        NSInteger page = 1;
+        for (;;) {
+            NSString *path = [NSString stringWithFormat:@"/repos/%@/%@/releases?per_page=%ld&page=%ld",
+                               config.repoOwner, config.repoName, (long)kPerPage, (long)page];
+            NSError *error = nil;
+            id result = [self bds_getJSON:path config:config error:&error];
+            if (!result) {
+                finish(0, error);
+                return;
+            }
+            NSArray *pageReleases = [result isKindOfClass:NSArray.class] ? result : @[];
+            for (NSDictionary *release in pageReleases) {
+                if ([release isKindOfClass:NSDictionary.class]) [allReleases addObject:release];
+            }
+            if (pageReleases.count < kPerPage) break; // short page - this was the last one
+            page++;
+        }
+
+        // Each release + its tag ref is deleted independently and
+        // best-effort, same spirit as +bds_cleanupScratchSubmission: -
+        // one release failing to delete (already gone, transient 5xx,
+        // etc.) shouldn't stop the rest of the repo from being cleared.
+        NSInteger deletedCount = 0;
+        for (NSDictionary *release in allReleases) {
+            NSString *releaseID = [release[@"id"] stringValue];
+            NSString *tagName = [release[@"tag_name"] isKindOfClass:NSString.class] ? release[@"tag_name"] : nil;
+
+            if (releaseID.length > 0) {
+                NSString *deletePath = [NSString stringWithFormat:@"/repos/%@/%@/releases/%@",
+                                         config.repoOwner, config.repoName, releaseID];
+                NSError *deleteError = nil;
+                if ([self bds_deleteJSON:deletePath config:config error:&deleteError]) {
+                    deletedCount++;
+                } else {
+                    ZLog(@"[BundleDoctorService] couldn't delete release %@ (tag %@) while clearing the proxy: %@", releaseID, tagName, deleteError);
+                }
+            }
+
+            // Deleting a release does NOT delete its underlying git tag
+            // ref (same fact +bds_deleteReleaseWithTag:config: already
+            // handles for a single scratch release) - clean it up
+            // regardless of whether the release delete above actually
+            // succeeded, so a tag ref orphaned by some earlier failure
+            // still gets swept here too.
+            if (tagName.length > 0) {
+                NSString *escapedTag = [tagName stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLPathAllowedCharacterSet]];
+                NSString *tagRefPath = [NSString stringWithFormat:@"/repos/%@/%@/git/refs/tags/%@",
+                                         config.repoOwner, config.repoName, escapedTag];
+                NSError *tagDeleteError = nil;
+                if (![self bds_deleteJSON:tagRefPath config:config error:&tagDeleteError]) {
+                    ZLog(@"[BundleDoctorService] couldn't delete release tag ref %@ while clearing the proxy: %@", tagName, tagDeleteError);
+                }
+            }
+        }
+
+        finish(deletedCount, nil);
+    });
+}
+
 #pragma mark - Git Data API steps
 
 + (BOOL)bds_resolveBaseCommitSHA:(NSString **)outCommitSHA
@@ -749,6 +1121,17 @@ totalBytesExpectedToSend:(int64_t)totalBytesExpectedToSend {
     return YES;
 }
 
+// Deterministic tags (see this file's header addendum) mean two
+// submissions of the same CAB+sha256 pair can now legitimately race for
+// the same branch name - e.g. a first attempt is still mid-flight (no
+// output asset yet, so +bds_releaseAtTagHasOutputAsset:config: didn't
+// short-circuit) and a second dispatch/retry for the identical bundle
+// comes in before it finishes. A pre-existing random-UUID tag could
+// never collide like this, so this is new: a 422 "already exists" here
+// isn't a failure, it just means the branch this submission wants is
+// already sitting there (pointed at whatever commit the earlier
+// submission used, which is fine - workflow_dispatch only needs a ref
+// name to run against, not a specific commit).
 + (BOOL)bds_createBranch:(NSString *)branchName
               atCommitSHA:(NSString *)commitSHA
                    config:(BundleDoctorConfig *)config
@@ -758,7 +1141,30 @@ totalBytesExpectedToSend:(int64_t)totalBytesExpectedToSend {
         @"ref": [NSString stringWithFormat:@"refs/heads/%@", branchName],
         @"sha": commitSHA,
     };
-    return [self bds_postJSON:urlPath body:body config:config error:error] != nil;
+    NSError *createError = nil;
+    if ([self bds_postJSON:urlPath body:body config:config error:&createError] != nil) return YES;
+
+    if ([self bds_errorIsAlreadyExists:createError]) {
+        ZLog(@"[BundleDoctorService] scratch branch %@ already exists (racing/leftover submission for the same bundle) - reusing it.", branchName);
+        return YES;
+    }
+    if (error) *error = createError;
+    return NO;
+}
+
+// GitHub's shape for "the ref/tag you tried to create is already taken"
+// - a 422 whose body mentions it, for both the git/refs (branch) and
+// releases (tag) endpoints (the latter nests it as an `errors[].code`
+// of "already_exists" on the "tag_name" field; the former just puts
+// "Reference already exists" straight in "message" - checking the raw
+// body for "already exists" catches both without parsing two different
+// shapes).
++ (BOOL)bds_errorIsAlreadyExists:(NSError *)error {
+    if (![error.domain isEqualToString:BundleDoctorServiceErrorDomain]) return NO;
+    if (error.code != BundleDoctorServiceErrorAPIError) return NO;
+    if (![error.userInfo[BundleDoctorServiceHTTPStatusKey] isEqual:@422]) return NO;
+    NSString *body = error.userInfo[BundleDoctorServiceResponseBodyKey];
+    return [body rangeOfString:@"already exists" options:NSCaseInsensitiveSearch].location != NSNotFound;
 }
 
 + (void)bds_deleteBranch:(NSString *)branchName config:(BundleDoctorConfig *)config {
@@ -799,8 +1205,29 @@ totalBytesExpectedToSend:(int64_t)totalBytesExpectedToSend {
         @"draft": @NO,
         @"prerelease": @YES,
     };
-    id result = [self bds_postJSON:urlPath body:body config:config error:error];
-    if (!result) return NO;
+    NSError *createError = nil;
+    id result = [self bds_postJSON:urlPath body:body config:config error:&createError];
+    if (!result) {
+        // Same race as +bds_createBranch:...'s own note just above it -
+        // a release already sitting on this deterministic tag (someone
+        // else's in-flight or abandoned submission for the identical
+        // bundle) isn't a failure, just look up its own upload_url
+        // instead of the one this call would have minted.
+        if ([self bds_errorIsAlreadyExists:createError]) {
+            ZLog(@"[BundleDoctorService] release tagged %@ already exists (racing/leftover submission for the same bundle) - reusing it.", tagName);
+            NSError *lookupError = nil;
+            NSDictionary *existing = [self bds_fetchReleaseByTag:tagName config:config error:&lookupError];
+            NSString *existingUploadURLTemplate = existing[@"upload_url"];
+            if ([existingUploadURLTemplate isKindOfClass:NSString.class]) {
+                if (outUploadURLTemplate) *outUploadURLTemplate = existingUploadURLTemplate;
+                return YES;
+            }
+            if (error) *error = lookupError ?: [self bds_errorWithCode:BundleDoctorServiceErrorAPIError description:@"Existing release had no upload_url."];
+            return NO;
+        }
+        if (error) *error = createError;
+        return NO;
+    }
 
     NSString *uploadURLTemplate = result[@"upload_url"];
     if (![uploadURLTemplate isKindOfClass:NSString.class]) {
@@ -911,11 +1338,31 @@ totalBytesExpectedToSend:(int64_t)totalBytesExpectedToSend {
     return [result isKindOfClass:NSDictionary.class] ? result : nil;
 }
 
+// Section 5's "check the releases tab first" - a plain GET against the
+// deterministic tag, not a dry run of the doctor pipeline. A release
+// existing with no BDS_OUTPUT_ASSET_NAME on it yet (someone else's
+// submission still mid-flight, or one that failed partway through) does
+// NOT count as a hit - only a release that already carries the finished
+// output asset does, matching the header's "no early-exit on a failed/
+// in-flight run" note.
++ (BOOL)bds_releaseAtTagHasOutputAsset:(NSString *)tagName config:(BundleDoctorConfig *)config {
+    NSError *lookupError = nil;
+    NSDictionary *release = [self bds_fetchReleaseByTag:tagName config:config error:&lookupError];
+    if (!release) return NO; // 404 (no such release yet) or a transient lookup error either way - fall through to a normal dispatch
+    NSArray *assets = release[@"assets"];
+    if (![assets isKindOfClass:NSArray.class]) return NO;
+    for (NSDictionary *asset in assets) {
+        if ([asset isKindOfClass:NSDictionary.class] && [asset[@"name"] isEqual:kBDSOutputAssetName]) return YES;
+    }
+    return NO;
+}
+
 // Looks up the release tagged releaseTag, finds the asset named `name`
 // on it, and downloads its bytes.
 + (BOOL)bds_downloadReleaseAssetNamed:(NSString *)name
                        fromReleaseTag:(NSString *)releaseTag
                                config:(BundleDoctorConfig *)config
+                             progress:(nullable void (^)(double fractionComplete))progress
                                  data:(NSData **)outData
                                 error:(NSError **)error {
     NSDictionary *release = [self bds_fetchReleaseByTag:releaseTag config:config error:error];
@@ -954,7 +1401,7 @@ totalBytesExpectedToSend:(int64_t)totalBytesExpectedToSend {
         return NO;
     }
 
-    NSData *data = [self bds_downloadBinaryAtAbsoluteURLString:assetAPIURL config:config error:error];
+    NSData *data = [self bds_downloadBinaryAtAbsoluteURLString:assetAPIURL config:config progress:progress error:error];
     if (!data) return NO;
     if (outData) *outData = data;
     return YES;
@@ -1145,6 +1592,7 @@ totalBytesExpectedToSend:(int64_t)totalBytesExpectedToSend {
 // returns the raw file instead of JSON metadata about it.
 + (nullable NSData *)bds_downloadBinaryAtAbsoluteURLString:(NSString *)urlString
                                                        config:(BundleDoctorConfig *)config
+                                                     progress:(nullable void (^)(double fractionComplete))progress
                                                         error:(NSError **)error {
     NSMutableURLRequest *request = [self bds_requestForAbsoluteURLString:urlString config:config];
     if (!request) {
@@ -1154,20 +1602,39 @@ totalBytesExpectedToSend:(int64_t)totalBytesExpectedToSend {
     [request setValue:@"application/octet-stream" forHTTPHeaderField:@"Accept"];
     request.HTTPMethod = @"GET";
 
+    // Download task, not a data task - see BDSDownloadProgressDelegate's
+    // own header comment on why that's what makes byte-level progress
+    // observable here at all. The finished file lands at a Foundation-
+    // owned temp URL that's deleted the moment this completion handler
+    // returns, so it's read into memory synchronously right here rather
+    // than handed back as a URL for some later caller to open.
     __block NSData *responseData = nil;
     __block NSHTTPURLResponse *httpResponse = nil;
     __block NSError *transportError = nil;
 
+    BDSDownloadProgressDelegate *delegate = [BDSDownloadProgressDelegate new];
+    delegate.onProgress = progress;
+    NSURLSession *session = [NSURLSession sessionWithConfiguration:NSURLSessionConfiguration.defaultSessionConfiguration
+                                                             delegate:delegate
+                                                        delegateQueue:nil];
+
     dispatch_semaphore_t sema = dispatch_semaphore_create(0);
-    NSURLSessionDataTask *task = [[NSURLSession sharedSession] dataTaskWithRequest:request
-                                                                    completionHandler:^(NSData *data, NSURLResponse *response, NSError *taskError) {
-        responseData = data;
+    NSURLSessionDownloadTask *task = [session downloadTaskWithRequest:request
+                                                      completionHandler:^(NSURL *location, NSURLResponse *response, NSError *taskError) {
         httpResponse = [response isKindOfClass:[NSHTTPURLResponse class]] ? (NSHTTPURLResponse *)response : nil;
         transportError = taskError;
+        if (location) {
+            NSError *readError = nil;
+            responseData = [NSData dataWithContentsOfURL:location options:0 error:&readError];
+            if (!responseData) {
+                ZLog(@"[BundleDoctorService] couldn't read downloaded temp file at %@: %@", location, readError);
+            }
+        }
         dispatch_semaphore_signal(sema);
     }];
     [task resume];
     dispatch_semaphore_wait(sema, DISPATCH_TIME_FOREVER);
+    [session finishTasksAndInvalidate];
 
     if (transportError) {
         if (error) {
@@ -1198,7 +1665,18 @@ totalBytesExpectedToSend:(int64_t)totalBytesExpectedToSend {
         return nil;
     }
 
-    return responseData ?: [NSData data];
+    if (!responseData) {
+        // 2xx status but the temp-file read above failed (logged there) -
+        // unlike the old data-task version, "request succeeded" and
+        // "bytes are actually in memory" are no longer the same event, so
+        // this has to be its own explicit failure instead of silently
+        // falling through to an empty NSData.
+        if (error) *error = [self bds_errorWithCode:BundleDoctorServiceErrorRequestFailed
+                                         description:@"Download succeeded but the temp file couldn't be read."];
+        return nil;
+    }
+
+    return responseData;
 }
 
 // Synchronous GET (blocks the calling background queue via a semaphore -

@@ -88,6 +88,26 @@ typedef NS_ENUM(NSInteger, BundleDoctorInstallerErrorCode) {
 // -gd_forceRestoreOriginalsTapped.
 + (NSInteger)restoreAllBackedUpBundlesForce:(BOOL)force error:(NSError **)error;
 
+// 7 "Cache bundle" - per-bundle counterpart to
+// +restoreAllBackedUpBundlesForce:error:, for swapping ONE live bundle
+// back to its backed-up original without touching any other installed
+// bundle. Looks up stockBundleURL's backup the same way (keyed by
+// stockBundleURL.lastPathComponent under +bundleBackupDirectory) and, if
+// found, overwrites stockBundleURL with the backup's bytes - the backup
+// itself is left in place either way (unlike a delete/reset flow, this
+// is meant to be reversible - see -gd_restoreStoredBundleEntry:inFolder:
+// in GraphicsDebugOverlay.m, which reinstalls over top of it later via
+// the ordinary +installDoctoredBundleAtURL:toStockBundleURL:error:,
+// relying on that method's own "second swap of the same file reuses the
+// existing backup" behavior to avoid re-backing-up what's already sitting
+// there as the true original). Returns NO with
+// BundleDoctorInstallerErrorBackupFailed if no backup is on file for this
+// bundle - shouldn't happen for anything the Mods panel offers "Cache
+// bundle" on, since that option only ever appears for an entry whose
+// doctorStatus is Installed, which is only reachable after a successful
+// +installDoctoredBundleAtURL:toStockBundleURL:error: call already made one.
++ (BOOL)cacheOriginalBackForStockBundleURL:(NSURL *)stockBundleURL error:(NSError **)error;
+
 // The nuclear option, for the Config section's "Hard Assets Reset" (see
 // GraphicsDebugOverlay.m). Unlike +restoreAllBackedUpBundlesWithError:,
 // this does NOT put the stock bytes back - it deletes, outright, the

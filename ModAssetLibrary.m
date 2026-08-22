@@ -7,6 +7,7 @@
 
 NSString * const ModAssetLibraryErrorDomain = @"ModAssetLibraryErrorDomain";
 static NSString * const kMALManifestFileName = @"manifest.json";
+static NSString * const kMALFolderRemarkFileName = @"remark.txt"; // 3.4.5 - see +remarkForFolder:/+setRemark:forFolder:error: in this header's own comment for why this is a sibling file rather than a manifest.json field
 
 static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
     return [NSError errorWithDomain:ModAssetLibraryErrorDomain
@@ -23,6 +24,8 @@ static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
     d[@"byteSize"] = @(self.byteSize);
     d[@"dateAdded"] = self.dateAdded;
     if (self.livePathDescription) d[@"livePathDescription"] = self.livePathDescription;
+    if (self.remark.length > 0) d[@"remark"] = self.remark; // same "only written when non-default" convention as the rest of this method
+    if (self.cachedFromFolder.length > 0) d[@"cachedFromFolder"] = self.cachedFromFolder; // 7 - only set while sitting in "Stored Bundles"
     if (self.isAssetBundle) d[@"isAssetBundle"] = @YES; // only written when true, same "stay compact" convention as the doctor-state fields below
     if (self.cabIdentifier) d[@"cabIdentifier"] = self.cabIdentifier;
     if (self.targetPlatform) d[@"targetPlatform"] = self.targetPlatform;
@@ -49,6 +52,8 @@ static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
     e.byteSize = [d[@"byteSize"] unsignedLongLongValue];
     e.dateAdded = [d[@"dateAdded"] isKindOfClass:NSString.class] ? d[@"dateAdded"] : @"";
     e.livePathDescription = [d[@"livePathDescription"] isKindOfClass:NSString.class] ? d[@"livePathDescription"] : nil;
+    e.remark = [d[@"remark"] isKindOfClass:NSString.class] ? d[@"remark"] : nil; // absent on any manifest row written before 3.4 - nil is the correct default (no remark set)
+    e.cachedFromFolder = [d[@"cachedFromFolder"] isKindOfClass:NSString.class] ? d[@"cachedFromFolder"] : nil; // 7 - absent for anything never cached
     // Absent entirely on any manifest row written before this field
     // existed - defaults to NO, same as a non-bundle entry, which is
     // the safest read for a row this class no longer has a way to
@@ -83,12 +88,17 @@ static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
 
 @interface ModAssetLibrary ()
 + (NSString *)mal_manifestPathForFolder:(NSString *)folderName;
++ (NSString *)mal_remarkPathForFolder:(NSString *)folderName;
 + (BOOL)mal_writeEntries:(NSArray<ModAssetLibraryEntry *> *)entries toFolder:(NSString *)folderName error:(NSError **)error;
 + (NSString *)mal_uniqueFileNameFor:(NSString *)desired inFolder:(NSString *)folderPath;
 + (nullable NSString *)mal_livePathDescriptionForFileName:(NSString *)fileName;
 @end
 
 @implementation ModAssetLibrary
+
++ (NSString *)liveGamePathDescriptionForInstalledURL:(NSURL *)installedURL {
+    return [self mal_sandboxRelativePath:installedURL.path];
+}
 
 + (NSString *)modLibraryRootDirectory {
     NSArray<NSString *> *paths = NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES);
@@ -100,6 +110,11 @@ static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
 + (NSString *)mal_manifestPathForFolder:(NSString *)folderName {
     return [[[self modLibraryRootDirectory] stringByAppendingPathComponent:folderName]
                 stringByAppendingPathComponent:kMALManifestFileName];
+}
+
++ (NSString *)mal_remarkPathForFolder:(NSString *)folderName {
+    return [[[self modLibraryRootDirectory] stringByAppendingPathComponent:folderName]
+                stringByAppendingPathComponent:kMALFolderRemarkFileName];
 }
 
 + (NSArray<NSString *> *)folderNames {
@@ -448,6 +463,129 @@ static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
     return [self mal_writeEntries:remaining toFolder:folderName error:error];
 }
 
+// 7 - see this method's own header in ModAssetLibrary.h for the full
+// contract. Copies rather than moves the underlying file (so a failure
+// partway through never leaves fromFolder's own copy gone with nothing
+// landed in toFolder) - the old file/CAB-subfolder is only removed from
+// fromFolder once the copy into toFolder (and both manifest writes)
+// have actually succeeded.
++ (nullable ModAssetLibraryEntry *)moveEntry:(ModAssetLibraryEntry *)entry
+                                   fromFolder:(NSString *)fromFolder
+                                     toFolder:(NSString *)toFolder
+                          replacementBytesURL:(nullable NSURL *)replacementBytesURL
+                                        error:(NSError **)error {
+    NSString *root = [self modLibraryRootDirectory];
+    NSString *toFolderPath = root ? [root stringByAppendingPathComponent:toFolder] : nil;
+    NSFileManager *fm = NSFileManager.defaultManager;
+    BOOL toIsDir = NO;
+    if (!toFolderPath || ![fm fileExistsAtPath:toFolderPath isDirectory:&toIsDir] || !toIsDir) {
+        if (error) *error = MALError(ModAssetLibraryErrorFolderNotFound,
+            [NSString stringWithFormat:@"No folder named \"%@\" - create it first.", toFolder]);
+        return nil;
+    }
+
+    NSError *fromEntriesErr = nil;
+    NSArray<ModAssetLibraryEntry *> *fromEntries = [self entriesInFolder:fromFolder error:&fromEntriesErr];
+    if (!fromEntries) {
+        if (error) *error = fromEntriesErr;
+        return nil;
+    }
+    BOOL foundInSource = NO;
+    for (ModAssetLibraryEntry *e in fromEntries) {
+        if ([e.path isEqualToString:entry.path]) { foundInSource = YES; break; }
+    }
+    if (!foundInSource) {
+        if (error) *error = MALError(ModAssetLibraryErrorEntryNotFound,
+            [NSString stringWithFormat:@"\"%@\" is no longer in \"%@\".", entry.fileName, fromFolder]);
+        return nil;
+    }
+
+    // Same CAB-subfolder-vs-flat placement decision +importFileURLs:
+    // intoFolder:error: makes at import time - a bundle-kind entry
+    // still needs its own CAB-named subfolder in toFolder (Unity's
+    // loader still requires the literal name "__data"), everything
+    // else just needs a unique flat name.
+    NSString *destPath = nil;
+    NSString *destName = entry.fileName;
+    if (entry.isAssetBundle && entry.cabIdentifier.length > 0) {
+        NSString *cabFolderName = [self mal_uniqueFolderNameFor:entry.cabIdentifier inParentFolder:toFolderPath];
+        NSString *cabFolderPath = [toFolderPath stringByAppendingPathComponent:cabFolderName];
+        NSError *mkdirErr = nil;
+        if (![fm createDirectoryAtPath:cabFolderPath withIntermediateDirectories:YES attributes:nil error:&mkdirErr]) {
+            if (error) *error = mkdirErr ?: MALError(ModAssetLibraryErrorCopyFailed, @"Couldn't create the destination folder.");
+            return nil;
+        }
+        destName = @"__data";
+        destPath = [cabFolderPath stringByAppendingPathComponent:destName];
+    } else {
+        destName = [self mal_uniqueFileNameFor:entry.fileName inFolder:toFolderPath];
+        destPath = [toFolderPath stringByAppendingPathComponent:destName];
+    }
+
+    NSError *copyErr = nil;
+    NSString *sourceForBytes = replacementBytesURL ? replacementBytesURL.path : entry.path;
+    BOOL copied = [fm copyItemAtPath:sourceForBytes toPath:destPath error:&copyErr];
+    if (!copied) {
+        if (error) *error = copyErr ?: MALError(ModAssetLibraryErrorCopyFailed,
+            [NSString stringWithFormat:@"Couldn't move \"%@\" into \"%@\".", entry.fileName, toFolder]);
+        return nil;
+    }
+
+    NSDictionary<NSFileAttributeKey, id> *attrs = [fm attributesOfItemAtPath:destPath error:nil];
+
+    ModAssetLibraryEntry *movedEntry = [ModAssetLibraryEntry new];
+    movedEntry.fileName = destName;
+    movedEntry.path = destPath;
+    movedEntry.byteSize = attrs.fileSize;
+    movedEntry.dateAdded = entry.dateAdded;
+    movedEntry.livePathDescription = entry.livePathDescription;
+    movedEntry.remark = entry.remark;
+    movedEntry.isAssetBundle = entry.isAssetBundle;
+    movedEntry.cabIdentifier = entry.cabIdentifier;
+    movedEntry.targetPlatform = entry.targetPlatform;
+    movedEntry.cachedFromFolder = entry.cachedFromFolder;
+    movedEntry.doctorStatus = entry.doctorStatus;
+    movedEntry.doctorUploadProgress = entry.doctorUploadProgress;
+    movedEntry.doctorProcessProgress = entry.doctorProcessProgress;
+    movedEntry.doctorDownloadProgress = entry.doctorDownloadProgress;
+    movedEntry.doctorScratchBranch = entry.doctorScratchBranch;
+    movedEntry.doctorRunID = entry.doctorRunID;
+    movedEntry.doctorRunURL = entry.doctorRunURL;
+    movedEntry.doctorLastError = entry.doctorLastError;
+
+    NSMutableArray<ModAssetLibraryEntry *> *toEntries =
+        [([self entriesInFolder:toFolder error:nil] ?: @[]) mutableCopy];
+    [toEntries addObject:movedEntry];
+    NSError *toWriteErr = nil;
+    if (![self mal_writeEntries:toEntries toFolder:toFolder error:&toWriteErr]) {
+        [fm removeItemAtPath:destPath error:nil]; // roll back the copy - fromFolder is still untouched at this point
+        if (error) *error = toWriteErr;
+        return nil;
+    }
+
+    // Only now that toFolder's manifest safely references the new copy
+    // do we remove the old one - same "copy first, delete once the new
+    // side is durable" ordering as the rest of this method.
+    NSMutableArray<ModAssetLibraryEntry *> *remainingInSource = [NSMutableArray arrayWithCapacity:fromEntries.count];
+    for (ModAssetLibraryEntry *e in fromEntries) {
+        if (![e.path isEqualToString:entry.path]) [remainingInSource addObject:e];
+    }
+    [fm removeItemAtPath:entry.path error:nil];
+    NSString *fromFolderPath = root ? [root stringByAppendingPathComponent:fromFolder] : nil;
+    NSString *entryDir = entry.path.stringByDeletingLastPathComponent;
+    if (fromFolderPath && ![entryDir isEqualToString:fromFolderPath]) {
+        NSArray<NSString *> *remainingInDir = [fm contentsOfDirectoryAtPath:entryDir error:nil];
+        if (remainingInDir.count == 0) [fm removeItemAtPath:entryDir error:nil];
+    }
+    NSError *fromWriteErr = nil;
+    if (![self mal_writeEntries:remainingInSource toFolder:fromFolder error:&fromWriteErr]) {
+        ZLog(@"[ModAssetLibrary] moved %@ into \"%@\" but couldn't drop its old row from \"%@\": %@ (file now tracked in both folders' manifests until this is retried)",
+             entry.fileName, toFolder, fromFolder, fromWriteErr.localizedDescription);
+    }
+
+    return movedEntry;
+}
+
 + (nullable ModAssetLibraryEntry *)updateDoctorStateForEntry:(ModAssetLibraryEntry *)entry
                                                       inFolder:(NSString *)folderName
                                                     applyBlock:(void (NS_NOESCAPE ^)(ModAssetLibraryEntry *entryToMutate))applyBlock
@@ -531,6 +669,48 @@ static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
     if (![fm moveItemAtPath:oldPath toPath:newPath error:&moveErr]) {
         if (error) *error = moveErr ?: MALError(ModAssetLibraryErrorDeleteFailed,
             [NSString stringWithFormat:@"Couldn't rename \"%@\".", folderName]);
+        return NO;
+    }
+    return YES;
+}
+
+// 3.4.5 - see this method's own header comment in ModAssetLibrary.h for
+// why this reads a sibling file instead of a manifest.json field. A
+// missing/unreadable remark.txt (never set, or the folder itself is
+// gone) is treated the same as an empty one - nil either way, nothing
+// to surface.
++ (nullable NSString *)remarkForFolder:(NSString *)folderName {
+    NSString *path = [self mal_remarkPathForFolder:folderName];
+    NSString *contents = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:nil];
+    NSString *trimmed = [contents stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    return trimmed.length > 0 ? trimmed : nil;
+}
+
++ (BOOL)setRemark:(nullable NSString *)remark forFolder:(NSString *)folderName error:(NSError **)error {
+    NSString *root = [self modLibraryRootDirectory];
+    NSString *folderPath = root ? [root stringByAppendingPathComponent:folderName] : nil;
+    NSFileManager *fm = NSFileManager.defaultManager;
+    BOOL isDir = NO;
+    if (!folderPath || ![fm fileExistsAtPath:folderPath isDirectory:&isDir] || !isDir) {
+        if (error) *error = MALError(ModAssetLibraryErrorFolderNotFound,
+            [NSString stringWithFormat:@"No folder named \"%@\".", folderName]);
+        return NO;
+    }
+
+    NSString *trimmed = [remark stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    NSString *path = [self mal_remarkPathForFolder:folderName];
+    if (trimmed.length == 0) {
+        // Best-effort - "no remark" is the only state that matters here,
+        // not whether a stale file happened to still be sitting there
+        // (e.g. it never existed in the first place - same "already
+        // clean is success" convention +deleteAllFoldersWithError: uses).
+        [fm removeItemAtPath:path error:nil];
+        return YES;
+    }
+
+    NSError *writeErr = nil;
+    if (![trimmed writeToFile:path atomically:YES encoding:NSUTF8StringEncoding error:&writeErr]) {
+        if (error) *error = writeErr ?: MALError(ModAssetLibraryErrorManifestWriteFailed, @"Couldn't save the folder's remark.");
         return NO;
     }
     return YES;
