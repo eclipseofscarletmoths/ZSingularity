@@ -1011,6 +1011,18 @@ didFinishDownloadingToURL:(NSURL *)location {
 
 #pragma mark - Processed Bundles listing (6)
 
+// Reopens BundleDoctorService's own @implementation (not a category -
+// this needs to be the primary implementation so it satisfies the
+// bds_ declarations in the class-continuation interface above; a
+// named category wouldn't). Split into two @implementation blocks
+// purely because BundleDoctorProcessedRelease's own @implementation
+// sits physically between them in this file - multiple primary
+// @implementation blocks for one class in the same translation unit
+// is valid, unlike nesting one @implementation inside another (which
+// is what this file had before the "no known class method"/"missing
+// context for method declaration" build failures - see progress.md).
+@implementation BundleDoctorService
+
 + (void)listProcessedReleasesForConfig:(BundleDoctorConfig *)rawConfig
                               completion:(void (^)(NSArray<BundleDoctorProcessedRelease *> * _Nullable, NSError * _Nullable))completion {
     void (^finish)(NSArray<BundleDoctorProcessedRelease *> * _Nullable, NSError * _Nullable) =
