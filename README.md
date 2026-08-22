@@ -27,3 +27,7 @@ None of this touches `LocalGameOptionData` or the save system - values are live/
 - `UnityBundleCAB.h` / `.m` - reads a UnityFS archive's own directory table to recover its real identity: the `CAB-<hash>` name stored as node[0], which is the one reliable way to tell a bundle's own name apart from the many other CAB strings referenced inside it (shared dependencies). Back in this build after being retired along with the old `BundleTransplant.m` - see `UnityCacheLocator.h` for its new caller.
 - `UnityCacheLocator.h` / `.m` - the CAB-based bundle lookup this project used to have, reimplemented as its own class: reads the CAB off a modded/doctored bundle, then searches `Library/UnityCache/Shared` for a cached file that reports the same CAB as its own identity. Lets the doctor pipeline (`BundleDoctorService.h`/`BundleDoctorInstaller.h`) skip the manual "pick the stock bundle" file-picker step when a match is found, falling back to that picker otherwise.
 
+`GameEngineControl.h`/`.m` doesn't exist - earlier versions of this README described it as the intended home for the engine calls above, but it was never actually built. `GDScripts.h`/`.m` is that file, under a different name.
+
+
+Bank-kind mods (`BankTransplant.h`/`.m`, a direct FMOD `.bank` byte swap with no Unity object parsing involved) and the network manifest patch (`PatchManifestNetwork.h`/`.m`) are unaffected and still work.

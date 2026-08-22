@@ -335,6 +335,76 @@ didFinishDownloadingToURL:(NSURL *)location {
 
 #pragma mark - BundleDoctorService
 
+// Private class-continuation - every bds_-prefixed helper the class's
+// public methods call is implemented further down in this same
+// @implementation (grep for each one), but several are called from
+// code that appears above their own implementation textually (e.g.
+// -dispatchBundleAtURL:... below calls +bds_createBranch:... long
+// before that method's own definition). Objective-C class methods sent
+// to `self` inside a class method need a declaration visible before
+// the call site or the compiler can't resolve the selector - same
+// reason ModAssetLibrary.m has its own private mal_-prefixed block
+// above +[ModAssetLibrary ...]'s @implementation. Kept in the same
+// declaration order the methods are actually implemented in below.
+@interface BundleDoctorService ()
++ (nullable NSData *)bds_findOriginalBundleDataForModdedBundleAtPath:(NSString *)moddedBundlePath;
++ (BOOL)bds_resolveBaseCommitSHA:(NSString **)outCommitSHA
+                          config:(BundleDoctorConfig *)config
+                           error:(NSError **)error;
++ (BOOL)bds_createBranch:(NSString *)branchName
+              atCommitSHA:(NSString *)commitSHA
+                   config:(BundleDoctorConfig *)config
+                    error:(NSError **)error;
++ (BOOL)bds_errorIsAlreadyExists:(NSError *)error;
++ (void)bds_deleteBranch:(NSString *)branchName config:(BundleDoctorConfig *)config;
++ (BOOL)bds_createReleaseWithTagName:(NSString *)tagName
+                       targetCommitish:(NSString *)targetCommitish
+                                config:(BundleDoctorConfig *)config
+                  outUploadURLTemplate:(NSString **)outUploadURLTemplate
+                                 error:(NSError **)error;
++ (BOOL)bds_uploadReleaseAssetData:(NSData *)data
+                                name:(NSString *)name
+                   uploadURLTemplate:(NSString *)uploadURLTemplate
+                            progress:(nullable void (^)(double fractionComplete))progress
+                              config:(BundleDoctorConfig *)config
+                               error:(NSError **)error;
++ (nullable NSDictionary *)bds_fetchReleaseByTag:(NSString *)tagName config:(BundleDoctorConfig *)config error:(NSError **)error;
++ (BOOL)bds_releaseAtTagHasOutputAsset:(NSString *)tagName config:(BundleDoctorConfig *)config;
++ (BOOL)bds_downloadReleaseAssetNamed:(NSString *)name
+                       fromReleaseTag:(NSString *)releaseTag
+                               config:(BundleDoctorConfig *)config
+                             progress:(nullable void (^)(double fractionComplete))progress
+                                 data:(NSData **)outData
+                                error:(NSError **)error;
++ (void)bds_deleteReleaseWithTag:(NSString *)tagName config:(BundleDoctorConfig *)config;
++ (void)bds_cleanupScratchSubmission:(NSString *)scratchBranch config:(BundleDoctorConfig *)config;
++ (BOOL)bds_dispatchWorkflowOnBranch:(NSString *)branchName
+                                config:(BundleDoctorConfig *)config
+                                 error:(NSError **)error;
++ (BOOL)bds_findRunOnBranch:(NSString *)branchName
+             dispatchedAfter:(NSDate *)dispatchedAt
+                      config:(BundleDoctorConfig *)config
+                       runID:(NSString **)outRunID
+                      runURL:(NSString **)outRunURL
+                       error:(NSError **)error;
++ (BOOL)bds_waitForRunCompletion:(NSString *)runID
+                            runURL:(NSString *)runURL
+                            config:(BundleDoctorConfig *)config
+                             error:(NSError **)error;
++ (nullable NSMutableURLRequest *)bds_requestForAbsoluteURLString:(NSString *)urlString config:(BundleDoctorConfig *)config;
++ (nullable NSMutableURLRequest *)bds_requestForPath:(NSString *)path config:(BundleDoctorConfig *)config;
++ (nullable NSData *)bds_downloadBinaryAtAbsoluteURLString:(NSString *)urlString
+                                                       config:(BundleDoctorConfig *)config
+                                                     progress:(nullable void (^)(double fractionComplete))progress
+                                                        error:(NSError **)error;
++ (nullable id)bds_getJSON:(NSString *)path config:(BundleDoctorConfig *)config error:(NSError **)error;
++ (nullable id)bds_postJSON:(NSString *)path body:(NSDictionary *)body config:(BundleDoctorConfig *)config error:(NSError **)error;
++ (BOOL)bds_deleteJSON:(NSString *)path config:(BundleDoctorConfig *)config error:(NSError **)error;
++ (nullable id)bds_performJSONRequest:(NSURLRequest *)request expectBody:(BOOL)expectBody error:(NSError **)error;
++ (NSDateFormatter *)bds_iso8601Formatter;
++ (NSError *)bds_errorWithCode:(BundleDoctorServiceErrorCode)code description:(NSString *)description;
+@end
+
 @implementation BundleDoctorService
 
 + (BOOL)isUploadCompressionEnabled {
@@ -901,6 +971,8 @@ didFinishDownloadingToURL:(NSURL *)location {
         finish(repo != nil, error);
     });
 }
+
+@end
 
 #pragma mark - BundleDoctorProcessedRelease
 
