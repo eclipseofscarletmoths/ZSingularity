@@ -8024,6 +8024,45 @@ static NSURL *gd_mods_live_stock_url_for_entry(ModAssetLibraryEntry *entry) {
 
 // Step 3 - the actual on-disk swap, then final bookkeeping.
 - (void)gd_doctorInstallDoctoredURL:(NSURL *)doctoredURL toStockBundleURL:(NSURL *)stockBundleURL entryPath:(NSString *)entryPath inFolder:(NSString *)folderName {
+    // The doctored bytes have to completely replace BOTH copies this
+    // tweak is tracking - the mod library's own un-encoded copy at
+    // entryPath, and the game's live copy at stockBundleURL - not just
+    // the latter. Previously only stockBundleURL ever got the new
+    // bytes; entryPath kept the original pre-doctor file forever, so
+    // anything that later reads the library's own copy (re-importing
+    // this bundle to send it through again, "Cache bundle", a future
+    // re-dispatch) was silently working from stale data even though
+    // the row displayed fresh post-doctor stats (see this method's own
+    // stats-refresh block below, which reads doctoredURL directly for
+    // exactly that reason).
+    //
+    // Library copy goes first, per spec: it's a plain in-sandbox
+    // overwrite with nothing to back up (unlike stockBundleURL, which
+    // BundleDoctorInstaller backs up before touching), so if this fails
+    // there's no reason to risk touching the game's files at all -
+    // bail out before it, same as any other pre-install failure.
+    NSError *readErr = nil;
+    NSData *doctoredData = [NSData dataWithContentsOfURL:doctoredURL options:0 error:&readErr];
+    if (!doctoredData) {
+        [self.doctorDownloadInFlightPaths removeObject:entryPath];
+        UINotificationFeedbackGenerator *haptic = [UINotificationFeedbackGenerator new];
+        [haptic notificationOccurred:UINotificationFeedbackTypeError];
+        [self gd_presentModsAlertWithTitle:@"Install Failed"
+                                    message:readErr.localizedDescription ?: @"Couldn't read the doctored bundle."];
+        [self gd_rebuildModsLibrary];
+        return;
+    }
+    NSError *libraryWriteErr = nil;
+    if (![doctoredData writeToFile:entryPath options:NSDataWritingAtomic error:&libraryWriteErr]) {
+        [self.doctorDownloadInFlightPaths removeObject:entryPath];
+        UINotificationFeedbackGenerator *haptic = [UINotificationFeedbackGenerator new];
+        [haptic notificationOccurred:UINotificationFeedbackTypeError];
+        [self gd_presentModsAlertWithTitle:@"Install Failed"
+                                    message:libraryWriteErr.localizedDescription ?: @"Couldn't update the mod library's own copy."];
+        [self gd_rebuildModsLibrary];
+        return;
+    }
+
     NSError *installError = nil;
     BOOL installed = [BundleDoctorInstaller installDoctoredBundleAtURL:doctoredURL toStockBundleURL:stockBundleURL error:&installError];
     [self.doctorDownloadInFlightPaths removeObject:entryPath];
