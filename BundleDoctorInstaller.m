@@ -1,26 +1,49 @@
 #import "BundleDoctorInstaller.h"
 #import "ZTweakLog.h"
+#import "GDScripts.h" // gd_track_asset_path - see that file's header
+#import "ModAssetLibrary.h" // originalBundleBackupsDirectory - see +bundleBackupDirectory below
 
 NSString * const BundleDoctorInstallerErrorDomain = @"BundleDoctorInstallerErrorDomain";
 
 static NSString * const kBackupSuffix = @".orig-bak";
 
-// Small JSON manifest mapping "<name>.orig-bak" -> the ORIGINAL full
-// path it was backed up from. Needed because (unlike BankTransplant,
-// which always restores into one fixed, known directory) a stock
-// bundle's location here is whatever the person picked at install
-// time - see BundleDoctorInstaller.h's header on why this class
-// doesn't assume a fixed AssetBundles directory. Lives inside
-// +bundleBackupDirectory itself, next to the backups it describes.
+// Small JSON manifest mapping a backup key (see
+// +bds_backupKeyForStockBundleURL: below) -> the ORIGINAL full path it
+// was backed up from. Needed because (unlike BankTransplant, which
+// always restores into one fixed, known directory) a stock bundle's
+// location here is whatever the person picked at install time - see
+// BundleDoctorInstaller.h's header on why this class doesn't assume a
+// fixed AssetBundles directory. Lives inside +bundleBackupDirectory
+// itself, next to the backups it describes.
 static NSString * const kManifestFileName = @"manifest.json";
 
 @implementation BundleDoctorInstaller
 
 + (NSString *)bundleBackupDirectory {
-    NSArray<NSString *> *libraryPaths = NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES);
-    NSString *libraryDir = libraryPaths.firstObject;
-    if (!libraryDir) return nil;
-    return [libraryDir stringByAppendingPathComponent:@"ZSingularityBundleBackups"];
+    return [ModAssetLibrary originalBundleBackupsDirectory];
+}
+
+// 10 - stockBundleURL's full path, not just its last path component,
+// turned into a filesystem-safe key: a short human-recognizable prefix
+// (the leaf name every stock bundle shares, e.g. "__data") plus a
+// deterministic hash of the FULL path, which is what actually tells one
+// stock bundle's location apart from another's - see this class's
+// header for why lastPathComponent alone isn't enough. FNV-1a rather
+// than a CommonCrypto digest since this only needs to be
+// collision-resistant and stable across runs of this same process, not
+// cryptographically secure, and avoids pulling in another framework
+// dependency for it.
++ (NSString *)bds_backupKeyForStockBundleURL:(NSURL *)stockBundleURL {
+    NSString *path = stockBundleURL.path ?: stockBundleURL.absoluteString ?: @"";
+    uint64_t hash = 1469598103934665603ULL; // FNV-1a 64-bit offset basis
+    const char *bytes = path.UTF8String;
+    if (bytes) {
+        for (; *bytes != '\0'; bytes++) {
+            hash ^= (uint64_t)(uint8_t)*bytes;
+            hash *= 1099511628211ULL; // FNV-1a 64-bit prime
+        }
+    }
+    return [NSString stringWithFormat:@"%@-%016llx", path.lastPathComponent ?: @"backup", hash];
 }
 
 + (BOOL)bds_ensureBackupDirectoryExists:(NSError **)error {
@@ -96,14 +119,21 @@ static NSString * const kManifestFileName = @"manifest.json";
     // picker-sourced URLs.
     BOOL scoped = [stockBundleURL startAccessingSecurityScopedResource];
 
-    NSString *name = stockBundleURL.lastPathComponent;
-    NSString *backupPath = [[self bundleBackupDirectory] stringByAppendingPathComponent:[name stringByAppendingString:kBackupSuffix]];
+    // 10 - keyed by the full path (see +bds_backupKeyForStockBundleURL:),
+    // not stockBundleURL.lastPathComponent - every stock bundle's leaf
+    // file is always literally named "__data", so a lastPathComponent-
+    // only key made every bundle's backup collide on the same name and
+    // silently skip backing up anything but the first one ever installed.
+    NSString *backupKey = [self bds_backupKeyForStockBundleURL:stockBundleURL];
+    NSString *backupPath = [[self bundleBackupDirectory] stringByAppendingPathComponent:[backupKey stringByAppendingString:kBackupSuffix]];
     NSFileManager *fm = [NSFileManager defaultManager];
 
-    // One-time backup: only ever written if this exact name hasn't been
-    // backed up before, same "never-overwritten" guarantee BankTransplant
-    // gives its own backups - so repeated swaps of the same bundle always
-    // trace back to the true original, not to a previous mod.
+    // One-time backup: only ever written if this exact stock location
+    // hasn't been backed up before, same "never-overwritten" guarantee
+    // BankTransplant gives its own backups - so repeated swaps of the
+    // same bundle always trace back to the true original, not to a
+    // previous mod, and a DIFFERENT bundle installed over a different
+    // stock location can never clobber this one's backup.
     if (![fm fileExistsAtPath:backupPath]) {
         NSError *backupError = nil;
         if (![fm copyItemAtURL:stockBundleURL toURL:[NSURL fileURLWithPath:backupPath] error:&backupError]) {
@@ -117,7 +147,7 @@ static NSString * const kManifestFileName = @"manifest.json";
         }
 
         NSMutableDictionary<NSString *, NSString *> *manifest = [self bds_loadManifest];
-        manifest[name] = stockBundleURL.path;
+        manifest[backupKey] = stockBundleURL.path;
         [self bds_writeManifest:manifest];
     }
 
@@ -134,6 +164,12 @@ static NSString * const kManifestFileName = @"manifest.json";
 
     if (scoped) [stockBundleURL stopAccessingSecurityScopedResource];
     ZLog(@"[BundleDoctorInstaller] installed doctored bundle at %@", stockBundleURL.path);
+
+    // Independent of this class's own manifest.json bookkeeping - see
+    // GDScripts.h's gd_track_asset_path() header for why Hard Assets
+    // Reset needs this logged separately.
+    gd_track_asset_path(stockBundleURL.path);
+
     return YES;
 }
 
@@ -172,9 +208,9 @@ static NSString * const kManifestFileName = @"manifest.json";
     NSFileManager *fm = [NSFileManager defaultManager];
     NSInteger restored = 0;
 
-    for (NSString *name in manifest) {
-        NSString *originalPath = manifest[name];
-        NSString *backupPath = [dir stringByAppendingPathComponent:[name stringByAppendingString:kBackupSuffix]];
+    for (NSString *backupKey in manifest) {
+        NSString *originalPath = manifest[backupKey];
+        NSString *backupPath = [dir stringByAppendingPathComponent:[backupKey stringByAppendingString:kBackupSuffix]];
         if (![fm fileExistsAtPath:backupPath] || originalPath.length == 0) continue;
 
         if (!force && [self bds_fileAtPath:originalPath hasIdenticalBytesToFileAtPath:backupPath]) {
@@ -188,7 +224,7 @@ static NSString * const kManifestFileName = @"manifest.json";
         if ([backupData writeToFile:originalPath options:NSDataWritingAtomic error:&writeError]) {
             restored++;
         } else {
-            ZLog(@"[BundleDoctorInstaller] couldn't restore %@ to %@: %@", name, originalPath, writeError);
+            ZLog(@"[BundleDoctorInstaller] couldn't restore %@ to %@: %@", backupKey, originalPath, writeError);
         }
     }
 
@@ -201,8 +237,8 @@ static NSString * const kManifestFileName = @"manifest.json";
 
 + (BOOL)cacheOriginalBackForStockBundleURL:(NSURL *)stockBundleURL error:(NSError **)error {
     NSString *dir = [self bundleBackupDirectory];
-    NSString *name = stockBundleURL.lastPathComponent;
-    NSString *backupPath = dir ? [dir stringByAppendingPathComponent:[name stringByAppendingString:kBackupSuffix]] : nil;
+    NSString *backupKey = [self bds_backupKeyForStockBundleURL:stockBundleURL];
+    NSString *backupPath = dir ? [dir stringByAppendingPathComponent:[backupKey stringByAppendingString:kBackupSuffix]] : nil;
 
     NSFileManager *fm = NSFileManager.defaultManager;
     if (!backupPath || ![fm fileExistsAtPath:backupPath]) {
@@ -238,42 +274,12 @@ static NSString * const kManifestFileName = @"manifest.json";
         return NO;
     }
 
-    ZLog(@"[BundleDoctorInstaller] cached %@ - live bytes swapped back to the backed-up original", name);
+    ZLog(@"[BundleDoctorInstaller] cached %@ - live bytes swapped back to the backed-up original", stockBundleURL.lastPathComponent);
     return YES;
 }
 
-// Same manifest walk as +restoreAllBackedUpBundlesWithError:, but
-// deletes the live file at each logged originalPath instead of
-// overwriting it with the backup's bytes, then deletes bundleBackupDirectory
-// itself (manifest.json and every .orig-bak in it) once the walk is
-// done - see this method's header comment for why this is "forget it
-// ever happened", not a restore.
-+ (NSInteger)deleteAllTrackedBundlesAndBackupsWithError:(NSError **)error {
-    NSString *dir = [self bundleBackupDirectory];
-    if (!dir || ![[NSFileManager defaultManager] fileExistsAtPath:dir]) return 0;
-
-    NSDictionary<NSString *, NSString *> *manifest = [self bds_loadManifest];
-    NSFileManager *fm = [NSFileManager defaultManager];
-    NSInteger deleted = 0;
-
-    for (NSString *name in manifest) {
-        NSString *originalPath = manifest[name];
-        if (originalPath.length == 0 || ![fm fileExistsAtPath:originalPath]) continue;
-
-        NSError *removeErr = nil;
-        if ([fm removeItemAtPath:originalPath error:&removeErr]) {
-            deleted++;
-        } else {
-            ZLog(@"[BundleDoctorInstaller] hard reset: couldn't delete live bundle %@: %@", originalPath, removeErr.localizedDescription);
-        }
-    }
-
-    // Backups (and the manifest logging where they came from) have done
-    // their job - clear the whole directory so nothing outlives the
-    // reset it was supposed to be part of.
-    [fm removeItemAtPath:dir error:nil];
-
-    return deleted;
-}
+// +deleteAllTrackedBundlesAndBackupsWithError: used to live here - see
+// the NOTE at the bottom of BundleDoctorInstaller.h for why Hard Assets
+// Reset no longer discovers what to delete by reading manifest.json.
 
 @end

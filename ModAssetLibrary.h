@@ -128,8 +128,35 @@ typedef NS_ENUM(NSInteger, ModAssetLibraryDoctorStatus) {
 // (+importFileURLs:intoFolder:error:), and never recomputed after. For
 // a bundle entry: resolved on first successful install, and refreshed
 // on every subsequent one (same stock location each time in practice,
-// but re-set rather than assumed).
+// but re-set rather than assumed). Until a bundle entry has actually
+// been installed, GraphicsDebugOverlay.m's Filepath display falls back
+// to resolvedInstallTargetPath below (the same kind of path, just not
+// yet proven live) rather than straight to entry.path (this file's own
+// on-disk Mod Asset Library copy).
 @property (nonatomic, copy, nullable) NSString *livePathDescription;
+
+// The real in-game (or Unity-cache) destination this bundle is known to
+// map to, resolved via CAB-based cache lookup (+[UnityCacheLocator
+// locateBundlePathForCAB:error:]) exactly ONCE, at IMPORT time - see
+// +importFileURLs:intoFolder:error:. Stored the same NSHomeDirectory()-
+// relative way as livePathDescription (+mal_sandboxRelativePath:), but
+// kept as its OWN field rather than writing straight into
+// livePathDescription: livePathDescription's whole contract (see its own
+// comment above) is "this bundle has actually been swapped in here
+// before" - several call sites (e.g. GraphicsDebugOverlay.m's
+// -gd_restoreStoredBundleEntry:inFolder:) use its mere presence to mean
+// exactly that, deciding whether there's a live install worth touching.
+// Resolving a target at import time, before any install has happened,
+// must not retroactively make those call sites think an install
+// occurred - hence the separate field. nil for a non-bundle entry, or a
+// bundle whose CAB couldn't be read, or one the cache search found no
+// match for at import time (the game hasn't downloaded/cached that asset
+// yet); the doctor pipeline's download step falls back to the manual
+// "pick a stock bundle" picker in that case, same as if this field
+// didn't exist. Never re-resolved after import - see GraphicsDebugOverlay.m's
+// -gd_doctorInstallUsingKnownTargetForDoctoredURL:entryPath:inFolder:,
+// which reads this instead of re-running the cache search a second time.
+@property (nonatomic, copy, nullable) NSString *resolvedInstallTargetPath;
 
 // Freeform note the person attaches via the file's own "..." options
 // dropdown's "Add remark" action (GraphicsDebugOverlay.m's
@@ -198,8 +225,24 @@ typedef NS_ENUM(NSInteger, ModAssetLibraryDoctorStatus) {
 // placement as +bankBackupDirectory/+bundleBackupDirectory.
 + (NSString *)modLibraryRootDirectory;
 
+// 10 - a reserved, internal subdirectory of +modLibraryRootDirectory
+// where BundleDoctorInstaller keeps its one-time-per-original stock
+// bundle backups, per the person's own spec that these live "in the
+// asset library" rather than off in a wholly separate Library
+// directory of their own (which is where they lived before this).
+// Deliberately NOT surfaced by +folderNames (see that method) - this
+// isn't a mod folder the person created or can see/rename/delete
+// through the ordinary accordion UI, it's this class's own backing
+// store, same spirit as manifest.json/remark.txt being sibling files
+// the person never sees directly rather than library entries.
+// BundleDoctorInstaller is this directory's only caller/owner; nothing
+// here reads or writes backup files itself.
++ (NSString *)originalBundleBackupsDirectory;
+
 // Every existing folder name, alphabetical. Empty (not nil) if the root
-// doesn't exist yet - i.e. nothing's been added.
+// doesn't exist yet - i.e. nothing's been added. Excludes
+// +originalBundleBackupsDirectory's own directory name (10) - that's
+// this class's internal backing store, not a folder the person made.
 + (NSArray<NSString *> *)folderNames;
 
 // Creates an empty folder (and its manifest.json) under
@@ -351,9 +394,9 @@ typedef NS_ENUM(NSInteger, ModAssetLibraryDoctorStatus) {
 // +unityCacheSharedDirectory/+mobileFMODBuildsDirectory or either
 // backup directory) - this is the Config section's "Hard Assets Reset"
 // clearing its own bookkeeping, not the game-file deletion side of that
-// action (see +[BankTransplant deleteAllTrackedBanksAndBackupsWithError:]
-// / +[BundleDoctorInstaller deleteAllTrackedBundlesAndBackupsWithError:]
-// for that). Same "already-clean is success, not failure" convention as
+// action (see GraphicsDebugOverlay.m's -hardAssetsResetTapped, which
+// drives that side from GDScripts.h's gd_tracked_asset_paths() log
+// instead). Same "already-clean is success, not failure" convention as
 // +[BundleDoctorSettings clearAllWithError:] - returns YES if the end
 // state is "nothing stored", even if the root directory never existed.
 + (BOOL)deleteAllFoldersWithError:(NSError **)error;

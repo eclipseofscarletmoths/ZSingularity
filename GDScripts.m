@@ -533,6 +533,7 @@ BOOL      g_ditheringOn    = NO;
 NSInteger g_menuFPS        = 60;
 NSInteger g_combatFPS      = 60;
 NSArray<NSString *> *g_syslogBlacklist = nil;
+NSMutableArray<NSString *> *g_trackedAssetPaths = nil;
 
 #pragma mark - Settings persistence (JSON in Documents)
 //
@@ -577,7 +578,55 @@ void gd_write_settings_dictionary(NSDictionary *dict) {
     }
 }
 
+#pragma mark - Tracked asset paths (Hard Assets Reset)
+//
+// See GDScripts.h for why this exists. g_trackedAssetPaths is loaded
+// lazily (once) from whatever's already on disk rather than assuming
+// buildPanel's own settings-load has run first - a bank/bundle swap can
+// happen before the graphics panel is ever built.
+
+static void gd_ensure_tracked_asset_paths_loaded(void) {
+    if (g_trackedAssetPaths) return;
+    NSDictionary *saved = gd_load_settings_dictionary();
+    NSArray *savedPaths = [saved[@"trackedAssetPaths"] isKindOfClass:[NSArray class]] ? saved[@"trackedAssetPaths"] : nil;
+    g_trackedAssetPaths = [NSMutableArray new];
+    for (id path in savedPaths) {
+        if ([path isKindOfClass:[NSString class]]) [g_trackedAssetPaths addObject:path];
+    }
+}
+
+void gd_track_asset_path(NSString *path) {
+    if (path.length == 0) return;
+    gd_ensure_tracked_asset_paths_loaded();
+    if ([g_trackedAssetPaths containsObject:path]) return;
+    [g_trackedAssetPaths addObject:path];
+    // Persisted immediately (not just held in memory until the next
+    // unrelated settings save) - a swap that isn't followed by any
+    // graphics-slider change this session still needs to survive a
+    // relaunch for Hard Assets Reset to find it later.
+    gd_write_settings_dictionary(gd_current_settings_dictionary());
+}
+
+NSArray<NSString *> *gd_tracked_asset_paths(void) {
+    gd_ensure_tracked_asset_paths_loaded();
+    return [g_trackedAssetPaths copy];
+}
+
+void gd_clear_tracked_asset_paths(void) {
+    gd_ensure_tracked_asset_paths_loaded();
+    [g_trackedAssetPaths removeAllObjects];
+    gd_write_settings_dictionary(gd_current_settings_dictionary());
+}
+
 NSDictionary *gd_current_settings_dictionary(void) {
+    // Every snapshot - even one triggered by an unrelated graphics
+    // slider - must include whatever's currently tracked, or a save
+    // from before any track/clear call this session would silently
+    // drop the key gd_write_settings_dictionary() below is about to
+    // overwrite the file with (that function is a full replace, not a
+    // merge - see its own header).
+    gd_ensure_tracked_asset_paths_loaded();
+
     NSMutableDictionary *urp = [NSMutableDictionary new];
     for (int i = 0; i < kURPPostEffectCount; i++) {
         if (!kURPPostEffects[i].floatField) continue;
@@ -599,6 +648,7 @@ NSDictionary *gd_current_settings_dictionary(void) {
         @"aaQualityIndex": @(g_aaQualityIndex),
         @"dithering": @(g_ditheringOn),
         @"syslogBlacklist": g_syslogBlacklist ?: @[],
+        @"trackedAssetPaths": g_trackedAssetPaths ?: @[],
     };
 }
 

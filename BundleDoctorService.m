@@ -54,52 +54,45 @@ static NSString *bds_compressionLabel(uint8_t type) {
     }
 }
 
-// Full lowercase-hex SHA-256 digest of `data`. Used only to build the
-// deterministic release tag below (identity, not transport security),
-// so no chunked/streaming variant is needed - the bundles this runs on
-// are already fully resident in memory by the time this is called (see
-// +dispatchBundleAtURL:...'s own moddedData read).
-static NSString *bds_sha256Hex(NSData *data) {
-    unsigned char digest[CC_SHA256_DIGEST_LENGTH];
-    CC_SHA256(data.bytes, (CC_LONG)data.length, digest);
-    NSMutableString *hex = [NSMutableString stringWithCapacity:CC_SHA256_DIGEST_LENGTH * 2];
-    for (int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++) {
-        [hex appendFormat:@"%02x", digest[i]];
-    }
-    return hex;
-}
-
-// See BundleDoctorService.h's "Deterministic release naming" addendum -
-// this is the tag/branch string that used to be a fresh
-// "bundle-doctor/<uuid>" on every call. cabIdentifier is expected in the
-// @"CAB-<hash>" shape +[UnityBundleCAB primaryCABForBundleAtPath:error:]
-// returns; nil/empty falls back to the old random-UUID scheme, since a
-// bundle this class can't identify can't be deduplicated against a
-// future submission either.
-static NSString *bds_deterministicTagForCAB(NSString *cabIdentifier, NSData *moddedData) {
+// See BundleDoctorService.h's "Unique release naming + per-entry resume
+// check" addendum - this is the tag/branch string, always freshly unique
+// per call now (a UUID is unconditionally part of it - see that addendum
+// for why the old CAB+SHA-deterministic scheme was dropped). cabIdentifier
+// is expected in the @"CAB-<hash>" shape
+// +[UnityBundleCAB primaryCABForBundleAtPath:error:] returns; nil/empty
+// just means the tag has no CAB segment to display (falls back to a bare
+// "bundle-doctor/<uuid>"), not a change in dedup behavior - there never
+// was any content-based dedup for this class to lose.
+static NSString *bds_uniqueTagForCAB(NSString *cabIdentifier) {
+    NSString *uuid = [NSUUID UUID].UUIDString;
     if (cabIdentifier.length == 0) {
-        return [NSString stringWithFormat:@"bundle-doctor/%@", [NSUUID UUID].UUIDString];
+        return [NSString stringWithFormat:@"bundle-doctor/%@", uuid];
     }
     NSString *cabHash = [cabIdentifier hasPrefix:@"CAB-"] ? [cabIdentifier substringFromIndex:4] : cabIdentifier;
     NSString *cabTrunc = [cabHash substringToIndex:MIN((NSUInteger)5, cabHash.length)];
-    NSString *sha256Hex = bds_sha256Hex(moddedData);
-    NSString *shaTrunc = [sha256Hex substringToIndex:MIN((NSUInteger)5, sha256Hex.length)];
-    return [NSString stringWithFormat:@"bundle-doctor/CAB-%@-sha256-%@", cabTrunc, shaTrunc];
+    return [NSString stringWithFormat:@"bundle-doctor/CAB-%@-%@", cabTrunc, uuid];
 }
 
 // See BundleDoctorProcessedRelease.h's cabDisplayName header comment -
-// pulls the "CAB-<hex>" segment back out of a deterministic tag (e.g.
-// "bundle-doctor/CAB-38321-sha256-9f2a1" -> "CAB-38321"), i.e. the
-// person's 6 spec's "release's name, excluding the sha part". Returns
-// nil if tagName has no "CAB-" substring at all (the old random-UUID
-// fallback tag - see bds_deterministicTagForCAB above - which has
-// nothing to extract).
+// pulls the "CAB-<hex>" segment back out of a tag (e.g.
+// "bundle-doctor/CAB-38321-9f2a1c3e-..." -> "CAB-38321"), i.e. the
+// person's spec's "release's name, excluding the UUID part" - the UUID
+// itself is kept in the tag (so it round-trips through
+// entry.doctorScratchBranch as the per-entry resume key - see this
+// file's header) but never shown. Returns nil if tagName has no "CAB-"
+// substring at all (the bare-UUID fallback tag - see bds_uniqueTagForCAB
+// above - which has nothing to extract).
 static NSString *bds_cabDisplayNameFromTag(NSString *tagName) {
     NSRange cabRange = [tagName rangeOfString:@"CAB-"];
     if (cabRange.location == NSNotFound) return nil;
     NSString *fromCAB = [tagName substringFromIndex:cabRange.location];
-    NSRange shaRange = [fromCAB rangeOfString:@"-sha256-"];
-    return (shaRange.location != NSNotFound) ? [fromCAB substringToIndex:shaRange.location] : fromCAB;
+    // fromCAB is "CAB-<5 hex>-<uuid>" - the UUID itself contains hyphens,
+    // so isolate the CAB segment by taking exactly the first two
+    // hyphen-delimited components ("CAB" and the 5-char hash) rather than
+    // cutting at the first hyphen found or trying to pattern-match a UUID.
+    NSArray<NSString *> *components = [fromCAB componentsSeparatedByString:@"-"];
+    if (components.count < 2) return fromCAB;
+    return [NSString stringWithFormat:@"%@-%@", components[0], components[1]];
 }
 
 // Transport optimization only: GitHub sees a smaller release asset, while
@@ -306,6 +299,14 @@ totalBytesExpectedToSend:(int64_t)totalBytesExpectedToSend {
 // route around here.
 @interface BDSDownloadProgressDelegate : NSObject <NSURLSessionDownloadDelegate>
 @property (nonatomic, copy, nullable) void (^onProgress)(double fractionComplete);
+// Set before the task starts, from the release asset's own "size" field
+// (see +bds_downloadReleaseAssetNamed:...) - falls back into use below
+// whenever totalBytesExpectedToWrite comes back <= 0, which GitHub's
+// blob-storage proxy does for a chunked-transfer response with no
+// Content-Length. Without this, onProgress was never called at all for
+// such a response (matches the reported "indicator stuck at 0%, even
+// though the download itself finishes fine" symptom exactly).
+@property (nonatomic, assign) int64_t fallbackExpectedByteCount;
 @end
 
 @implementation BDSDownloadProgressDelegate
@@ -315,8 +316,10 @@ totalBytesExpectedToSend:(int64_t)totalBytesExpectedToSend {
       didWriteData:(int64_t)bytesWritten
  totalBytesWritten:(int64_t)totalBytesWritten
 totalBytesExpectedToWrite:(int64_t)totalBytesExpectedToWrite {
-    if (!self.onProgress || totalBytesExpectedToWrite <= 0) return;
-    double fraction = (double)totalBytesWritten / (double)totalBytesExpectedToWrite;
+    if (!self.onProgress) return;
+    int64_t expected = totalBytesExpectedToWrite > 0 ? totalBytesExpectedToWrite : self.fallbackExpectedByteCount;
+    if (expected <= 0) return;
+    double fraction = (double)totalBytesWritten / (double)expected;
     self.onProgress(MIN(MAX(fraction, 0.0), 1.0));
 }
 
@@ -395,6 +398,7 @@ didFinishDownloadingToURL:(NSURL *)location {
 + (nullable NSMutableURLRequest *)bds_requestForPath:(NSString *)path config:(BundleDoctorConfig *)config;
 + (nullable NSData *)bds_downloadBinaryAtAbsoluteURLString:(NSString *)urlString
                                                        config:(BundleDoctorConfig *)config
+                                          expectedByteCount:(int64_t)expectedByteCount
                                                      progress:(nullable void (^)(double fractionComplete))progress
                                                         error:(NSError **)error;
 + (nullable id)bds_getJSON:(NSString *)path config:(BundleDoctorConfig *)config error:(NSError **)error;
@@ -643,6 +647,7 @@ didFinishDownloadingToURL:(NSURL *)location {
 
 + (void)dispatchBundleAtURL:(NSURL *)moddedBundleURL
                        config:(BundleDoctorConfig *)rawConfig
+        previousScratchBranch:(nullable NSString *)previousScratchBranch
                uploadProgress:(void (^)(double))uploadProgress
                    completion:(void (^)(BundleDoctorHandle * _Nullable, NSError * _Nullable))completion {
     void (^reportProgress)(double) = ^(double fraction) {
@@ -691,35 +696,42 @@ didFinishDownloadingToURL:(NSURL *)location {
         // this data that has to stay exact.
         NSData *originalData = [self bds_findOriginalBundleDataForModdedBundleAtPath:moddedBundleURL.path];
 
-        // See BundleDoctorService.h's "Deterministic release naming"
-        // addendum: the tag/branch is now derived from the modded
-        // bundle's own CAB + SHA-256 rather than a fresh random UUID, so
-        // an unchanged bundle re-dispatched later lands on the exact
-        // same tag a previous submission already used.
+        // See BundleDoctorService.h's "Unique release naming + per-entry
+        // resume check" addendum: every dispatch now gets its own unique
+        // tag/branch (CAB identity is still folded in for readability,
+        // but a UUID makes it unique regardless) - no two submissions,
+        // even of byte-identical bundles, ever land on the same tag. That
+        // means the branch/release-create calls below can never collide
+        // with a leftover from an earlier attempt.
         NSError *cabError = nil;
         NSString *cabIdentifier = [UnityBundleCAB primaryCABForBundleAtPath:moddedBundleURL.path error:&cabError];
         if (!cabIdentifier) {
-            ZLog(@"[BundleDoctorService] couldn't resolve a CAB identifier for %@ (%@) - falling back to a one-shot random tag, no cache dedup for this submission.",
+            ZLog(@"[BundleDoctorService] couldn't resolve a CAB identifier for %@ (%@) - tag will just be a bare UUID.",
                  moddedBundleURL.path.lastPathComponent, cabError.localizedDescription);
         }
-        NSString *scratchBranch = bds_deterministicTagForCAB(cabIdentifier, moddedData);
-        ZLog(@"[BundleDoctorService] dispatching %@/%@, scratch branch %@ (original bundle for shader-restore: %@)",
-              config.repoOwner, config.repoName, scratchBranch, originalData ? @"found" : @"not found");
 
-        // Section 5: an already-doctored release sitting under this exact
-        // tag means someone (possibly this same device, possibly a fellow
-        // agent sharing the repo) already ran this exact bundle through
-        // the pipeline - skip the upload/branch/dispatch steps entirely
-        // and hand back a handle the caller can fetch from directly. Only
-        // meaningful when the tag is actually deterministic - a
-        // random-UUID fallback (cabIdentifier == nil) can never already
-        // exist, so don't bother making the round trip for that case.
-        if (cabIdentifier.length > 0 && [self bds_releaseAtTagHasOutputAsset:scratchBranch config:config]) {
-            ZLog(@"[BundleDoctorService] cache hit on %@ - skipping upload/dispatch, caller should fetch directly.", scratchBranch);
-            BundleDoctorHandle *cachedHandle = [[BundleDoctorHandle alloc] initWithScratchBranch:scratchBranch alreadyComplete:YES];
+        // Resume check, scoped to THIS submission only: if the caller
+        // handed back a tag from an earlier attempt at dispatching this
+        // exact entry (previousScratchBranch - e.g. Retry on an entry
+        // that already got as far as a finished-but-never-polled run
+        // before the app was killed), check that one specific tag for a
+        // finished output asset before doing any new work. Deliberately
+        // NOT a fresh content-hash lookup against "any bundle that
+        // matches the CAB and SHA" - that global dedup is what used to
+        // cause a plethora of issues when the same bundle got uploaded
+        // more than once (two unrelated submissions racing/colliding on
+        // the one tag their shared content hashed to). A bundle with no
+        // previous attempt of its own never short-circuits here.
+        if (previousScratchBranch.length > 0 && [self bds_releaseAtTagHasOutputAsset:previousScratchBranch config:config]) {
+            ZLog(@"[BundleDoctorService] resume hit on %@ - this entry's earlier submission already finished, skipping upload/dispatch.", previousScratchBranch);
+            BundleDoctorHandle *cachedHandle = [[BundleDoctorHandle alloc] initWithScratchBranch:previousScratchBranch alreadyComplete:YES];
             finish(cachedHandle, nil);
             return;
         }
+
+        NSString *scratchBranch = bds_uniqueTagForCAB(cabIdentifier);
+        ZLog(@"[BundleDoctorService] dispatching %@/%@, scratch branch %@ (original bundle for shader-restore: %@)",
+              config.repoOwner, config.repoName, scratchBranch, originalData ? @"found" : @"not found");
 
         NSString *baseCommitSHA = nil;
         if (![self bds_resolveBaseCommitSHA:&baseCommitSHA config:config error:&error]) {
@@ -966,19 +978,14 @@ didFinishDownloadingToURL:(NSURL *)location {
         }
         reportProgress(1.0); // land on a clean 100% even if the last didWriteData: callback landed a hair short
 
-        // Deliberately NOT +bds_cleanupScratchSubmission:... anymore - that
-        // deleted the release itself, which was correct when the tag was a
-        // one-shot random UUID with nothing else ever able to reuse it.
-        // Now that the tag is deterministic (see this file's header), the
-        // release IS the cache +dispatchBundleAtURL:...'s own
-        // +bds_releaseAtTagHasOutputAsset:config: checks against - deleting
-        // it here would erase the cache entry on its own first successful
-        // read. Only the now-empty scratch branch (best-effort; a no-op
-        // when this handle came from a cache hit and no branch was ever
-        // created for it) gets cleaned up. Wiping the releases themselves
-        // is now a separate, explicit operation - see the Config section's
-        // "delete stored bundles in proxy".
-        [self bds_deleteBranch:handle.scratchBranch config:config]; // best-effort, logged not surfaced
+        // Every tag is unique per submission again (see this file's
+        // header's "Unique release naming + per-entry resume check"
+        // addendum) - nothing else can ever dispatch onto this exact tag
+        // in the future, so there's no cache left to preserve. Delete the
+        // release and its scratch branch both, same as the pre-Section-5
+        // behavior, rather than leaving a one-shot release sitting around
+        // on the repo forever.
+        [self bds_cleanupScratchSubmission:handle.scratchBranch config:config]; // best-effort, logged not surfaced
 
         NSString *tempName = [NSString stringWithFormat:@"doctored-%@.bundle", [NSUUID UUID].UUIDString];
         NSURL *tempURL = [NSURL fileURLWithPath:[NSTemporaryDirectory() stringByAppendingPathComponent:tempName]];
@@ -1102,6 +1109,56 @@ didFinishDownloadingToURL:(NSURL *)location {
         }];
 
         finish(results, nil);
+    });
+}
+
+#pragma mark - Processed Bundles install (9)
+
++ (void)downloadProcessedRelease:(BundleDoctorProcessedRelease *)release
+                            config:(BundleDoctorConfig *)rawConfig
+                          progress:(nullable void (^)(double fractionComplete))downloadProgress
+                        completion:(void (^)(NSURL * _Nullable, NSError * _Nullable))completion {
+    void (^reportProgress)(double) = ^(double fraction) {
+        if (!downloadProgress) return;
+        dispatch_async(dispatch_get_main_queue(), ^{ downloadProgress(fraction); });
+    };
+    void (^finish)(NSURL * _Nullable, NSError * _Nullable) = ^(NSURL * _Nullable url, NSError * _Nullable error) {
+        dispatch_async(dispatch_get_main_queue(), ^{ completion(url, error); });
+    };
+
+    BundleDoctorConfig *config = [rawConfig normalizedConfig];
+    if (config.repoOwner.length == 0 || config.repoName.length == 0 || config.authToken.length == 0) {
+        finish(nil, [self bds_errorWithCode:BundleDoctorServiceErrorInvalidConfig
+                                 description:@"Set a GitHub repository link and Personal Access Token under Mods \u2192 Auth first."]);
+        return;
+    }
+
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSError *error = nil;
+        NSData *bundleData = nil;
+        if (![self bds_downloadReleaseAssetNamed:kBDSOutputAssetName fromReleaseTag:release.tagName
+                                           config:config progress:reportProgress data:&bundleData error:&error]) {
+            finish(nil, error);
+            return;
+        }
+        reportProgress(1.0); // same clean-100%-landing reasoning as +fetchDoctoredBundleForHandle:...
+
+        // No +bds_cleanupScratchSubmission:... here - see this method's
+        // own header on why a Processed Bundles release outlives this
+        // download, unlike a scratch submission's one-shot release.
+
+        NSString *tempName = [NSString stringWithFormat:@"processed-%@.bundle", [NSUUID UUID].UUIDString];
+        NSURL *tempURL = [NSURL fileURLWithPath:[NSTemporaryDirectory() stringByAppendingPathComponent:tempName]];
+        NSError *writeError = nil;
+        if (![bundleData writeToURL:tempURL options:NSDataWritingAtomic error:&writeError]) {
+            finish(nil, [self bds_errorWithCode:BundleDoctorServiceErrorRequestFailed
+                                     description:writeError.localizedDescription ?: @"Couldn't write the processed bundle to a temp file."]);
+            return;
+        }
+
+        ZLog(@"[BundleDoctorService] processed release %@ downloaded to %@ (%lu bytes)", release.tagName, tempURL.path, (unsigned long)bundleData.length);
+
+        finish(tempURL, nil);
     });
 }
 
@@ -1486,7 +1543,17 @@ didFinishDownloadingToURL:(NSURL *)location {
         return NO;
     }
 
-    NSData *data = [self bds_downloadBinaryAtAbsoluteURLString:assetAPIURL config:config progress:progress error:error];
+    // GitHub's standard release-asset field, the authoritative expected
+    // byte count straight from the API response we already have in
+    // scope - used as a fallback when the download response itself
+    // never reports a Content-Length (see BDSDownloadProgressDelegate's
+    // fallbackExpectedByteCount). 0 if missing/malformed, which
+    // -bds_downloadBinaryAtAbsoluteURLString:...'s own fallback handles
+    // the same as "no fallback available" (progress just never renders,
+    // same as before this fix - the download itself is unaffected).
+    int64_t expectedByteCount = [asset[@"size"] respondsToSelector:@selector(longLongValue)] ? [asset[@"size"] longLongValue] : 0;
+
+    NSData *data = [self bds_downloadBinaryAtAbsoluteURLString:assetAPIURL config:config expectedByteCount:expectedByteCount progress:progress error:error];
     if (!data) return NO;
     if (outData) *outData = data;
     return YES;
@@ -1677,6 +1744,7 @@ didFinishDownloadingToURL:(NSURL *)location {
 // returns the raw file instead of JSON metadata about it.
 + (nullable NSData *)bds_downloadBinaryAtAbsoluteURLString:(NSString *)urlString
                                                        config:(BundleDoctorConfig *)config
+                                          expectedByteCount:(int64_t)expectedByteCount
                                                      progress:(nullable void (^)(double fractionComplete))progress
                                                         error:(NSError **)error {
     NSMutableURLRequest *request = [self bds_requestForAbsoluteURLString:urlString config:config];
@@ -1699,6 +1767,7 @@ didFinishDownloadingToURL:(NSURL *)location {
 
     BDSDownloadProgressDelegate *delegate = [BDSDownloadProgressDelegate new];
     delegate.onProgress = progress;
+    delegate.fallbackExpectedByteCount = expectedByteCount;
     NSURLSession *session = [NSURLSession sessionWithConfiguration:NSURLSessionConfiguration.defaultSessionConfiguration
                                                              delegate:delegate
                                                         delegateQueue:nil];
@@ -1809,6 +1878,23 @@ didFinishDownloadingToURL:(NSURL *)location {
     return [self bds_performJSONRequest:request expectBody:NO error:error] != nil;
 }
 
+// Bounds every synchronous bds_* network call below to a fixed wall-clock
+// ceiling instead of the DISPATCH_TIME_FOREVER wait this used to use.
+// NSURLRequest's own 60s default timeoutInterval only fires while the
+// task is actually running - it doesn't help if the underlying task
+// never resumes cleanly or its completion handler never gets a chance
+// to run in this tweak's injected-dylib context (e.g. the host game
+// suspending/backgrounding around the request). Without a hard ceiling
+// on the wait itself, that left the calling background queue thread -
+// and therefore whatever's waiting on its completion, like Config's
+// "Delete Stored Bundles in Proxy" button - blocked forever with no way
+// to recover short of restarting the game. This wait and NSURLRequest's
+// own 60s timeoutInterval are independent of each other - whichever
+// fires first wins - so 45s here just needs to feel responsive on a
+// stalled connection without cutting off a slow-but-progressing request
+// too eagerly.
+static const NSTimeInterval kBDSSynchronousRequestTimeout = 45.0;
+
 // expectBody: YES if a non-2xx response with no body should still count
 // as a hard failure needing a body to report (used for GETs, where an
 // empty 2xx never happens); NO for calls where a 204 No Content success
@@ -1828,7 +1914,22 @@ didFinishDownloadingToURL:(NSURL *)location {
         dispatch_semaphore_signal(sema);
     }];
     [task resume];
-    dispatch_semaphore_wait(sema, DISPATCH_TIME_FOREVER);
+
+    long timedOut = dispatch_semaphore_wait(sema, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kBDSSynchronousRequestTimeout * NSEC_PER_SEC)));
+    if (timedOut != 0) {
+        // The completion handler never ran in time - cancel the task so
+        // it isn't left running unbounded either, and fail this call
+        // outright rather than waiting on it any further. If the
+        // completion handler does still fire later (a cancel doesn't
+        // guarantee it won't), it just signals a semaphore nothing is
+        // waiting on anymore - harmless.
+        [task cancel];
+        if (error) {
+            *error = [self bds_errorWithCode:BundleDoctorServiceErrorRequestFailed
+                                  description:@"Timed out waiting for a response from GitHub."];
+        }
+        return nil;
+    }
 
     if (transportError) {
         if (error) {

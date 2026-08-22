@@ -3,11 +3,13 @@
 #import "ModAssetLibrary.h"
 #import "BankTransplant.h"
 #import "UnityBundleCAB.h" // isUnityFSBundleAtPath: / primaryCABForBundleAtPath:error: - see +importFileURLs:intoFolder:error: below
+#import "UnityCacheLocator.h" // locateBundlePathForCAB:error: - resolves resolvedInstallTargetPath at import time, see +importFileURLs:intoFolder:error: below
 #import "ZTweakLog.h"
 
 NSString * const ModAssetLibraryErrorDomain = @"ModAssetLibraryErrorDomain";
 static NSString * const kMALManifestFileName = @"manifest.json";
 static NSString * const kMALFolderRemarkFileName = @"remark.txt"; // 3.4.5 - see +remarkForFolder:/+setRemark:forFolder:error: in this header's own comment for why this is a sibling file rather than a manifest.json field
+static NSString * const kMALOriginalBundleBackupsDirectoryName = @".OriginalBundleBackups"; // 10 - see +originalBundleBackupsDirectory
 
 static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
     return [NSError errorWithDomain:ModAssetLibraryErrorDomain
@@ -24,6 +26,7 @@ static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
     d[@"byteSize"] = @(self.byteSize);
     d[@"dateAdded"] = self.dateAdded;
     if (self.livePathDescription) d[@"livePathDescription"] = self.livePathDescription;
+    if (self.resolvedInstallTargetPath) d[@"resolvedInstallTargetPath"] = self.resolvedInstallTargetPath;
     if (self.remark.length > 0) d[@"remark"] = self.remark; // same "only written when non-default" convention as the rest of this method
     if (self.cachedFromFolder.length > 0) d[@"cachedFromFolder"] = self.cachedFromFolder; // 7 - only set while sitting in "Stored Bundles"
     if (self.isAssetBundle) d[@"isAssetBundle"] = @YES; // only written when true, same "stay compact" convention as the doctor-state fields below
@@ -52,6 +55,7 @@ static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
     e.byteSize = [d[@"byteSize"] unsignedLongLongValue];
     e.dateAdded = [d[@"dateAdded"] isKindOfClass:NSString.class] ? d[@"dateAdded"] : @"";
     e.livePathDescription = [d[@"livePathDescription"] isKindOfClass:NSString.class] ? d[@"livePathDescription"] : nil;
+    e.resolvedInstallTargetPath = [d[@"resolvedInstallTargetPath"] isKindOfClass:NSString.class] ? d[@"resolvedInstallTargetPath"] : nil; // absent on any manifest row written before this field existed - nil is the correct default (falls back to entry.path for display, manual picker for install)
     e.remark = [d[@"remark"] isKindOfClass:NSString.class] ? d[@"remark"] : nil; // absent on any manifest row written before 3.4 - nil is the correct default (no remark set)
     e.cachedFromFolder = [d[@"cachedFromFolder"] isKindOfClass:NSString.class] ? d[@"cachedFromFolder"] : nil; // 7 - absent for anything never cached
     // Absent entirely on any manifest row written before this field
@@ -117,6 +121,12 @@ static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
                 stringByAppendingPathComponent:kMALFolderRemarkFileName];
 }
 
++ (NSString *)originalBundleBackupsDirectory {
+    NSString *root = [self modLibraryRootDirectory];
+    if (!root) return nil;
+    return [root stringByAppendingPathComponent:kMALOriginalBundleBackupsDirectoryName];
+}
+
 + (NSArray<NSString *> *)folderNames {
     NSString *root = [self modLibraryRootDirectory];
     NSFileManager *fm = NSFileManager.defaultManager;
@@ -126,6 +136,7 @@ static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
     NSArray<NSString *> *entries = [fm contentsOfDirectoryAtPath:root error:nil] ?: @[];
     NSMutableArray<NSString *> *folders = [NSMutableArray array];
     for (NSString *entry in entries) {
+        if ([entry isEqualToString:kMALOriginalBundleBackupsDirectoryName]) continue; // 10 - internal, not a real folder
         NSString *full = [root stringByAppendingPathComponent:entry];
         BOOL entryIsDir = NO;
         if ([fm fileExistsAtPath:full isDirectory:&entryIsDir] && entryIsDir) {
@@ -352,6 +363,7 @@ static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
         // way, even on the flat-placement fallback path.
         NSString *cabID = nil;
         NSNumber *targetPlatformNumber = nil;
+        NSString *resolvedTargetPath = nil;
         if (isBundle) {
             NSError *cabErr = nil;
             cabID = [UnityBundleCAB primaryCABForBundleAtPath:url.path error:&cabErr];
@@ -367,6 +379,29 @@ static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
             } else {
                 ZLog(@"[ModAssetLibrary] couldn't read a target platform for %@: %@",
                      url.lastPathComponent, platformErr.localizedDescription);
+            }
+
+            // 7 - resolved HERE, once, at import time, rather than only
+            // once a doctor download is ready to install (previously a
+            // 2nd indexing pass over the same CAB - see
+            // ModAssetLibraryEntry.resolvedInstallTargetPath's own header
+            // for why this is a separate field from livePathDescription).
+            // This whole method already has to run off the main thread
+            // for the CAB/platform reads above (see this method's own
+            // caller, -gd_handleLoadModsPickedURLs:intoFolder: in
+            // GraphicsDebugOverlay.m), so adding this search here costs
+            // nothing further hang-risk-wise - it's the exact same search
+            // +[UnityCacheLocator locateBundlePathForCAB:error:] always
+            // did, just moved earlier rather than run twice.
+            if (cabID) {
+                NSError *locateErr = nil;
+                NSString *matchPath = [UnityCacheLocator locateBundlePathForCAB:cabID error:&locateErr];
+                if (matchPath) {
+                    resolvedTargetPath = [self mal_sandboxRelativePath:matchPath];
+                } else {
+                    ZLog(@"[ModAssetLibrary] no cache match yet for %@'s CAB (%@) - Filepath/install will fall back to the manual picker until one's found: %@",
+                         url.lastPathComponent, cabID, locateErr.localizedDescription);
+                }
             }
         }
 
@@ -415,6 +450,7 @@ static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
         // Resolved here, once, and never again - see ModAssetLibrary.h's
         // own comment on livePathDescription.
         entry.livePathDescription = [self mal_livePathDescriptionForFileName:destName];
+        entry.resolvedInstallTargetPath = resolvedTargetPath;
         [entries addObject:entry];
         importedCount++;
     }
@@ -539,6 +575,7 @@ static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
     movedEntry.byteSize = attrs.fileSize;
     movedEntry.dateAdded = entry.dateAdded;
     movedEntry.livePathDescription = entry.livePathDescription;
+    movedEntry.resolvedInstallTargetPath = entry.resolvedInstallTargetPath;
     movedEntry.remark = entry.remark;
     movedEntry.isAssetBundle = entry.isAssetBundle;
     movedEntry.cabIdentifier = entry.cabIdentifier;

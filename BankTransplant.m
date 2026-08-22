@@ -6,6 +6,7 @@
 
 #import "BankTransplant.h"
 #import "ZTweakLog.h"
+#import "GDScripts.h" // gd_track_asset_path - see that file's header
 
 NSString * const BankTransplantErrorDomain = @"BankTransplantErrorDomain";
 
@@ -130,6 +131,12 @@ static NSString * const kBTBackupSuffix = @".orig-bak";
     }
 
     ZLog(@"[BankTransplant] swapped %@ in place with the modded file's bytes as-is", fileName);
+
+    // Independent of this class's own backup-directory bookkeeping -
+    // see GDScripts.h's gd_track_asset_path() header for why Hard
+    // Assets Reset needs this logged separately.
+    gd_track_asset_path(originalPath);
+
     return YES;
 }
 
@@ -227,51 +234,9 @@ static NSString * const kBTBackupSuffix = @".orig-bak";
     return [self restoreAllBackedUpBanksForce:NO error:error];
 }
 
-// Same backup-directory walk as +restoreAllBackedUpBanksWithError:, but
-// deletes the live file at mobileDir/<name> instead of overwriting it
-// with the backup's bytes, then deletes backupDir itself (the whole
-// directory - every .orig-bak in it, and the directory entry) once the
-// walk is done. See this method's header comment for why - this is the
-// "forget it ever happened" lever, not a restore.
-+ (NSInteger)deleteAllTrackedBanksAndBackupsWithError:(NSError **)error {
-    NSString *mobileDir = [self mobileFMODBuildsDirectory];
-    NSString *backupDir = [self bankBackupDirectory];
-    NSFileManager *fm = NSFileManager.defaultManager;
-
-    if (!backupDir || ![fm fileExistsAtPath:backupDir]) {
-        return 0; // nothing has ever been backed up - not an error
-    }
-
-    NSError *listErr = nil;
-    NSArray<NSString *> *entries = [fm contentsOfDirectoryAtPath:backupDir error:&listErr];
-    if (!entries) {
-        if (error) *error = listErr ?: BTError(BankTransplantErrorOriginalNotFound, @"Couldn't list the bank backup directory.");
-        return -1;
-    }
-
-    NSInteger deleted = 0;
-    for (NSString *entry in entries) {
-        if (![entry hasSuffix:kBTBackupSuffix]) continue;
-        NSString *fileName = [entry substringToIndex:entry.length - kBTBackupSuffix.length];
-        NSString *livePath = mobileDir ? [mobileDir stringByAppendingPathComponent:fileName] : nil;
-        if (!livePath || ![fm fileExistsAtPath:livePath]) continue;
-
-        NSError *removeErr = nil;
-        if ([fm removeItemAtPath:livePath error:&removeErr]) {
-            deleted++;
-        } else {
-            ZLog(@"[BankTransplant] hard reset: couldn't delete live bank %@: %@", livePath, removeErr.localizedDescription);
-        }
-    }
-
-    // Backups have done their job (or there was nothing left to restore
-    // from anyway) - clear the whole directory, manifest-equivalent
-    // .orig-bak files included, so a stray backup can't outlive the
-    // reset it was supposed to be part of.
-    [fm removeItemAtPath:backupDir error:nil];
-
-    return deleted;
-}
+// +deleteAllTrackedBanksAndBackupsWithError: used to live here - see
+// the NOTE at the bottom of BankTransplant.h for why Hard Assets Reset
+// no longer discovers what to delete by walking +bankBackupDirectory.
 
 + (NSInteger)restoreBackedUpBankNamed:(NSString *)name error:(NSError **)error {
     NSString *mobileDir = [self mobileFMODBuildsDirectory];

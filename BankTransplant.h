@@ -99,18 +99,19 @@ typedef NS_ENUM(NSInteger, BankTransplantErrorCode) {
 // filesystem-level failure.
 + (NSInteger)restoreBackedUpBankNamed:(NSString *)name error:(NSError **)error;
 
-// The nuclear option, for the Config section's "Hard Assets Reset" (see
-// GraphicsDebugOverlay.m): unlike +restoreAllBackedUpBanksWithError:,
-// this does NOT put the stock bytes back. It deletes, outright, every
-// live <name>.bank under +mobileFMODBuildsDirectory that has a matching
-// backup under +bankBackupDirectory - i.e. every bank this class has
-// ever logged the location of by touching it - then removes
-// +bankBackupDirectory itself, backups and all. A deleted bank is a
-// bank the game has to fetch fresh next time it's needed; that's the
-// point. Returns the number of live files deleted (0 if nothing was
-// ever backed up - not an error), or -1 with error filled on a
-// filesystem-level failure listing the backup directory.
-+ (NSInteger)deleteAllTrackedBanksAndBackupsWithError:(NSError **)error;
+// NOTE: this class used to also own a
+// +deleteAllTrackedBanksAndBackupsWithError: "nuclear option" for the
+// Config section's "Hard Assets Reset", discovering what to delete by
+// walking +bankBackupDirectory the same way +restoreAllBackedUpBanksWithError:
+// does. That was unreliable for exactly the reason a backup-directory
+// walk always will be for this: if the backup directory's own contents
+// are ever lost or cleared by something other than a completed Reset,
+// there's nothing left to discover from. -hardAssetsResetTapped in
+// GraphicsDebugOverlay.m now drives live-file deletion from
+// GDScripts.h's independent gd_tracked_asset_paths() log instead (every
+// path +transplantAndSwapModdedBankAtURL:error: has ever swapped into,
+// logged at swap time regardless of backup-directory state), and clears
+// +bankBackupDirectory directly rather than through this class.
 
 @end
 

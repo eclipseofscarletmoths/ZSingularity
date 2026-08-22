@@ -48,23 +48,42 @@ typedef NS_ENUM(NSInteger, BundleDoctorInstallerErrorCode) {
 
 @interface BundleDoctorInstaller : NSObject
 
-// Library/ZSingularityBundleBackups inside this app's sandbox - where
-// backups of stock bundles live. Deliberately separate from wherever
-// the stock bundle itself lives, same reasoning as BankTransplant's
-// +bankBackupDirectory (an unrecognized sibling file next to a tracked
-// asset can trip integrity checks that treat it as reason to flag/
-// redownload the asset).
+// +[ModAssetLibrary originalBundleBackupsDirectory] - a subdirectory of
+// the Mod Asset Library itself, per the person's own spec (10) that a
+// stock bundle's one-time backup lives "in the asset library", not off
+// in some wholly separate Library directory of this class's own (which
+// is where it lived before this - a leftover from before this class had
+// any reason to know ModAssetLibrary existed at all). Kept as this
+// class's own accessor (rather than every call site reaching into
+// ModAssetLibrary directly) purely so nothing else in this file, or any
+// existing caller/comment referencing "+bundleBackupDirectory", had to
+// change shape over the move.
 + (NSString *)bundleBackupDirectory;
 
 // doctoredURL: local temp file from BundleDoctorService's completion
 // block (see that class). stockBundleURL: the on-disk stock bundle to
 // replace, picked explicitly by the person - see this file's header on
 // why this class doesn't try to locate it itself. Backs stockBundleURL
-// up on first touch (keyed by stockBundleURL.lastPathComponent, so a
-// second swap of the same file reuses/does not re-clobber that backup),
-// then atomically replaces it with doctoredURL's bytes as-is. Returns
-// NO and fills error on any failure (nothing on disk is modified in
-// that case, aside from the backup, which is always safe to have made).
+// up on first touch, then atomically replaces it with doctoredURL's
+// bytes as-is. Returns NO and fills error on any failure (nothing on
+// disk is modified in that case, aside from the backup, which is
+// always safe to have made).
+//
+// 10 - the backup is keyed by stockBundleURL's FULL path (via
+// +bds_backupKeyForStockBundleURL:), not just its last path component.
+// Every Unity asset bundle's on-disk payload file is always literally
+// named "__data" (see ModAssetLibrary.h's own note on why bundles get
+// CAB-named subfolders) - it's what makes one stock location distinct
+// from another, not the shared leaf filename every one of them has. The
+// old lastPathComponent-only key meant installing bundle A over stock
+// path P1 wrote a backup that bundle B's later install over a
+// DIFFERENT stock path P2 then found "already exists" and skipped -
+// P2's real original was never captured, and a restore of P2 would
+// have handed back A's original bytes instead. Keying on the full path
+// means two different stock locations can never collide, so each one's
+// true original is backed up exactly once and never overwritten by a
+// different bundle's install - regardless of how many other bundles
+// happen to share the same "__data" leaf name.
 + (BOOL)installDoctoredBundleAtURL:(NSURL *)doctoredURL
                   toStockBundleURL:(NSURL *)stockBundleURL
                               error:(NSError **)error;
@@ -92,7 +111,7 @@ typedef NS_ENUM(NSInteger, BundleDoctorInstallerErrorCode) {
 // +restoreAllBackedUpBundlesForce:error:, for swapping ONE live bundle
 // back to its backed-up original without touching any other installed
 // bundle. Looks up stockBundleURL's backup the same way (keyed by
-// stockBundleURL.lastPathComponent under +bundleBackupDirectory) and, if
+// +bds_backupKeyForStockBundleURL: under +bundleBackupDirectory) and, if
 // found, overwrites stockBundleURL with the backup's bytes - the backup
 // itself is left in place either way (unlike a delete/reset flow, this
 // is meant to be reversible - see -gd_restoreStoredBundleEntry:inFolder:
@@ -108,16 +127,21 @@ typedef NS_ENUM(NSInteger, BundleDoctorInstallerErrorCode) {
 // +installDoctoredBundleAtURL:toStockBundleURL:error: call already made one.
 + (BOOL)cacheOriginalBackForStockBundleURL:(NSURL *)stockBundleURL error:(NSError **)error;
 
-// The nuclear option, for the Config section's "Hard Assets Reset" (see
-// GraphicsDebugOverlay.m). Unlike +restoreAllBackedUpBundlesWithError:,
-// this does NOT put the stock bytes back - it deletes, outright, the
-// live file at every original path recorded in the manifest under
-// +bundleBackupDirectory (the only place a swapped bundle's game-side
-// location is ever logged, per this class's header note on why that
-// manifest exists at all), then removes +bundleBackupDirectory itself,
-// manifest and backups included. Returns the number of live files
-// deleted (0 if nothing was ever installed - not an error).
-+ (NSInteger)deleteAllTrackedBundlesAndBackupsWithError:(NSError **)error;
+// NOTE: this class used to also own a
+// +deleteAllTrackedBundlesAndBackupsWithError: "nuclear option" for the
+// Config section's "Hard Assets Reset", discovering what to delete by
+// reading manifest.json under +bundleBackupDirectory. That was
+// unreliable for exactly the reason a manifest-file walk always will
+// be for this: if the backup directory's own contents are ever lost or
+// cleared by something other than a completed Reset, there's nothing
+// left to discover from. -hardAssetsResetTapped in
+// GraphicsDebugOverlay.m now drives live-file deletion from
+// GDScripts.h's independent gd_tracked_asset_paths() log instead (every
+// path +installDoctoredBundleAtURL:toStockBundleURL:error: has ever
+// installed over, logged at install time regardless of backup-directory
+// state), and clears +bundleBackupDirectory directly rather than
+// through this class. manifest.json itself is untouched by any of this
+// - +restoreAllBackedUpBundlesForce:error: still needs it.
 
 @end
 

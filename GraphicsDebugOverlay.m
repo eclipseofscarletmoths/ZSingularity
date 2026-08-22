@@ -191,7 +191,11 @@
 #import "BundleDoctorService.h"     // send-and-intercept: GitHub Actions doctor-bundle pipeline, see -loadModsTapped below
 #import "PatchManifestNetwork.h"    // isZeroingEnabled/setZeroingEnabled: - Config section's "Disable FModManifest zeroing" switch, see -fmodZeroingDisableChanged: below
 #import "BundleDoctorInstaller.h"   // backup+swap of the doctored bundle into place, mirrors BankTransplant's own pattern
-#import "UnityCacheLocator.h"       // CAB-based auto-match for the doctor pipeline's download/install target - see -gd_doctorLocateInstallTargetForDoctoredURL:entryPath:inFolder:
+// UnityCacheLocator.h is no longer imported here - its CAB-based cache
+// search now runs once, at import time, from ModAssetLibrary.m's
+// +importFileURLs:intoFolder:error: (see ModAssetLibraryEntry.
+// resolvedInstallTargetPath) - this file just reads the result back via
+// -gd_doctorInstallUsingKnownTargetForDoctoredURL:entryPath:inFolder:.
 #import "ModAssetLibrary.h"         // Mods Library accordion (organizational only) - see that file's header
 #import "UnityBundleCAB.h"          // isUnityFSBundleAtPath: - content-based bundle detection for Load Mods' picker handler, see -gd_handleLoadModsPickedURLs:intoFolder:
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h> // UTType-based UIDocumentPickerViewController init, for the Mods section's "Import Bank Mod" button
@@ -3014,15 +3018,16 @@ static UIView *gd_make_mods_folder_row(NSString *folderName, NSString *remark, B
     [row addSubview:label];
 
     BOOL hasRemark = (remark.length > 0);
-    UILabel *remarkLabel = nil;
+    GDMarqueeLabel *remarkLabel = nil;
     if (hasRemark) {
-        remarkLabel = [[UILabel alloc] init];
-        remarkLabel.translatesAutoresizingMaskIntoConstraints = NO;
+        remarkLabel = [[GDMarqueeLabel alloc] init];
         remarkLabel.text = remark;
         remarkLabel.font = [UIFont systemFontOfSize:10 weight:UIFontWeightRegular];
         remarkLabel.textColor = [UIColor colorWithWhite:1 alpha:0.45];
-        remarkLabel.lineBreakMode = NSLineBreakByTruncatingTail;
-        remarkLabel.numberOfLines = 1;
+        // Keyed by folder name so this marquee's scroll phase survives a
+        // rebuild triggered by some OTHER row's dropdown - see
+        // GDMarqueeLabel.marqueeKey.
+        remarkLabel.marqueeKey = [folderName stringByAppendingString:@"|remark"];
         [row addSubview:remarkLabel];
     }
 
@@ -3092,7 +3097,11 @@ static UIView *gd_make_mods_folder_row(NSString *folderName, NSString *remark, B
 
             [remarkLabel.leadingAnchor constraintEqualToAnchor:label.leadingAnchor],
             [remarkLabel.topAnchor constraintEqualToAnchor:label.bottomAnchor constant:2],
-            [remarkLabel.trailingAnchor constraintLessThanOrEqualToAnchor:labelTrailingNeighbor.trailingAnchor constant:(labelTrailingNeighbor == row ? -8 : -6)],
+            // Equal (not <=) so the view always has a concrete width to
+            // measure overflow against - GDMarqueeLabel only scrolls when
+            // its text actually overflows that width, so short remarks
+            // still sit still exactly as before.
+            [remarkLabel.trailingAnchor constraintEqualToAnchor:labelTrailingNeighbor.trailingAnchor constant:(labelTrailingNeighbor == row ? -8 : -6)],
             [row.bottomAnchor constraintEqualToAnchor:remarkLabel.bottomAnchor constant:6],
         ]];
     } else {
@@ -3541,6 +3550,22 @@ static UIView *gd_make_mods_entry_row(ModAssetLibraryEntry *entry, id target, SE
     return row;
 }
 
+// 8 - CAB identifiers (e.g. "CAB-a1b2c3d4e5f6...") are long enough to
+// overflow the info panel's width, but short enough that the resulting
+// marquee scroll distance is tiny - just barely over the overflow
+// threshold, so it ping-pongs back and forth rapidly instead of
+// scrolling smoothly, which reads as visual clutter rather than a
+// useful "there's more here" cue. Truncating the DISPLAYED string
+// (never entry.cabIdentifier itself, which stays untouched everywhere
+// else - CAB matching, persistence, etc.) below the point where it'd
+// still overflow removes the marquee behavior for this value entirely,
+// same as any other short value that fits without scrolling.
+static NSString *gd_truncated_cab_identifier_for_display(NSString *cabIdentifier) {
+    static const NSUInteger kMaxDisplayedCABLength = 16;
+    if (cabIdentifier.length <= kMaxDisplayedCABLength) return cabIdentifier;
+    return [[cabIdentifier substringToIndex:kMaxDisplayedCABLength] stringByAppendingString:@"\u2026"];
+}
+
 // One "Label: value" info row where only the value half scrolls when it
 // overflows - the static text (e.g. "Filepath:"/"Identifier:") sits in
 // its own fixed-width, required-hugging UILabel so it never gets
@@ -3602,15 +3627,18 @@ static UIView *gd_make_mods_entry_info_panel(ModAssetLibraryEntry *entry, BOOL d
     UIColor *subtextColor = [UIColor colorWithWhite:1 alpha:0.4];
 
     // 3.4 "Add remark": surfaced at the very top of the panel, before
-    // Filepath, per spec. Plain wrapping UILabel - not specified as
-    // scrolling, so no marquee treatment unlike Filepath/Identifier
-    // below. Only added when non-empty; most entries have no remark.
+    // Filepath. Now uses the same GDMarqueeLabel treatment as
+    // Filepath/Identifier below - a long remark scrolls into view
+    // instead of wrapping. Only added when non-empty; most entries have
+    // no remark. As a bare arranged subview (not a gd_make_marquee_info_row
+    // pair) the stack view's own fill alignment gives it a full-width
+    // frame, same as pathRow/identifierRow below.
     if (entry.remark.length > 0) {
-        UILabel *remarkLabel = [[UILabel alloc] init];
+        GDMarqueeLabel *remarkLabel = [[GDMarqueeLabel alloc] init];
         remarkLabel.text = entry.remark;
         remarkLabel.font = subtextFont;
         remarkLabel.textColor = [UIColor colorWithWhite:1 alpha:0.7];
-        remarkLabel.numberOfLines = 0;
+        remarkLabel.marqueeKey = [entry.path stringByAppendingString:@"|remark"];
         [panel addArrangedSubview:remarkLabel];
     }
 
@@ -3633,7 +3661,14 @@ static UIView *gd_make_mods_entry_info_panel(ModAssetLibraryEntry *entry, BOOL d
     // copy, which would be a confusing thing to surface here under the
     // "Filepath" label people are used to reading as the in-game path).
     if (!isStoredBundlesFolder) {
-        NSString *displayedPath = entry.livePathDescription ?: entry.path;
+        // 6/7 - livePathDescription (actually installed at least once)
+        // first, then resolvedInstallTargetPath (known target, resolved
+        // via cache lookup at import time, not yet installed there) -
+        // both are the same NSHomeDirectory()-relative "game's own files"
+        // description, just at different points in the pipeline. Only an
+        // entry with neither (no cache match found yet) falls back to
+        // entry.path, this file's own on-disk Mod Asset Library copy.
+        NSString *displayedPath = entry.livePathDescription ?: entry.resolvedInstallTargetPath ?: entry.path;
         UIView *pathRow = gd_make_marquee_info_row(@"Filepath:", displayedPath,
                                                     [entry.path stringByAppendingString:@"|path"],
                                                     subtextFont, subtextColor);
@@ -3646,7 +3681,10 @@ static UIView *gd_make_mods_entry_info_panel(ModAssetLibraryEntry *entry, BOOL d
     // meaningless for anything that never enters the doctor pipeline).
     if (entry.isAssetBundle) {
         if (entry.cabIdentifier.length > 0) {
-            UIView *identifierRow = gd_make_marquee_info_row(@"Identifier:", entry.cabIdentifier,
+            // 8 - display-only truncation; entry.cabIdentifier itself
+            // (used for the |cab marqueeKey and everywhere else CAB
+            // matching happens) is untouched.
+            UIView *identifierRow = gd_make_marquee_info_row(@"Identifier:", gd_truncated_cab_identifier_for_display(entry.cabIdentifier),
                                                                [entry.path stringByAppendingString:@"|cab"],
                                                                subtextFont, subtextColor);
             [panel addArrangedSubview:identifierRow];
@@ -3819,15 +3857,25 @@ static UIView *gd_make_processed_bundle_row(BundleDoctorProcessedRelease *releas
 }
 
 // Expandable info panel for one Processed Bundles row - Size / Upload
-// date / Checksum only, per the person's 6 spec (no Filepath/Identifier/
+// date / Checksum, per the person's 6 spec (no Filepath/Identifier/
 // Status/remark - there's no on-disk copy or install state for a release
-// that hasn't been downloaded). Checksum uses gd_make_marquee_info_row
-// since a full "sha256:<64 hex chars>" string is always wider than the
-// panel - same reasoning as Filepath/Identifier already scrolling in
+// that hasn't been downloaded), plus (9) a pill-shaped "install" button
+// underneath, only ever present here (i.e. only while this row's
+// dropdown is open, per the person's 9 spec) since this whole panel is
+// only built when releaseExpanded is true (see -gd_rebuildModsLibrary's
+// own "Processed Bundles" loop) - there is no separate visibility flag
+// to gate on beyond that. Checksum uses gd_make_marquee_info_row since a
+// full "sha256:<64 hex chars>" string is always wider than the panel -
+// same reasoning as Filepath/Identifier already scrolling in
 // gd_make_mods_entry_info_panel. Size/Upload date stay plain UILabels,
 // same as that function's own Size/Date Added rows, for the same reason
 // (short enough to never need it).
-static UIView *gd_make_processed_bundle_info_panel(BundleDoctorProcessedRelease *release) {
+// installInFlight: mirrors an ordinary entry row's downloadInFlight -
+// this exact release's own download+import+install pipeline
+// (-gd_installProcessedBundleRelease:intoFolder:config:) is already
+// running, so the pill reads "installing…" and stops accepting taps
+// instead of letting a second tap start a redundant second download.
+static UIView *gd_make_processed_bundle_info_panel(BundleDoctorProcessedRelease *release, BOOL installInFlight, id target, SEL installAction) {
     UIView *container = [[UIView alloc] init];
     container.translatesAutoresizingMaskIntoConstraints = NO;
     objc_setAssociatedObject(container, "gd_processedRelease", release, OBJC_ASSOCIATION_RETAIN);
@@ -3867,6 +3915,35 @@ static UIView *gd_make_processed_bundle_info_panel(BundleDoctorProcessedRelease 
                                                          subtextFont, subtextColor);
         [panel addArrangedSubview:checksumRow];
     }
+
+    // 9 - install pill. Wrapped in its own plain UIView rather than
+    // added to `panel` directly, so the pill keeps its own fixed
+    // (non-stretched) capsule size the same way gd_make_mods_entry_row's
+    // doctor slot does - a bare UIButton as an arranged subview of a
+    // vertical, fill-aligned UIStackView (panel's own alignment, like
+    // every other row above it) would otherwise stretch edge-to-edge.
+    // Same accent-green native-glass capsule style/size
+    // (kGDModsDoctorCapsuleFontSize/MinWidth/Height) as an entry row's
+    // own dispatch/download/retry pill, for visual consistency, even
+    // though this one lives in an info panel rather than a row.
+    UIView *installRow = [[UIView alloc] init];
+    installRow.translatesAutoresizingMaskIntoConstraints = NO;
+    UIButton *installButton = [UIButton buttonWithType:UIButtonTypeSystem];
+    installButton.translatesAutoresizingMaskIntoConstraints = NO;
+    gd_style_button_as_native_glass_with_font(installButton, installInFlight ? @"installing\u2026" : @"install",
+        gd_accent_green_color(), [UIFont systemFontOfSize:kGDModsDoctorCapsuleFontSize weight:UIFontWeightSemibold]);
+    installButton.enabled = !installInFlight;
+    objc_setAssociatedObject(installButton, "gd_processedRelease", release, OBJC_ASSOCIATION_RETAIN);
+    [installButton addTarget:target action:installAction forControlEvents:UIControlEventTouchUpInside];
+    [installRow addSubview:installButton];
+    [NSLayoutConstraint activateConstraints:@[
+        [installButton.leadingAnchor constraintEqualToAnchor:installRow.leadingAnchor],
+        [installButton.topAnchor constraintEqualToAnchor:installRow.topAnchor constant:2],
+        [installButton.bottomAnchor constraintEqualToAnchor:installRow.bottomAnchor],
+        [installButton.widthAnchor constraintGreaterThanOrEqualToConstant:kGDModsDoctorCapsuleMinWidth],
+        [installButton.heightAnchor constraintEqualToConstant:kGDModsDoctorCapsuleHeight],
+    ]];
+    [panel addArrangedSubview:installRow];
 
     [NSLayoutConstraint activateConstraints:@[
         [panel.topAnchor constraintEqualToAnchor:container.topAnchor],
@@ -4234,6 +4311,15 @@ static UIView *gd_make_title_block(void) {
 // modsLibraryExpandedInfoEntries using entry.path instead of the entry
 // object).
 @property (nonatomic, strong) NSMutableSet<NSString *> *modsLibraryExpandedProcessedBundles;
+// 9 - keyed by BundleDoctorProcessedRelease.tagName, same key
+// modsLibraryExpandedProcessedBundles above uses. Membership means
+// that release's download+import+install pipeline is currently
+// running (-gd_processedBundleInstallTapped:/-gd_installProcessedBundleRelease:
+// intoFolder:config:) - guards against a double-tap and lets the
+// info panel's install pill show "installing…" instead of staying
+// tappable mid-flight. Not persisted - nothing here survives an app
+// relaunch anyway (the download itself would just have to be retried).
+@property (nonatomic, strong) NSMutableSet<NSString *> *processedBundleInstallInFlight;
 
 // Section 3 runtime state for the doctor-pipeline dispatch/poll flow
 // (see "#pragma mark Mods (doctor pipeline)" below) - none of this is
@@ -4424,6 +4510,15 @@ static const NSTimeInterval kSaveDebounceInterval = 0.4;
                                                   name:UIKeyboardWillChangeFrameNotification
                                                 object:nil];
 
+    // Re-poll any in-flight doctor entries immediately when the game
+    // comes back from being backgrounded, rather than leaving progress
+    // stale for up to 6s (or, worse, however long the app was actually
+    // backgrounded) until the next timer tick.
+    [[NSNotificationCenter defaultCenter] addObserver:self
+                                              selector:@selector(gd_pollAllActiveDoctorEntriesImmediately)
+                                                  name:UIApplicationWillEnterForegroundNotification
+                                                object:nil];
+
     // The very first successful gd_key_window() call, right after the
     // game finishes launching, isn't a reliable place to read final
     // geometry from - safeAreaInsets in particular can still report 0
@@ -4452,6 +4547,10 @@ static const NSTimeInterval kSaveDebounceInterval = 0.4;
     [UIView animateWithDuration:0.25 animations:^{
         self.chevron.transform = self.panelOpen ? CGAffineTransformMakeRotation(M_PI) : CGAffineTransformIdentity;
     }];
+    // Re-poll any in-flight doctor entries right away on open, rather
+    // than leaving a freshly-opened panel showing up-to-6s-stale
+    // progress until the next timer tick.
+    if (self.panelOpen) [self gd_pollAllActiveDoctorEntriesImmediately];
 }
 
 // Swipe-right-to-close, requested as an alternative to re-tapping the
@@ -5147,6 +5246,7 @@ static const CGFloat kContentFadeHeight = 22;
     self.modsLibraryExpandedFolders = [NSMutableSet set];
     self.modsLibraryExpandedInfoEntries = [NSMutableSet set];
     self.modsLibraryExpandedProcessedBundles = [NSMutableSet set]; // 6 - see that property's own header comment
+    self.processedBundleInstallInFlight = [NSMutableSet set]; // 9 - see that property's own header comment
     self.modsLibraryStack = [[UIStackView alloc] init];
     self.modsLibraryStack.axis = UILayoutConstraintAxisVertical;
     self.modsLibraryStack.spacing = 2;
@@ -5420,20 +5520,31 @@ static const CGFloat kContentFadeHeight = 22;
 // ever swapped into the game's own files is deleted outright (forcing
 // a fresh fetch next time the game needs it), every backup this tweak
 // has ever made is cleared, and the entire Mod Asset Library is wiped.
-// Three separate classes each own the piece of this that matches what
-// they already track, same "each class owns its own directory" split
-// this project already uses everywhere else:
-//   - BankTransplant: deletes every live .bank under
-//     +mobileFMODBuildsDirectory that has a backup under
-//     +bankBackupDirectory (that backup's existence IS the log of
-//     "this bank's live path was touched"), then clears
-//     +bankBackupDirectory itself.
-//   - BundleDoctorInstaller: same idea, but the log is explicit -
-//     its manifest.json under +bundleBackupDirectory maps a doctored
-//     bundle's name to the exact original path it was installed over
-//     (see that class's header on why an explicit manifest is needed
-//     there and not for banks). Deletes the live file at every logged
-//     path, then clears +bundleBackupDirectory itself.
+//
+// Live-file deletion is driven entirely by GDScripts.h's
+// gd_tracked_asset_paths() - an independent log of every path
+// +[BankTransplant transplantAndSwapModdedBankAtURL:error:] or
+// +[BundleDoctorInstaller installDoctoredBundleAtURL:toStockBundleURL:error:]
+// has ever swapped into, written at the moment of that swap regardless
+// of either class's own backup-directory state. This used to instead
+// walk BankTransplant's/BundleDoctorInstaller's own backup directories
+// to discover what to delete (that backup's/manifest entry's existence
+// WAS the log) - unreliable, since anything that clears one of those
+// directories out from under this action (a failed restore, a manual
+// Files.app delete, a future bug elsewhere) left this button unable to
+// find - and therefore delete - the faulty live asset it was supposed
+// to. The independent log has no such dependency: it's never read from
+// or reset by anything except this button and the two swap methods
+// above.
+//
+//   - Every tracked path with a live file at it is deleted, then the
+//     tracked-paths log itself is cleared (gd_clear_tracked_asset_paths) -
+//     so entries for paths that no longer had a live file (already
+//     deleted some other way) are dropped too, not left to accumulate.
+//   - +bankBackupDirectory and +bundleBackupDirectory are still wiped
+//     directly (whole-directory removal, not a per-entry walk) - this
+//     button still promises to clear every backup this tweak has made,
+//     independent of the tracked-paths log above.
 //   - ModAssetLibrary: wipes +modLibraryRootDirectory entirely - this
 //     is bookkeeping only and was never a "live" game file to begin
 //     with, but it's still one of the four things this button promises
@@ -5444,11 +5555,25 @@ static const CGFloat kContentFadeHeight = 22;
 // single action can throw away more than any other button here, so it
 // gets a longer, more deliberate hold.
 - (void)hardAssetsResetTapped {
-    NSError *bankError = nil;
-    NSInteger banksDeleted = [BankTransplant deleteAllTrackedBanksAndBackupsWithError:&bankError];
+    NSFileManager *fm = NSFileManager.defaultManager;
 
-    NSError *bundleError = nil;
-    NSInteger bundlesDeleted = [BundleDoctorInstaller deleteAllTrackedBundlesAndBackupsWithError:&bundleError];
+    NSArray<NSString *> *trackedPaths = gd_tracked_asset_paths();
+    NSInteger assetsDeleted = 0;
+    for (NSString *path in trackedPaths) {
+        if (![fm fileExistsAtPath:path]) continue;
+        NSError *removeErr = nil;
+        if ([fm removeItemAtPath:path error:&removeErr]) {
+            assetsDeleted++;
+        } else {
+            ZLog(@"[GraphicsDebugOverlay] hard reset: couldn't delete live asset %@: %@", path, removeErr.localizedDescription);
+        }
+    }
+    gd_clear_tracked_asset_paths();
+
+    NSString *bankBackupDir = [BankTransplant bankBackupDirectory];
+    if (bankBackupDir) [fm removeItemAtPath:bankBackupDir error:nil];
+    NSString *bundleBackupDir = [BundleDoctorInstaller bundleBackupDirectory];
+    if (bundleBackupDir) [fm removeItemAtPath:bundleBackupDir error:nil];
 
     NSError *libraryError = nil;
     BOOL libraryCleared = [ModAssetLibrary deleteAllFoldersWithError:&libraryError];
@@ -5461,25 +5586,24 @@ static const CGFloat kContentFadeHeight = 22;
 
     UINotificationFeedbackGenerator *haptic = [UINotificationFeedbackGenerator new];
 
-    if (banksDeleted < 0 || bundlesDeleted < 0 || !libraryCleared) {
+    if (!libraryCleared) {
         [haptic notificationOccurred:UINotificationFeedbackTypeError];
-        NSString *reason = bankError.localizedDescription ?: bundleError.localizedDescription ?: libraryError.localizedDescription ?: @"Unknown error.";
+        NSString *reason = libraryError.localizedDescription ?: @"Unknown error.";
         [self gd_presentModsAlertWithTitle:@"Hard Reset Failed" message:reason];
         return;
     }
 
-    if (banksDeleted == 0 && bundlesDeleted == 0) {
+    if (assetsDeleted == 0) {
         [haptic notificationOccurred:UINotificationFeedbackTypeWarning];
         [self gd_presentModsAlertWithTitle:@"Nothing to Reset"
-                                    message:@"No tracked banks or bundles were found. The Mod Asset Library has been cleared regardless."];
+                                    message:@"No tracked bank or bundle assets were found. Every backup and the Mod Asset Library have been cleared regardless."];
         return;
     }
 
     [haptic notificationOccurred:UINotificationFeedbackTypeSuccess];
     NSString *message = [NSString stringWithFormat:
-        @"Deleted %ld bank%@ and %ld bundle%@ from the game's own files, cleared every backup, and emptied the Mod Asset Library. Restart the game for it to take effect.",
-        (long)banksDeleted, banksDeleted == 1 ? @"" : @"s",
-        (long)bundlesDeleted, bundlesDeleted == 1 ? @"" : @"s"];
+        @"Deleted %ld tracked asset%@ from the game's own files, cleared every backup, and emptied the Mod Asset Library. Restart the game for it to take effect.",
+        (long)assetsDeleted, assetsDeleted == 1 ? @"" : @"s"];
     [self gd_presentModsAlertWithTitle:@"Hard Assets Reset" message:message];
 }
 
@@ -5498,6 +5622,17 @@ static const CGFloat kContentFadeHeight = 22;
 // -gd_authVerifyTapped:'s "Verifying\u2026") - the 1.5s hold itself is
 // already spent by the time this runs, so this guards against a
 // second hold firing mid-request, not against the hold gesture itself.
+// USED TO get stuck on "Deleting\u2026" permanently: every network call
+// this makes eventually funnels into BundleDoctorService.m's
+// +bds_performJSONRequest:expectBody:error:, which used to block its
+// background queue on a dispatch_semaphore_wait with NO timeout
+// (DISPATCH_TIME_FOREVER) - if a request's completion handler never
+// fired (this tweak runs injected into the host game's process, which
+// can suspend/background around a request in ways this wait had no
+// escape hatch for), that thread - and this button's completion block
+// waiting on it - never came back. Fixed at the source in
+// +bds_performJSONRequest:expectBody:error: (kBDSSynchronousRequestTimeout,
+// 45s) rather than here, since every bds_* call shares that one method.
 - (void)deleteStoredBundlesInProxyTapped:(UIButton *)button {
     BundleDoctorConfig *config = [BundleDoctorSettings loadConfig];
     if (config.repoOwner.length == 0 || config.repoName.length == 0 || config.authToken.length == 0) {
@@ -5661,7 +5796,8 @@ static const CGFloat kContentFadeHeight = 22;
 // folder as of the 3.5 fix (see -gd_handlePickedLibraryImportURLs:
 // intoFolder: below, which now just forwards here). Classifies every
 // submitted file FIRST (see -gd_isRecognizedBundleURL:
-// below), then only hands the recognized ones to
+// below - a cheap header-signature sniff only, safe to run on this,
+// the main, queue), then only hands the recognized ones to
 // +[ModAssetLibrary importFileURLs:intoFolder:error:] - an unrecognized
 // file never touches the library at all, and gets its own "not a
 // recognized bank or bundle" line in the end-of-run summary instead.
@@ -5672,6 +5808,20 @@ static const CGFloat kContentFadeHeight = 22;
 // Mods (doctor pipeline)" below, there's no queue to feed here
 // anymore). All three sets land in one combined end-of-run alert - see
 // -gd_presentLoadModsFinalSummary.
+//
+// 7 - the import call itself now runs on a background queue behind an
+// "Indexing…" spinner, same shape as -gd_processLoadModsBankURLs:'s own
+// "Swapping Files…" step just below and the (now-removed) doctor-side
+// -gd_doctorLocateInstallTargetForDoctoredURL:entryPath:inFolder:.
+// +importFileURLs:intoFolder:error: does real per-bundle work here now
+// (CAB id / target-platform header reads, AND - as of this fix - the
+// CAB-based cache search that resolves resolvedInstallTargetPath up
+// front, see that method's own comment in ModAssetLibrary.m) that can
+// run long enough to freeze the UI for several seconds if left on the
+// calling thread - previously left there, which was the import-time
+// hang item 7 reported. Left OFF this file's classification loop
+// itself: that's just the cheap header sniff, not worth a spinner of
+// its own.
 - (void)gd_handleLoadModsPickedURLs:(NSArray<NSURL *> *)urls intoFolder:(NSString *)folderName {
     if (urls.count == 0) return;
 
@@ -5703,18 +5853,49 @@ static const CGFloat kContentFadeHeight = 22;
         }
     }
 
-    if (validURLs.count > 0) {
+    self.loadModsSummaryLines = summaryLines;
+
+    if (validURLs.count == 0) {
+        [self gd_processLoadModsBankURLs:bankURLs];
+        return;
+    }
+
+    UIViewController *presenter = gd_key_window().rootViewController;
+    UIAlertController *indexing = [UIAlertController alertControllerWithTitle:@"Indexing\u2026"
+                                                                        message:@"Reading bundle identifiers and matching them against the game's cache."
+                                                                 preferredStyle:UIAlertControllerStyleAlert];
+    UIActivityIndicatorView *spinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
+    spinner.translatesAutoresizingMaskIntoConstraints = NO;
+    [indexing.view addSubview:spinner];
+    [spinner startAnimating];
+    [NSLayoutConstraint activateConstraints:@[
+        [spinner.centerXAnchor constraintEqualToAnchor:indexing.view.centerXAnchor],
+        [spinner.bottomAnchor constraintEqualToAnchor:indexing.view.bottomAnchor constant:-16],
+    ]];
+    if (presenter) [presenter presentViewController:indexing animated:YES completion:nil];
+
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSError *importError = nil;
         BOOL imported = [ModAssetLibrary importFileURLs:validURLs intoFolder:folderName error:&importError];
         if (!imported) {
             ZLog(@"[Mods] couldn't add picked files to Mod Asset Library folder \"%@\": %@", folderName, importError);
         }
-        [self gd_rebuildModsLibrary];
-    }
 
-    self.loadModsSummaryLines = summaryLines;
-
-    [self gd_processLoadModsBankURLs:bankURLs];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            typeof(self) strongSelf = weakSelf;
+            if (!strongSelf) return;
+            void (^afterDismiss)(void) = ^{
+                [strongSelf gd_rebuildModsLibrary];
+                [strongSelf gd_processLoadModsBankURLs:bankURLs];
+            };
+            if (indexing.presentingViewController) {
+                [indexing dismissViewControllerAnimated:YES completion:afterDismiss];
+            } else {
+                afterDismiss();
+            }
+        });
+    });
 }
 
 // Content-based bundle check for a picker URL, safe to call before that
@@ -5905,12 +6086,13 @@ static const CGFloat kContentFadeHeight = 22;
 //
 // Dispatch, Retry, and Download are all wired below (Section 3 is done,
 // per progress.md's own split into first/second half). Download's own
-// target-file-pick step - CAB-auto-match via UnityCacheLocator first,
-// falling back to a manual UIDocumentPickerViewController pick - is the
-// old queue-based flow's target-picker machinery, reintroduced adapted
-// to a per-entry (rather than per-queue-item) shape; see
-// -gd_modsLibraryEntryDownloadTapped:'s own header for the full three
-// steps.
+// target-file-pick step - reading back the CAB-auto-match already
+// resolved at import time (ModAssetLibraryEntry.resolvedInstallTargetPath),
+// falling back to a manual UIDocumentPickerViewController pick only if
+// import time found no match - is the old queue-based flow's
+// target-picker machinery, reintroduced adapted to a per-entry (rather
+// than per-queue-item) shape; see -gd_modsLibraryEntryDownloadTapped:'s
+// own header for the full three steps.
 
 // ModAssetLibraryEntry doesn't carry the name of the folder it lives in
 // (see ModAssetLibrary.h's own header on why - it's bookkeeping the
@@ -5976,7 +6158,9 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
         return;
     }
 
-    [self gd_doctorStartOrInstallForEntry:entry folderName:folderName];
+    // Should just be nil for a never-before-dispatched entry, but pass
+    // it through for uniformity rather than hardcoding nil here.
+    [self gd_doctorStartOrInstallForEntry:entry folderName:folderName previousScratchBranch:entry.doctorScratchBranch];
 }
 
 // Shared by Dispatch (NotDispatched state) and Retry (once it's reset
@@ -5997,26 +6181,26 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
 // source the exact same way a .bank mod is a direct file swap with no
 // re-encoding (see BankTransplant.m). doctorDownloadInFlightPaths is
 // reused as this path's in-flight marker too, since
-// gd_doctorLocateInstallTargetForDoctoredURL:.../gd_doctorInstallDoctoredURL:...
+// gd_doctorInstallUsingKnownTargetForDoctoredURL:.../gd_doctorInstallDoctoredURL:...
 // already add/remove from it on completion - see
 // gd_make_mods_entry_row's NotDispatched case for how that reflects in
 // the row itself ("installing…" instead of the dispatch capsule).
 //
 // Anything else goes through the normal pipeline via
 // -gd_doctorBeginDispatchForEntry:folderName:.
-- (void)gd_doctorStartOrInstallForEntry:(ModAssetLibraryEntry *)entry folderName:(NSString *)folderName {
+- (void)gd_doctorStartOrInstallForEntry:(ModAssetLibraryEntry *)entry folderName:(NSString *)folderName previousScratchBranch:(nullable NSString *)previousScratchBranch {
     if (entry.targetPlatform && entry.targetPlatform.intValue == 9) {
         if (!self.doctorDownloadInFlightPaths) self.doctorDownloadInFlightPaths = [NSMutableSet set];
         if ([self.doctorDownloadInFlightPaths containsObject:entry.path]) return; // already installing - ignore the double-tap
         [self.doctorDownloadInFlightPaths addObject:entry.path];
         [self gd_rebuildModsLibrary];
-        [self gd_doctorLocateInstallTargetForDoctoredURL:[NSURL fileURLWithPath:entry.path]
+        [self gd_doctorInstallUsingKnownTargetForDoctoredURL:[NSURL fileURLWithPath:entry.path]
                                                 entryPath:entry.path
                                                  inFolder:folderName];
         return;
     }
 
-    [self gd_doctorBeginDispatchForEntry:entry folderName:folderName];
+    [self gd_doctorBeginDispatchForEntry:entry folderName:folderName previousScratchBranch:previousScratchBranch];
 }
 
 // The pipeline's actual phase-1 kickoff (upload + commit + branch +
@@ -6024,7 +6208,7 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
 // unchanged so -gd_modsLibraryEntryRetryTapped: can call the exact same
 // thing once it's reset the entry, instead of just dropping back to the
 // dispatch capsule and waiting for a second tap.
-- (void)gd_doctorBeginDispatchForEntry:(ModAssetLibraryEntry *)entry folderName:(NSString *)folderName {
+- (void)gd_doctorBeginDispatchForEntry:(ModAssetLibraryEntry *)entry folderName:(NSString *)folderName previousScratchBranch:(nullable NSString *)previousScratchBranch {
     // Section 4 spec: a boot-time check that found the saved credentials
     // no longer valid (self.authCredentialsStale) blocks dispatch with
     // just an error haptic - no alert - until Remove clears them. Checked
@@ -6067,6 +6251,7 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
     __weak typeof(self) weakSelf = self;
     [BundleDoctorService dispatchBundleAtURL:bundleURL
                                         config:config
+                         previousScratchBranch:previousScratchBranch
                                 uploadProgress:^(double fractionComplete) {
         [weakSelf gd_doctorHandleUploadProgress:fractionComplete forEntryPath:entryPath inFolder:folderName];
     }
@@ -6096,6 +6281,15 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
     [self.doctorUploadProgressLastPercent removeObjectForKey:entry.path];
     [self.doctorProcessProgressLastPercent removeObjectForKey:entry.path];
 
+    // Captured BEFORE the reset block below nils the persisted field -
+    // this is the one thing the resume check in
+    // -gd_doctorBeginDispatchForEntry:folderName:previousScratchBranch:
+    // needs (e.g. a run that quietly finished while the app was
+    // closed). The persisted doctorScratchBranch still gets nil'd in
+    // the reset block same as before; only this local carries the old
+    // value forward for this one call.
+    NSString *previousScratchBranch = entry.doctorScratchBranch;
+
     NSError *error = nil;
     ModAssetLibraryEntry *updated = [ModAssetLibrary updateDoctorStateForEntry:entry
                                                                         inFolder:folderName
@@ -6114,7 +6308,7 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
         return;
     }
 
-    [self gd_doctorStartOrInstallForEntry:updated folderName:folderName];
+    [self gd_doctorStartOrInstallForEntry:updated folderName:folderName previousScratchBranch:previousScratchBranch];
 }
 
 // Throttled write-back for phase 1's uploadProgress callback - skips
@@ -6262,6 +6456,25 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
     NSTimer *timer = self.doctorPollTimers[entryPath];
     [timer invalidate];
     [self.doctorPollTimers removeObjectForKey:entryPath];
+}
+
+// Shared by the two "poll right now instead of waiting for the next 6s
+// tick" triggers below (panel-open, app-foreground-resume) - iterates
+// every entry currently mid-Processing (i.e. with a live poll timer -
+// see -gd_armDoctorPollTimerForEntryPath:inFolder:) and re-polls it
+// immediately. folderName isn't stored in doctorPollTimers, so it's
+// re-derived per path the same way a poll tick itself would if it only
+// had a path - see gd_mods_folder_name_for_entry/
+// gd_mods_entry_placeholder_for_path above, both already used
+// elsewhere in this pipeline for exactly this. Doesn't touch the
+// timers themselves (arm/disarm is unrelated to this) - just piggy-
+// backs an extra -gd_pollDoctorRunForEntryPath:inFolder: call onto
+// each one that's already ticking.
+- (void)gd_pollAllActiveDoctorEntriesImmediately {
+    for (NSString *entryPath in self.doctorPollTimers.allKeys) {
+        NSString *folderName = gd_mods_folder_name_for_entry(gd_mods_entry_placeholder_for_path(entryPath));
+        [self gd_pollDoctorRunForEntryPath:entryPath inFolder:folderName];
+    }
 }
 
 // One poll tick for one entry: reads the entry's current on-disk state
@@ -6705,24 +6918,31 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
     // (gd_mods_stored_bundle_file_options(), wired inside
     // gd_make_mods_entry_row/-gd_openModsOptionsDropdownForButton:entry:
     // folderName: via the isStoredBundlesRow check there).
-    BOOL storedExpanded = [self.modsLibraryExpandedFolders containsObject:kGDStoredBundlesFolderName];
-    UIView *storedFolderRow = gd_make_mods_folder_row(kGDStoredBundlesFolderName,
-        kGDStoredBundlesFolderSubtext, storedExpanded, self,
-        @selector(gd_modsLibraryFolderRowTapped:), NULL);
-    [self.modsLibraryStack addArrangedSubview:storedFolderRow];
+    //
+    // 4: unlike every other folder above (which shows even when empty,
+    // labeled "Empty."), this row is only added at all when there's
+    // actually something stored - the folder itself is created lazily
+    // on first store (see -gd_cacheBundleEntry:inFolder:), so
+    // +folderNames not containing it yet is the normal "nothing's ever
+    // been stored" state, not an error. +entriesInFolder:error: is
+    // fetched once here regardless of expanded state (rather than only
+    // when storedExpanded, as before) since visibility itself now
+    // depends on whether it's non-empty - reused below instead of
+    // re-fetching a second time.
+    NSError *storedError = nil;
+    NSArray<ModAssetLibraryEntry *> *storedEntries =
+        [[ModAssetLibrary folderNames] containsObject:kGDStoredBundlesFolderName]
+            ? [ModAssetLibrary entriesInFolder:kGDStoredBundlesFolderName error:&storedError]
+            : nil;
 
-    if (storedExpanded) {
-        NSError *storedError = nil;
-        NSArray<ModAssetLibraryEntry *> *storedEntries =
-            [ModAssetLibrary entriesInFolder:kGDStoredBundlesFolderName error:&storedError];
+    if (storedEntries.count > 0) {
+        BOOL storedExpanded = [self.modsLibraryExpandedFolders containsObject:kGDStoredBundlesFolderName];
+        UIView *storedFolderRow = gd_make_mods_folder_row(kGDStoredBundlesFolderName,
+            kGDStoredBundlesFolderSubtext, storedExpanded, self,
+            @selector(gd_modsLibraryFolderRowTapped:), NULL);
+        [self.modsLibraryStack addArrangedSubview:storedFolderRow];
 
-        if (!storedEntries || storedEntries.count == 0) {
-            UILabel *emptyStored = [[UILabel alloc] init];
-            emptyStored.text = @"  Empty.";
-            emptyStored.font = [UIFont systemFontOfSize:11 weight:UIFontWeightRegular];
-            emptyStored.textColor = [UIColor colorWithWhite:1 alpha:0.4];
-            [self.modsLibraryStack addArrangedSubview:emptyStored];
-        } else {
+        if (storedExpanded) {
             // Same A-Z display sort as a real folder's entries (not
             // Processed Bundles' newest-first release order) - per
             // spec 7, "the Bundle's name and description will remain
@@ -6813,7 +7033,9 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
         [self.modsLibraryStack addArrangedSubview:releaseRow];
 
         if (releaseExpanded) {
-            UIView *releaseInfoPanel = gd_make_processed_bundle_info_panel(release);
+            BOOL installInFlight = [self.processedBundleInstallInFlight containsObject:release.tagName];
+            UIView *releaseInfoPanel = gd_make_processed_bundle_info_panel(release, installInFlight, self,
+                @selector(gd_processedBundleInstallTapped:));
             [self.modsLibraryStack addArrangedSubview:releaseInfoPanel];
         }
     }
@@ -6904,6 +7126,191 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
         [self.modsLibraryExpandedProcessedBundles addObject:release.tagName];
     }
     [self gd_rebuildModsLibrary];
+}
+
+// --- Processed Bundles install (9) ---
+//
+// Wired to a Processed Bundles row's info-panel install pill (see
+// gd_make_processed_bundle_info_panel) - only reachable while that
+// row's dropdown is open, per spec. Four steps, in order:
+//   1. Pick (or create) a destination Mod Asset Library folder -
+//      -gd_pickModsLibraryFolderForInstallWithCompletion:.
+//   2. Download the release's own output.bundle asset -
+//      +[BundleDoctorService downloadProcessedRelease:config:progress:
+//      completion:], which - unlike the ordinary doctor-pipeline
+//      download - leaves the release itself sitting in the repo
+//      afterward (see that method's own header).
+//   3. Import the downloaded bytes into the chosen folder -
+//      +[ModAssetLibrary importFileURLs:intoFolder:error:], the same
+//      importer (and the same item-7 off-main hang fix) an ordinary
+//      Load Mods pick already goes through, which resolves this new
+//      entry's own resolvedInstallTargetPath via a CAB cache match.
+//   4. Since a processed release is already fully doctored - that's
+//      what "processed" means - skip straight to the same known-target
+//      install step (-gd_doctorInstallUsingKnownTargetForDoctoredURL:
+//      entryPath:inFolder:) an ordinary doctor-pipeline download uses
+//      once ITS import has already resolved a target.
+- (void)gd_processedBundleInstallTapped:(UIButton *)sender {
+    BundleDoctorProcessedRelease *release = objc_getAssociatedObject(sender, "gd_processedRelease");
+    if (!release) return;
+
+    if (!self.processedBundleInstallInFlight) self.processedBundleInstallInFlight = [NSMutableSet set];
+    if ([self.processedBundleInstallInFlight containsObject:release.tagName]) return; // already in flight - ignore the double-tap
+
+    BundleDoctorConfig *config = [BundleDoctorSettings loadConfig];
+    if (config.repoOwner.length == 0 || config.repoName.length == 0 || config.authToken.length == 0) {
+        [self gd_presentModsAlertWithTitle:@"Auth Not Configured"
+                                    message:@"Set a GitHub Repository Link and Personal Access Token under Mods \u2192 Auth first."];
+        return;
+    }
+
+    UIImpactFeedbackGenerator *haptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
+    [haptic impactOccurred];
+
+    __weak typeof(self) weakSelf = self;
+    [self gd_pickModsLibraryFolderForInstallWithCompletion:^(NSString *folderName) {
+        [weakSelf gd_installProcessedBundleRelease:release intoFolder:folderName config:config];
+    }];
+}
+
+// Step 1 - "select a folder to place the bundle or create [one]", per
+// the 9 spec; if none exist yet, skips straight to "create a folder,
+// then continue" with no picker at all, same shape
+// -gd_restoreStoredBundleEntry:inFolder:'s own zero-pickable-folders
+// branch already uses. Unlike that method's picker, this one always
+// offers a "New Folder…" row alongside any existing folders too (not
+// just when there are none) - both halves of "select ... or create" are
+// available up front here, since there's no previous folder of this
+// release's own to fall back to first the way a Restore has.
+// "Stored Bundles" is never offered as a destination, same reasoning as
+// that folder being excluded from Restore's own picker.
+- (void)gd_pickModsLibraryFolderForInstallWithCompletion:(void (^)(NSString *chosenFolder))completion {
+    NSMutableArray<NSString *> *pickable = [[ModAssetLibrary folderNames] mutableCopy];
+    [pickable removeObject:kGDStoredBundlesFolderName];
+
+    void (^createAndContinue)(void) = ^{
+        [self gd_promptForModFolderNameWithTitle:@"New Folder"
+                                      actionTitle:@"Create & Install"
+                                       completion:^(NSString *trimmedName) {
+            NSError *createErr = nil;
+            if (![ModAssetLibrary createFolderNamed:trimmedName error:&createErr]) {
+                [self gd_presentModsAlertWithTitle:@"Couldn't Create Folder" message:createErr.localizedDescription ?: @"Unknown error."];
+                return;
+            }
+            completion(trimmedName);
+        }];
+    };
+
+    if (pickable.count == 0) {
+        createAndContinue();
+        return;
+    }
+
+    UIViewController *presenter = gd_key_window().rootViewController;
+    if (!presenter) return;
+    UIAlertController *sheet = [UIAlertController alertControllerWithTitle:@"Install Into Which Folder?"
+                                                                      message:nil
+                                                               preferredStyle:UIAlertControllerStyleActionSheet];
+    for (NSString *candidate in pickable) {
+        [sheet addAction:[UIAlertAction actionWithTitle:candidate style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+            completion(candidate);
+        }]];
+    }
+    [sheet addAction:[UIAlertAction actionWithTitle:@"New Folder\u2026" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
+        createAndContinue();
+    }]];
+    [sheet addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    [presenter presentViewController:sheet animated:YES completion:nil];
+}
+
+// Steps 2-4 - see -gd_processedBundleInstallTapped:'s own header.
+// Guards on processedBundleInstallInFlight itself (rather than trusting
+// the caller not to double-invoke) since this is also the completion
+// target of the folder-pick step above, which can't itself re-check a
+// tap that already passed the guard in -gd_processedBundleInstallTapped:.
+- (void)gd_installProcessedBundleRelease:(BundleDoctorProcessedRelease *)release intoFolder:(NSString *)folderName config:(BundleDoctorConfig *)config {
+    if ([self.processedBundleInstallInFlight containsObject:release.tagName]) return;
+    [self.processedBundleInstallInFlight addObject:release.tagName];
+    [self gd_rebuildModsLibrary]; // so the pill immediately reads "installing…"
+
+    __weak typeof(self) weakSelf = self;
+    [BundleDoctorService downloadProcessedRelease:release config:config
+        progress:nil // no per-row percent UI for this pill, per spec - a minimal pill, not a full doctor-capsule state machine
+        completion:^(NSURL * _Nullable bundleURL, NSError * _Nullable error) {
+        typeof(self) strongSelf = weakSelf;
+        if (!strongSelf) return;
+        if (!bundleURL) {
+            [strongSelf.processedBundleInstallInFlight removeObject:release.tagName];
+            UINotificationFeedbackGenerator *errHaptic = [UINotificationFeedbackGenerator new];
+            [errHaptic notificationOccurred:UINotificationFeedbackTypeError];
+            [strongSelf gd_presentModsAlertWithTitle:@"Download Failed"
+                                              message:error.localizedDescription ?: @"Unknown error."];
+            [strongSelf gd_rebuildModsLibrary];
+            return;
+        }
+        [strongSelf gd_importAndInstallDownloadedProcessedBundleAtURL:bundleURL release:release intoFolder:folderName];
+    }];
+}
+
+// Step 3-4 tail - imports the downloaded bytes (off-main, same
+// "Indexing…"-worthy cost/shape as -gd_handleLoadModsPickedURLs:
+// intoFolder:'s own import call, though this one runs silently rather
+// than under its own spinner since the install pill's "installing…"
+// label already covers the whole pipeline, download included), then
+// diffs the folder's entries before/after to find the new entry
+// +importFileURLs:intoFolder:error: just created - that method reports
+// success/failure only, not which entry it added - before handing off
+// to the same known-target install step an ordinary doctor-pipeline
+// download uses.
+- (void)gd_importAndInstallDownloadedProcessedBundleAtURL:(NSURL *)bundleURL release:(BundleDoctorProcessedRelease *)release intoFolder:(NSString *)folderName {
+    NSError *beforeErr = nil;
+    NSSet<NSString *> *pathsBefore = [NSSet setWithArray:
+        [[ModAssetLibrary entriesInFolder:folderName error:&beforeErr] valueForKey:@"path"] ?: @[]];
+
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        NSError *importError = nil;
+        BOOL imported = [ModAssetLibrary importFileURLs:@[bundleURL] intoFolder:folderName error:&importError];
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            typeof(self) strongSelf = weakSelf;
+            if (!strongSelf) return;
+            if (!imported) {
+                [strongSelf.processedBundleInstallInFlight removeObject:release.tagName];
+                UINotificationFeedbackGenerator *errHaptic = [UINotificationFeedbackGenerator new];
+                [errHaptic notificationOccurred:UINotificationFeedbackTypeError];
+                [strongSelf gd_presentModsAlertWithTitle:@"Import Failed"
+                                                  message:importError.localizedDescription ?: @"Unknown error."];
+                [strongSelf gd_rebuildModsLibrary];
+                return;
+            }
+
+            NSError *afterErr = nil;
+            NSArray<ModAssetLibraryEntry *> *afterEntries = [ModAssetLibrary entriesInFolder:folderName error:&afterErr] ?: @[];
+            ModAssetLibraryEntry *newEntry = nil;
+            for (ModAssetLibraryEntry *candidate in afterEntries) {
+                if (![pathsBefore containsObject:candidate.path]) { newEntry = candidate; break; }
+            }
+            if (!newEntry) {
+                ZLog(@"[Mods Library] imported processed release %@ into \"%@\" but couldn't find its new entry afterward.", release.tagName, folderName);
+                [strongSelf.processedBundleInstallInFlight removeObject:release.tagName];
+                [strongSelf gd_rebuildModsLibrary];
+                return;
+            }
+
+            // -gd_doctorInstallUsingKnownTargetForDoctoredURL:...'s own
+            // failure paths (no cache match -> manual picker; install
+            // itself fails) each surface their own alert but do NOT
+            // clear processedBundleInstallInFlight or rebuild this
+            // pill's own row - do both here, up front, since this
+            // pipeline's own in-flight bookkeeping is local to this
+            // method, not shared with the ordinary entry-row download
+            // flow those failure paths were written for.
+            [strongSelf.processedBundleInstallInFlight removeObject:release.tagName];
+            [strongSelf gd_rebuildModsLibrary];
+            [strongSelf gd_doctorInstallUsingKnownTargetForDoctoredURL:bundleURL entryPath:newEntry.path inFolder:folderName];
+        });
+    });
 }
 
 // 3.4.5: this used to be where the folder row's standalone "Add" pill
@@ -7253,10 +7660,12 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
 // / mal_sandboxRelativePath:), so this is just that relationship run in
 // reverse: the one way to get back to the real, absolute in-game path
 // Cache/Restore actually need to touch. nil for anything that was never
-// installed (livePathDescription unset) - "Cache bundle" is only ever
-// offered once doctorStatus is Installed, which is the same thing that
-// sets this field in the first place, so that shouldn't happen in
-// practice; checked anyway rather than assumed.
+// installed (livePathDescription unset) - callers only invoke this for
+// an entry that's actually live-installed (see -gd_cacheBundleEntry:
+// inFolder:/-gd_restoreStoredBundleEntry:inFolder:, both of which now
+// gate on entry.isAssetBundle themselves rather than assuming every
+// entry that reaches here is a live-installed bundle - see 1's changes
+// to both).
 static NSURL *gd_mods_live_stock_url_for_entry(ModAssetLibraryEntry *entry) {
     if (entry.livePathDescription.length == 0) return nil;
     NSString *absolute = [NSHomeDirectory() stringByAppendingPathComponent:entry.livePathDescription];
@@ -7281,41 +7690,56 @@ static NSURL *gd_mods_live_stock_url_for_entry(ModAssetLibraryEntry *entry) {
 // cachedFromFolder is stamped with the entry's real folder before the
 // move so -gd_restoreStoredBundleEntry:inFolder: knows where to put it
 // back.
+//
+// 1: storing no longer requires the entry to already be installed - any
+// bank or bundle entry, in any doctor state, can be moved into Stored
+// Bundles now. The live-swap-back-to-original step above only actually
+// runs for a bundle that's currently live-installed via the doctor
+// pipeline (isLiveInstalledBundle below) - anything else (a never-
+// dispatched/still-processing/failed bundle, or any .bank entry, whose
+// own live swap is a wholly separate BankTransplant-driven mechanism
+// this action was never wired to and shouldn't touch) has nothing live
+// of its own to restore, so this just moves the entry's existing
+// on-disk library copy into Stored Bundles as-is - replacementBytesURL
+// stays nil in that case rather than snapshotting/restoring anything.
 - (void)gd_cacheBundleEntry:(ModAssetLibraryEntry *)entry inFolder:(NSString *)folderName {
-    if (!entry.isAssetBundle || entry.doctorStatus != ModAssetLibraryDoctorStatusInstalled) {
-        [self gd_presentModsAlertWithTitle:@"Can't Cache"
-                                    message:@"Only an installed bundle can be cached."];
-        return;
-    }
-    NSURL *stockURL = gd_mods_live_stock_url_for_entry(entry);
-    if (!stockURL) {
-        [self gd_presentModsAlertWithTitle:@"Can't Cache"
+    BOOL isLiveInstalledBundle = entry.isAssetBundle && entry.doctorStatus == ModAssetLibraryDoctorStatusInstalled;
+
+    NSURL *stockURL = isLiveInstalledBundle ? gd_mods_live_stock_url_for_entry(entry) : nil;
+    if (isLiveInstalledBundle && !stockURL) {
+        [self gd_presentModsAlertWithTitle:@"Can't Store"
                                     message:@"This entry's live location isn't known."];
         return;
     }
 
-    // Snapshot the live (doctored) bytes into a temp file BEFORE
-    // swapping the live file back to the original - this is what
-    // +moveEntry:...replacementBytesURL: copies into "Stored Bundles" as
-    // the entry's own new contents, so it has to be taken before
-    // -cacheOriginalBackForStockBundleURL:error: overwrites stockURL.
-    NSString *tempPath = [NSTemporaryDirectory() stringByAppendingPathComponent:[NSUUID UUID].UUIDString];
-    NSError *snapshotErr = nil;
-    BOOL scoped = [stockURL startAccessingSecurityScopedResource];
-    BOOL snapshotted = [NSFileManager.defaultManager copyItemAtURL:stockURL toURL:[NSURL fileURLWithPath:tempPath] error:&snapshotErr];
-    if (scoped) [stockURL stopAccessingSecurityScopedResource];
-    if (!snapshotted) {
-        [self gd_presentModsAlertWithTitle:@"Cache Failed"
-                                    message:snapshotErr.localizedDescription ?: @"Couldn't read the live bundle."];
-        return;
-    }
+    NSString *tempPath = nil;
+    NSURL *replacementBytesURL = nil;
+    if (stockURL) {
+        // Snapshot the live (doctored) bytes into a temp file BEFORE
+        // swapping the live file back to the original - this is what
+        // +moveEntry:...replacementBytesURL: copies into "Stored
+        // Bundles" as the entry's own new contents, so it has to be
+        // taken before -cacheOriginalBackForStockBundleURL:error:
+        // overwrites stockURL.
+        tempPath = [NSTemporaryDirectory() stringByAppendingPathComponent:[NSUUID UUID].UUIDString];
+        NSError *snapshotErr = nil;
+        BOOL scoped = [stockURL startAccessingSecurityScopedResource];
+        BOOL snapshotted = [NSFileManager.defaultManager copyItemAtURL:stockURL toURL:[NSURL fileURLWithPath:tempPath] error:&snapshotErr];
+        if (scoped) [stockURL stopAccessingSecurityScopedResource];
+        if (!snapshotted) {
+            [self gd_presentModsAlertWithTitle:@"Store Failed"
+                                        message:snapshotErr.localizedDescription ?: @"Couldn't read the live bundle."];
+            return;
+        }
 
-    NSError *cacheErr = nil;
-    if (![BundleDoctorInstaller cacheOriginalBackForStockBundleURL:stockURL error:&cacheErr]) {
-        [NSFileManager.defaultManager removeItemAtPath:tempPath error:nil];
-        [self gd_presentModsAlertWithTitle:@"Cache Failed"
-                                    message:cacheErr.localizedDescription ?: @"Unknown error."];
-        return;
+        NSError *cacheErr = nil;
+        if (![BundleDoctorInstaller cacheOriginalBackForStockBundleURL:stockURL error:&cacheErr]) {
+            [NSFileManager.defaultManager removeItemAtPath:tempPath error:nil];
+            [self gd_presentModsAlertWithTitle:@"Store Failed"
+                                        message:cacheErr.localizedDescription ?: @"Unknown error."];
+            return;
+        }
+        replacementBytesURL = [NSURL fileURLWithPath:tempPath];
     }
 
     // "Stored Bundles" is created on demand, the first time anything's
@@ -7326,8 +7750,8 @@ static NSURL *gd_mods_live_stock_url_for_entry(ModAssetLibraryEntry *entry) {
     NSError *createErr = nil;
     if (![ModAssetLibrary createFolderNamed:kGDStoredBundlesFolderName error:&createErr]
         && createErr.code != ModAssetLibraryErrorFolderAlreadyExists) {
-        [NSFileManager.defaultManager removeItemAtPath:tempPath error:nil];
-        [self gd_presentModsAlertWithTitle:@"Cache Failed"
+        if (tempPath) [NSFileManager.defaultManager removeItemAtPath:tempPath error:nil];
+        [self gd_presentModsAlertWithTitle:@"Store Failed"
                                     message:createErr.localizedDescription ?: @"Couldn't prepare Stored Bundles."];
         return;
     }
@@ -7337,16 +7761,19 @@ static NSURL *gd_mods_live_stock_url_for_entry(ModAssetLibraryEntry *entry) {
     ModAssetLibraryEntry *moved = [ModAssetLibrary moveEntry:entry
                                                     fromFolder:folderName
                                                       toFolder:kGDStoredBundlesFolderName
-                                           replacementBytesURL:[NSURL fileURLWithPath:tempPath]
+                                           replacementBytesURL:replacementBytesURL
                                                          error:&moveErr];
-    [NSFileManager.defaultManager removeItemAtPath:tempPath error:nil];
+    if (tempPath) [NSFileManager.defaultManager removeItemAtPath:tempPath error:nil];
     if (!moved) {
         // The live file is already swapped back to original at this
-        // point and there's no clean way to un-cache it from here - log
-        // it plainly rather than pretending this half failed too.
-        ZLog(@"[Mods Library] cached %@'s live file back to original but couldn't move its library entry into Stored Bundles: %@", entry.fileName, moveErr.localizedDescription);
-        [self gd_presentModsAlertWithTitle:@"Cache Partly Failed"
-                                    message:@"The live bundle was restored, but the entry couldn't be moved into Stored Bundles. See syslog."];
+        // point (if it ever was swapped in) and there's no clean way to
+        // un-cache it from here - log it plainly rather than pretending
+        // this half failed too.
+        ZLog(@"[Mods Library] couldn't move %@ into Stored Bundles: %@", entry.fileName, moveErr.localizedDescription);
+        [self gd_presentModsAlertWithTitle:@"Store Partly Failed"
+                                    message:replacementBytesURL
+                                        ? @"The live bundle was restored, but the entry couldn't be moved into Stored Bundles. See syslog."
+                                        : @"The entry couldn't be moved into Stored Bundles. See syslog."];
         [self gd_rebuildModsLibrary];
         return;
     }
@@ -7367,13 +7794,16 @@ static NSURL *gd_mods_live_stock_url_for_entry(ModAssetLibraryEntry *entry) {
 // touching the backup, i.e. "the original returns to its cache" per the
 // person's own spec wording; it was never moved out of there by
 // -gd_cacheBundleEntry:inFolder: in the first place.
+//
+// 1: only a bundle entry that was actually live-installed before being
+// stored (i.e. -gd_cacheBundleEntry:inFolder: found a stockURL for it)
+// has anything live worth re-installing here - a bundle that was stored
+// without ever being installed, or any .bank entry (whose own live swap
+// is BankTransplant's, a separate mechanism this action was never wired
+// to and shouldn't touch), skips the live half entirely and just moves
+// the manifest row back.
 - (void)gd_restoreStoredBundleEntry:(ModAssetLibraryEntry *)entry inFolder:(NSString *)folderName {
-    NSURL *stockURL = gd_mods_live_stock_url_for_entry(entry);
-    if (!stockURL) {
-        [self gd_presentModsAlertWithTitle:@"Can't Restore"
-                                    message:@"This entry's original live location isn't known."];
-        return;
-    }
+    NSURL *stockURL = entry.isAssetBundle ? gd_mods_live_stock_url_for_entry(entry) : nil;
 
     NSArray<NSString *> *realFolders = [[ModAssetLibrary folderNames] mutableCopy];
     NSString *targetFolder = entry.cachedFromFolder;
@@ -7421,16 +7851,19 @@ static NSURL *gd_mods_live_stock_url_for_entry(ModAssetLibraryEntry *entry) {
 // Shared tail end of -gd_restoreStoredBundleEntry:inFolder: once the
 // destination folder is known to exist (whether that's
 // entry.cachedFromFolder unchanged, a person's own pick, or one just
-// created for this) - re-installs the doctored bytes live, then moves
-// the manifest row back.
-- (void)gd_finishRestoringStoredBundleEntry:(ModAssetLibraryEntry *)entry stockURL:(NSURL *)stockURL intoFolder:(NSString *)destFolder {
-    NSError *installErr = nil;
-    if (![BundleDoctorInstaller installDoctoredBundleAtURL:[NSURL fileURLWithPath:entry.path]
-                                          toStockBundleURL:stockURL
-                                                      error:&installErr]) {
-        [self gd_presentModsAlertWithTitle:@"Restore Failed"
-                                    message:installErr.localizedDescription ?: @"Unknown error."];
-        return;
+// created for this) - re-installs the doctored bytes live (only when
+// stockURL is non-nil - see -gd_restoreStoredBundleEntry:inFolder:'s own
+// header on when that's skipped), then moves the manifest row back.
+- (void)gd_finishRestoringStoredBundleEntry:(ModAssetLibraryEntry *)entry stockURL:(nullable NSURL *)stockURL intoFolder:(NSString *)destFolder {
+    if (stockURL) {
+        NSError *installErr = nil;
+        if (![BundleDoctorInstaller installDoctoredBundleAtURL:[NSURL fileURLWithPath:entry.path]
+                                              toStockBundleURL:stockURL
+                                                          error:&installErr]) {
+            [self gd_presentModsAlertWithTitle:@"Restore Failed"
+                                        message:installErr.localizedDescription ?: @"Unknown error."];
+            return;
+        }
     }
 
     entry.cachedFromFolder = nil;
@@ -7757,10 +8190,11 @@ static NSURL *gd_mods_live_stock_url_for_entry(ModAssetLibraryEntry *entry) {
 //      way Uploading/Processing are.
 //   2. Figure out which on-disk stock bundle to overwrite.
 //      BundleDoctorInstaller.h deliberately doesn't guess this itself -
-//      see that file's header - so this tries UnityCacheLocator's
-//      CAB-based auto-match first (silent, no picker) and only falls
-//      back to a manual UIDocumentPickerViewController pass, per the
-//      spec, if that comes up empty.
+//      see that file's header - so this reads back the CAB-based
+//      auto-match already resolved at import time (silent, no picker;
+//      see ModAssetLibraryEntry.resolvedInstallTargetPath) and only
+//      falls back to a manual UIDocumentPickerViewController pass, per
+//      the spec, if that came up empty back then.
 //   3. +[BundleDoctorInstaller installDoctoredBundleAtURL:
 //      toStockBundleURL:error:] - the actual on-disk swap. Per the
 //      person's own spec ("automatically slot it in place once it's
@@ -7831,7 +8265,7 @@ static NSURL *gd_mods_live_stock_url_for_entry(ModAssetLibraryEntry *entry) {
             [strongSelf gd_doctorDownloadFailedForEntryPath:entryPath inFolder:folderName error:error];
             return;
         }
-        [strongSelf gd_doctorLocateInstallTargetForDoctoredURL:doctoredBundleURL entryPath:entryPath inFolder:folderName];
+        [strongSelf gd_doctorInstallUsingKnownTargetForDoctoredURL:doctoredBundleURL entryPath:entryPath inFolder:folderName];
     }];
 }
 
@@ -7876,80 +8310,40 @@ static NSURL *gd_mods_live_stock_url_for_entry(ModAssetLibraryEntry *entry) {
 }
 
 // Step 2 of the download flow (see -gd_modsLibraryEntryDownloadTapped:'s
-// own header) - tries UnityCacheLocator's CAB match before falling back
-// to a manual pick. doctoredURL's CAB (not the pre-doctor modded file
-// still sitting in the library at entryPath) is used, per
-// UnityCacheLocator.h's own note that doctoring doesn't touch a
-// bundle's directory-table CAB, so either file reads the same one -
-// doctoredURL is what's actually about to be installed, so reading its
-// own CAB is one fewer file this has to reason about being in sync.
-//
-// The actual search (+[UnityCacheLocator cabForBundleAtPath:error:] +
-// +locateBundlePathForCAB:error:] walks Library/UnityCache/Shared and
-// runs UnityBundleCAB's header parse against every regular file under
-// it) used to run synchronously right here, on whatever queue this
+// own header) - reads back the destination +[ModAssetLibrary
+// importFileURLs:intoFolder:error:] already resolved ONCE at import time
+// (ModAssetLibraryEntry.resolvedInstallTargetPath - see that field's own
+// header comment) rather than re-running UnityCacheLocator's search
+// here. That search used to run right here, on whatever queue this
 // method was called on - which per -gd_modsLibraryEntryDownloadTapped:
 // is +[BundleDoctorService fetchDoctoredBundleForHandle:...]'s
-// completion, i.e. the main queue. A cache directory with any real
-// number of entries turns that into the multi-second freeze item 2
-// reported. Fixed the same way -gd_processLoadModsBankURLs: already
-// handles its own "Swapping Files..." background work: present a
-// small non-blocking "Indexing..." spinner alert first, do the actual
-// search on a background queue, then hop back to main to either
-// install (match found) or fall back to the manual picker (no match /
-// unreadable CAB) once it's done. This method itself must still be
-// called on the main queue (it presents UI); the search work it kicks
-// off is what moves off of it.
-- (void)gd_doctorLocateInstallTargetForDoctoredURL:(NSURL *)doctoredURL entryPath:(NSString *)entryPath inFolder:(NSString *)folderName {
-    UIViewController *presenter = gd_key_window().rootViewController;
-    UIAlertController *indexing = [UIAlertController alertControllerWithTitle:@"Indexing\u2026"
-                                                                        message:@"Looking for a matching stock bundle in the Unity cache."
-                                                                 preferredStyle:UIAlertControllerStyleAlert];
-    UIActivityIndicatorView *spinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
-    spinner.translatesAutoresizingMaskIntoConstraints = NO;
-    [indexing.view addSubview:spinner];
-    [spinner startAnimating];
-    [NSLayoutConstraint activateConstraints:@[
-        [spinner.centerXAnchor constraintEqualToAnchor:indexing.view.centerXAnchor],
-        [spinner.bottomAnchor constraintEqualToAnchor:indexing.view.bottomAnchor constant:-16],
-    ]];
-    if (presenter) [presenter presentViewController:indexing animated:YES completion:nil];
+// completion, i.e. the main queue - and a cache directory with any real
+// number of entries turned that into the multi-second freeze item 2
+// reported. Item 7 fixed the underlying hang at its source (moved the
+// search to import time, run off-main there - see
+// -gd_handleLoadModsPickedURLs:intoFolder:), which makes the search
+// this method used to do here entirely redundant, not just slow -
+// running it twice would just find the same answer twice. So this step
+// is now a synchronous manifest read with no spinner needed.
+// Falls back to the manual picker only when import time genuinely found
+// no cache match (asset not yet cached by the game) - never re-searches.
+- (void)gd_doctorInstallUsingKnownTargetForDoctoredURL:(NSURL *)doctoredURL entryPath:(NSString *)entryPath inFolder:(NSString *)folderName {
+    NSError *entriesErr = nil;
+    NSArray<ModAssetLibraryEntry *> *entries = [ModAssetLibrary entriesInFolder:folderName error:&entriesErr] ?: @[];
+    ModAssetLibraryEntry *entry = nil;
+    for (ModAssetLibraryEntry *candidate in entries) {
+        if ([candidate.path isEqualToString:entryPath]) { entry = candidate; break; }
+    }
 
-    __weak typeof(self) weakSelf = self;
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        NSError *cabError = nil;
-        NSString *cab = [UnityCacheLocator cabForBundleAtPath:doctoredURL.path error:&cabError];
+    NSString *relativeTarget = entry.resolvedInstallTargetPath;
+    if (relativeTarget.length > 0) {
+        NSString *absolute = [NSHomeDirectory() stringByAppendingPathComponent:relativeTarget];
+        [self gd_doctorInstallDoctoredURL:doctoredURL toStockBundleURL:[NSURL fileURLWithPath:absolute] entryPath:entryPath inFolder:folderName];
+        return;
+    }
 
-        NSString *matchPath = nil;
-        NSError *locateError = nil;
-        if (cab) {
-            matchPath = [UnityCacheLocator locateBundlePathForCAB:cab error:&locateError];
-        }
-
-        dispatch_async(dispatch_get_main_queue(), ^{
-            typeof(self) strongSelf = weakSelf;
-            if (!strongSelf) return;
-
-            void (^afterDismiss)(void) = ^{
-                if (matchPath) {
-                    [strongSelf gd_doctorInstallDoctoredURL:doctoredURL toStockBundleURL:[NSURL fileURLWithPath:matchPath] entryPath:entryPath inFolder:folderName];
-                    return;
-                }
-                if (cab) {
-                    ZLog(@"[Mods Library] no UnityCache match for %@'s CAB (%@) - falling back to the manual picker: %@", entryPath.lastPathComponent, cab, locateError.localizedDescription);
-                } else {
-                    ZLog(@"[Mods Library] couldn't read a CAB off the doctored bundle for %@ - falling back to the manual picker: %@", entryPath.lastPathComponent, cabError.localizedDescription);
-                }
-                [strongSelf gd_presentDoctorInstallTargetPickerForDoctoredURL:doctoredURL entryPath:entryPath inFolder:folderName];
-            };
-
-            if (indexing.presentingViewController) {
-                [indexing dismissViewControllerAnimated:YES completion:afterDismiss];
-            } else {
-                afterDismiss();
-            }
-        });
-    });
+    ZLog(@"[Mods Library] no import-time cache match on file for %@ - falling back to the manual picker.", entryPath.lastPathComponent);
+    [self gd_presentDoctorInstallTargetPickerForDoctoredURL:doctoredURL entryPath:entryPath inFolder:folderName];
 }
 
 // Manual fallback for step 2 - same picker shape as

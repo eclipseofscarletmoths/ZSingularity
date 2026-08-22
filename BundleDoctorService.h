@@ -144,45 +144,59 @@
 // old method did - phases 2-4 are each one cheap JSON request with a
 // single outcome, not a multi-step sequence worth narrating.
 //
-// DETERMINISTIC RELEASE NAMING, AND WHY (read before touching
-// +bds_deterministicTagForCAB:moddedData: in the .m): the scratch branch/
-// release tag used to be a fresh "bundle-doctor/<uuid>" on every call,
-// with no relationship between two dispatches of the same bundle. It's
-// now derived from the bundle's own identity instead, so re-dispatching
-// an unchanged bundle lands on the exact same tag:
+// UNIQUE RELEASE NAMING + PER-ENTRY RESUME CHECK, AND WHY (read before
+// touching +bds_uniqueTagForCAB: in the .m): the scratch branch/release
+// tag used to be deterministic - derived from the bundle's own CAB +
+// SHA-256, so re-dispatching an unchanged bundle landed on the exact same
+// tag a previous submission (possibly a completely unrelated one, on a
+// completely unrelated entry, that just happened to share content) had
+// already used. That caused a plethora of issues on a re-upload: the
+// branch-create/release-create calls below would collide with whatever
+// that earlier submission had left behind under the same tag (still
+// mid-flight, or cleaned up only halfway through a failure). The tag is
+// now always freshly unique instead - a UUID is unconditionally part of
+// it - so two dispatches never collide, no matter how many times the same
+// bundle gets uploaded:
 //
 //   bundle-doctor/CAB-<first 5 hex chars of the bundle's own CAB
-//   identifier>-sha256-<first 5 hex chars of the un-doctored modded
-//   bundle's own SHA-256>
+//   identifier>-<a fresh UUID>
 //
-// e.g. "bundle-doctor/CAB-38321-sha256-9f2a1". Per the person's spec this
-// was meant to read "CAB-XXXXX/sha256:XXXXX" - a colon and a second slash
-// are both illegal in a git ref name (this string is both a branch name
-// and, via the release tag, a "refs/tags/..." name), so the punctuation
-// was swapped for hyphens while keeping the same two truncated-hex
-// pieces; functionally identical, just ref-safe. If the bundle's CAB
-// can't be resolved (+[UnityBundleCAB primaryCABForBundleAtPath:error:]
-// failed - not a UnityFS archive this can parse), this falls back to the
-// old random-UUID tag, since a submission this class can't identify
-// can't be meaningfully deduplicated against future ones either.
+// e.g. "bundle-doctor/CAB-38321-9F2A1C3E-...". If the bundle's CAB can't
+// be resolved (+[UnityBundleCAB primaryCABForBundleAtPath:error:] failed
+// - not a UnityFS archive this can parse), this falls back to a bare
+// "bundle-doctor/<uuid>" tag with no CAB segment.
 //
-// This exists to let +dispatchBundleAtURL:config:uploadProgress:
-// completion: check, before doing any work, whether a release already
-// sits under this exact tag with BDS_OUTPUT_ASSET_NAME already on it -
-// if so, it skips the upload/branch-create/workflow-dispatch steps
-// entirely and hands back a handle with alreadyComplete == YES (see that
-// property above) pointing straight at the existing release. A
-// consequence of turning these tags into a reusable cache key instead of
-// a one-shot scratch identifier: +fetchDoctoredBundleForHandle:...'s
-// post-download cleanup no longer deletes the release/tag the way it
-// used to (only the now-empty scratch branch, when one exists) - the
-// release is the cache now, so it has to survive its own first
-// successful download. Clearing it out entirely is a separate, explicit
-// operation (see the Config section's "delete stored bundles in proxy").
+// The full tag (CAB segment + UUID) is what +bds_cabDisplayNameFromTag:
+// strips down to just "CAB-XXXXX" for display - the UUID itself is never
+// shown, but it IS what round-trips through ModAssetLibrary's
+// doctorScratchBranch field once a submission is dispatched, i.e. it's
+// stored alongside that entry's own bundle information without ever
+// appearing in the UI.
 //
-// A run that fails, or is still mid-flight, does NOT get an
-// early-exit here - only a release that already has the finished
-// BDS_OUTPUT_ASSET_NAME asset on it counts as a cache hit.
+// +dispatchBundleAtURL:config:previousScratchBranch:uploadProgress:
+// completion:'s previousScratchBranch parameter is what lets Dispatch/
+// Retry still "check first if it's already there" without resurrecting
+// the old cross-bundle dedup: pass the tag from THIS entry's own earlier
+// attempt (e.g. Retry, resuming a submission whose run may have quietly
+// finished while the app was closed) and, before doing any work, this
+// checks that one specific tag - and only that tag - for a release that
+// already has BDS_OUTPUT_ASSET_NAME on it. On a hit, it skips the upload/
+// branch-create/workflow-dispatch steps entirely and hands back a handle
+// with alreadyComplete == YES (see that property above) pointing straight
+// at the existing release. Pass nil for a brand-new entry that has never
+// been dispatched before - there is nothing of its own to resume, and
+// this deliberately does NOT fall back to probing for some OTHER release
+// that happens to match the bundle's CAB/SHA, which is exactly the
+// global, content-keyed dedup that caused the collisions above.
+//
+// A run that fails, or is still mid-flight, does NOT get an early-exit
+// here - only a release that already has the finished
+// BDS_OUTPUT_ASSET_NAME asset on it counts as a resume hit. Because
+// every tag is now one-shot/per-submission rather than a long-lived
+// cache key, +fetchDoctoredBundleForHandle:...'s post-download cleanup
+// goes back to deleting the release/tag itself (not just the scratch
+// branch) once its one download succeeds - there's no future submission
+// left that could ever reuse this exact tag anyway.
 
 #import <Foundation/Foundation.h>
 
@@ -358,6 +372,7 @@ typedef NS_ENUM(NSInteger, BundleDoctorRunStatus) {
 // +resolveRunForHandle:config:completion: next.
 + (void)dispatchBundleAtURL:(NSURL *)moddedBundleURL
                        config:(BundleDoctorConfig *)config
+        previousScratchBranch:(nullable NSString *)previousScratchBranch
                uploadProgress:(nullable void (^)(double fractionComplete))uploadProgress
                    completion:(void (^)(BundleDoctorHandle * _Nullable handle, NSError * _Nullable error))completion;
 
@@ -404,9 +419,13 @@ typedef NS_ENUM(NSInteger, BundleDoctorRunStatus) {
 // downloadProgress, when non-nil, is called on the main queue with a
 // 0.0-1.0 fraction as the doctored bundle's bytes come down - same
 // contract as +dispatchBundleAtURL:...'s uploadProgress, mirrored for
-// this side of the pipeline. May be called zero times if the response
-// never reports a Content-Length (progress just never renders past 0%
-// in that case; the fetch itself is unaffected).
+// this side of the pipeline. Falls back to the release asset's own
+// "size" field (standard GitHub API field) when the download response
+// itself never reports a Content-Length - e.g. a chunked-transfer
+// response through GitHub's blob-storage proxy - so progress still
+// renders in that case; only an asset with no usable size of its own
+// would still leave progress at 0% (the fetch itself is unaffected
+// either way).
 + (void)fetchDoctoredBundleForHandle:(BundleDoctorHandle *)handle
                                 config:(BundleDoctorConfig *)config
                               progress:(nullable void (^)(double fractionComplete))downloadProgress
@@ -451,6 +470,30 @@ typedef NS_ENUM(NSInteger, BundleDoctorRunStatus) {
 // shape every other call in this class uses.
 + (void)listProcessedReleasesForConfig:(BundleDoctorConfig *)config
                               completion:(void (^)(NSArray<BundleDoctorProcessedRelease *> * _Nullable releases, NSError * _Nullable error))completion;
+
+#pragma mark - Processed Bundles install (9)
+
+// Downloads one already-processed release's BDS_OUTPUT_ASSET_NAME asset
+// to a local temp file the caller owns (same ownership convention as
+// +fetchDoctoredBundleForHandle:...'s doctoredBundleURL - not cleaned up
+// by this class). Deliberately does NOT call
+// +bds_cleanupScratchSubmission:config: the way +fetchDoctoredBundleForHandle:...
+// does after its own download - a Processed Bundles release is meant to
+// stay in the repo's releases tab as a reusable on-proxy cache entry
+// (see BundleDoctorProcessedRelease's own header) so it can be installed
+// again later or by someone else; only +deleteAllReleasesForConfig:...'s
+// "Delete Stored Bundles in Proxy" button ever removes it. Shares
+// +bds_downloadReleaseAssetNamed:fromReleaseTag:config:progress:data:error:
+// with the phase-4 fetch for the same reason - it's the same "GET this
+// named asset off this tag" operation either way, just without the
+// teardown afterward. downloadProgress/completion have the exact same
+// contract (main-queue callbacks, 0.0-1.0 fraction, same
+// BundleDoctorServiceErrorCode shape on failure) as
+// +fetchDoctoredBundleForHandle:config:progress:completion:.
++ (void)downloadProcessedRelease:(BundleDoctorProcessedRelease *)release
+                            config:(BundleDoctorConfig *)config
+                          progress:(nullable void (^)(double fractionComplete))downloadProgress
+                        completion:(void (^)(NSURL * _Nullable bundleURL, NSError * _Nullable error))completion;
 
 #pragma mark - Delete every stored release (8)
 

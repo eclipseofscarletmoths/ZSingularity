@@ -196,6 +196,19 @@ extern NSMutableDictionary<NSString *, NSNumber *> *g_urpValue;
 // keeps this copy in sync whenever an entry is added or removed.
 extern NSArray<NSString *> *g_syslogBlacklist;
 
+// Every on-disk path (under +[BankTransplant mobileFMODBuildsDirectory]
+// or wherever a bundle's stock location was) that a bank/bundle asset
+// has ever actually been swapped into, logged independently of
+// BankTransplant's/BundleDoctorInstaller's own backup-directory
+// bookkeeping - see gd_track_asset_path() below for why. Mirrors
+// g_syslogBlacklist's "global copy kept in sync so it round-trips
+// through gd_current_settings_dictionary()" pattern, except this one is
+// written to directly by GDScripts.m's own accessors below rather than
+// by GraphicsDebugOverlay.m reaching in - callers should use
+// gd_track_asset_path()/gd_tracked_asset_paths()/
+// gd_clear_tracked_asset_paths(), not this global directly.
+extern NSMutableArray<NSString *> *g_trackedAssetPaths;
+
 #pragma mark - Settings persistence (JSON in Documents)
 
 NSDictionary *gd_load_settings_dictionary(void);
@@ -203,6 +216,33 @@ void gd_write_settings_dictionary(NSDictionary *dict);
 // Snapshots every current-value global above into one dictionary,
 // ready to hand to gd_write_settings_dictionary().
 NSDictionary *gd_current_settings_dictionary(void);
+
+#pragma mark - Tracked asset paths (Hard Assets Reset)
+//
+// Independent log of every live game-file path a bank/bundle swap has
+// ever written to, stored as its own "trackedAssetPaths" entry inside
+// the same GraphicsDebugOverlaySettings.json every other control here
+// round-trips through (see gd_current_settings_dictionary()). This
+// exists so the Config section's "Hard Assets Reset" doesn't have to
+// rediscover what to delete from BankTransplant's/BundleDoctorInstaller's
+// own backup-directory manifests - if something else (a failed restore,
+// a manual Files.app delete, a future bug) wipes one of those backup
+// directories out from under it, this list is untouched and Reset can
+// still find and delete the live files.
+//
+// gd_track_asset_path() is safe to call before the graphics panel has
+// ever been built (e.g. from a bundle/bank swap that happens during
+// early game startup) - it lazily loads whatever's already on disk into
+// g_trackedAssetPaths on first use rather than assuming buildPanel's
+// own settings-load has already run.
+void gd_track_asset_path(NSString *path);
+// Copy of the current list - callers should treat this as a snapshot,
+// not something to mutate in place.
+NSArray<NSString *> *gd_tracked_asset_paths(void);
+// Empties the list (in memory and on disk). Meant to be called once
+// Hard Assets Reset has finished deleting everything the list pointed
+// to - see GraphicsDebugOverlay.m's -hardAssetsResetTapped.
+void gd_clear_tracked_asset_paths(void);
 
 #pragma mark - Apply-everything entry points
 
