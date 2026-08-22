@@ -1423,6 +1423,23 @@ static const CGFloat kFillAlpha = 1.0;
         return;
     }
 
+    // Frame-drop fix (10.1): a still-visible pill gets asked to stay
+    // enabled on every single scroll tick (its on-screen position keeps
+    // changing), but the corner reconfigure/bringSubviewToFront/
+    // layoutIfNeeded below only ever needs to happen once, when the glass
+    // actually turns on - the pill's height (and therefore its corner
+    // radius) doesn't change mid-scroll. Skip straight to the one thing
+    // that DOES need to happen every tick - tracking the pill's new
+    // frame - instead of redoing all of that every frame for every
+    // currently-visible slider too.
+    if (glassEnabled && _glassEnabled && self.trackGlass.superview == host) {
+        UIView *overlay = host.superview;
+        if (overlay.window) {
+            self.trackGlass.frame = [self.track convertRect:self.track.bounds toView:host];
+        }
+        return;
+    }
+
     _glassEnabled = glassEnabled;
 
     if (glassEnabled) {
@@ -1688,6 +1705,20 @@ static const CGFloat kFillAlpha = 1.0;
         [self.trackGlass removeFromSuperview];
         self.track.backgroundColor = [UIColor colorWithWhite:1 alpha:0.08];
         self.track.layer.borderWidth = 1;
+        return;
+    }
+
+    // Frame-drop fix (10.1) - same early-out as GDCapsuleSlider's own
+    // -setGlassEnabled: above, and for the same reason: a still-visible
+    // pill's frame needs to keep tracking the scroll every tick, but its
+    // shape/corner radius doesn't change mid-scroll, so there's no need
+    // to redo the corner reconfigure/bringSubviewToFront/layoutIfNeeded
+    // work below on every single frame just because it's still visible.
+    if (glassEnabled && _glassEnabled && self.trackGlass.superview == host) {
+        UIView *overlay = host.superview;
+        if (overlay.window) {
+            self.trackGlass.frame = [self.track convertRect:self.track.bounds toView:host];
+        }
         return;
     }
 
@@ -10199,6 +10230,12 @@ static NSURL *gd_mods_live_stock_url_for_entry(ModAssetLibraryEntry *entry) {
 // Every pill is a real UIGlassEffect in a dedicated compositor. The setting
 // content itself is rendered by contentOverlay above this material, so the
 // green fill and labels are never dimmed by the pill glass.
+// Buffer added around the actual viewport rect before testing a row for
+// on-screen-ness (10.1 / frame-drop fix below) - a row just outside the
+// strict viewport still gets its glass attached a moment early, so a fast
+// flick doesn't visibly pop a bare track in right as it crosses the edge.
+static const CGFloat kGDSliderGlassCullMargin = 80;
+
 - (void)scrollViewDidScroll:(UIScrollView *)scrollView {
     [self gd_updateSliderGlassVisibility];
 
@@ -10212,25 +10249,48 @@ static NSURL *gd_mods_live_stock_url_for_entry(ModAssetLibraryEntry *entry) {
     }
 }
 
+// Frame-drop fix: this method's own name/comment always claimed to be
+// scoped to "the visible scroll pills of the panel", but the loop below
+// used to hand EVERY row's slider glassEnabled:YES unconditionally, on
+// every single scroll tick, with no on-screen test at all - there never
+// was a working cull here, despite the comment implying one. Since
+// -setGlassEnabled:YES (GDCapsuleSlider/GDModeSlider, above) does a real
+// UIGlassEffect corner reconfigure + bringSubviewToFront + layoutIfNeeded
+// every time it's called, that meant EVERY slider in the whole panel -
+// including the ones scrolled completely out of the viewport - paid that
+// cost on every scroll frame. That's strictly worse than doing nothing:
+// a panel with, say, 20 sliders was doing 20x the glass reconfiguration
+// work per frame a purely-static "always on" implementation would have,
+// for zero visible benefit on the ~5-8 actually on screen at once.
+//
+// Now: only a row whose frame actually intersects the viewport (padded
+// by kGDSliderGlassCullMargin) gets glassEnabled:YES; everything else
+// gets NO, which is just a removeFromSuperview (see -setGlassEnabled:
+// above) - no corner/frame work at all for off-screen rows. Rows that
+// are already in the right state are still called every tick (a still-
+// visible row's on-screen position keeps changing while scrolling, and
+// -setGlassEnabled: itself now short-circuits the expensive corner-
+// reconfigure/bringSubviewToFront/layoutIfNeeded part when nothing but
+// the frame actually needs updating - see that method's own early-out).
 - (void)gd_updateSliderGlassVisibility {
-    if (!gd_has_liquid_glass() || !self.stack) return;
+    if (!gd_has_liquid_glass() || !self.stack || !self.scrollViewport) return;
 
-    // These are the visible scroll pills of the panel. Keep the material
-    // attached continuously; removing/recreating UIGlassEffect views during
-    // scrolling can cause UIKit's glass compositor to miss a frame or retain
-    // a stale shape cache. The number of sliders here is small enough that the
-    // deterministic path is preferable. Mode sliders (AA Mode/Quality,
-    // Tonemap) now get the same real Liquid Glass treatment as the
-    // continuous sliders - see the GDModeSlider class comment.
+    CGRect visibleRect = CGRectInset(self.scrollViewport.bounds, -kGDSliderGlassCullMargin, -kGDSliderGlassCullMargin);
+
     for (UIView *arranged in self.stack.arrangedSubviews) {
         if (![arranged isKindOfClass:[GDRow class]]) continue;
         GDRow *row = (GDRow *)arranged;
+        if (!row.slider && !row.modeSlider) continue;
+
+        CGRect rowFrameInViewport = [row convertRect:row.bounds toView:self.scrollViewport];
+        BOOL onScreen = CGRectIntersectsRect(rowFrameInViewport, visibleRect);
+
         if (row.slider) {
             row.slider.glassHost = self.sliderGlassContent;
-            [row.slider setGlassEnabled:YES];
-        } else if (row.modeSlider) {
+            [row.slider setGlassEnabled:onScreen];
+        } else {
             row.modeSlider.glassHost = self.sliderGlassContent;
-            [row.modeSlider setGlassEnabled:YES];
+            [row.modeSlider setGlassEnabled:onScreen];
         }
     }
 }
