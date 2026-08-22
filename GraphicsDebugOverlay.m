@@ -2465,10 +2465,10 @@ static UIButton *gd_make_reencode_dropdown_option_button(NSString *format, BOOL 
 // Compact single-line row: title | a real native Liquid Glass button
 // (gd_style_button_as_native_glass) showing the current re-encode format
 // with a trailing chevron.up.chevron.down indicator. The button owns no
-// menu of its own now - `target`/`action` are wired to it directly
-// (UIControlEventTouchUpInside), same pattern as this file's other
+// menu of its own now - `target`/`action` are wired directly to
+// UIControlEventTouchDown, not TouchUpInside like this file's other
 // target/action rows (e.g. gd_make_mods_folder_row's tapAction) - see
-// -gd_reencodeFormatButtonTapped: for what the tap does.
+// -gd_reencodeFormatButtonTapped: for why touch-down specifically.
 static GDRow *gd_make_reencode_format_row(NSString *selectedFormat, id target, SEL tapAction) {
     GDRow *row = [[GDRow alloc] initWithFrame:CGRectZero];
     row.translatesAutoresizingMaskIntoConstraints = NO;
@@ -2484,7 +2484,10 @@ static GDRow *gd_make_reencode_format_row(NSString *selectedFormat, id target, S
 
     UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
     button.translatesAutoresizingMaskIntoConstraints = NO;
-    [button addTarget:target action:tapAction forControlEvents:UIControlEventTouchUpInside];
+    // TouchDown, not TouchUpInside - see -gd_reencodeFormatButtonTapped:'s
+    // comment for why this has to fire the instant the finger lands
+    // rather than after the button's own full press-and-release cycle.
+    [button addTarget:target action:tapAction forControlEvents:UIControlEventTouchDown];
     [row addSubview:button];
     objc_setAssociatedObject(row, "gd_button", button, OBJC_ASSOCIATION_RETAIN);
 
@@ -6957,9 +6960,30 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
     [haptic selectionChanged];
 }
 
-// Wired directly to reencodeFormatButton's UIControlEventTouchUpInside
-// (see gd_make_reencode_format_row) - a plain toggle, since this control
-// no longer owns a UIMenu to present/dismiss on its own.
+// Wired to reencodeFormatButton's UIControlEventTouchDown, not
+// TouchUpInside - see gd_make_reencode_format_row. TouchUpInside doesn't
+// fire until UIKit's own press-and-release cycle for the button finishes,
+// including its native glass configuration's own automatic press/release
+// visual feedback; opening the dropdown only at that point meant hiding
+// the real button (see -gd_openReencodeDropdown) right as its own
+// built-in animation was still settling, cutting that animation short
+// right before a completely separate view then grew in its place - the
+// "two different buttons" look. Firing on TouchDown instead means the
+// button is barely a frame into reacting to the touch when it gets
+// swapped for the overlay, so there's nothing of its own animation left
+// to visibly interrupt - the overlay's own grow reads as a continuation
+// of the same press rather than a hard cut to something else. This also
+// happens to match how real Liquid Glass disclosure controls behave
+// (e.g. Camera's mode picker) - they open the instant you touch down,
+// not after a full tap-and-release.
+//
+// The `else` branch below is effectively the only reachable one: the
+// real button is hidden for as long as reencodeDropdownOpen is YES (see
+// -gd_openReencodeDropdown), so it can't receive a touch to close things
+// again - closing only ever happens via reencodeDropdownScrim or picking
+// an option (see -gd_reencodeDropdownScrimTapped:/
+// -gd_reencodeDropdownOptionTapped:). The guard is kept anyway as a
+// harmless defensive no-op rather than something safe to assume away.
 - (void)gd_reencodeFormatButtonTapped:(UIButton *)sender {
     if (self.reencodeDropdownOpen) {
         [self gd_closeReencodeDropdownAnimated:YES];
