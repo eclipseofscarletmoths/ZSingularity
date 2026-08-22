@@ -405,6 +405,56 @@ didFinishDownloadingToURL:(NSURL *)location {
 + (NSError *)bds_errorWithCode:(BundleDoctorServiceErrorCode)code description:(NSString *)description;
 @end
 
+#pragma mark - BundleDoctorProcessedRelease
+//
+// Relocated here (still its own complete, standalone @implementation -
+// only the POSITION moved) from between two pieces of
+// BundleDoctorService's own implementation, where it used to split
+// that class's implementation in half. Objective-C doesn't allow a
+// class's @implementation to be reopened as a second primary block in
+// the same file ("reimplementation of class" - see progress.md for
+// the build log this came from) the way separate classes can each get
+// their own; keeping BundleDoctorService as one single continuous
+// @implementation below (uninterrupted, per its own private extension
+// right above needing every bds_ method visible in that one block) and
+// moving this class's block out in front of it is what actually fixes
+// that, rather than trying to split BundleDoctorService itself.
+
+@implementation BundleDoctorProcessedRelease {
+    NSString *_tagName;
+    NSString *_cabDisplayName;
+    NSString *_displayName;
+    unsigned long long _byteSize;
+    NSString *_uploadedAt;
+    NSString *_checksum;
+}
+
+- (instancetype)initWithTagName:(NSString *)tagName
+                        byteSize:(unsigned long long)byteSize
+                      uploadedAt:(nullable NSString *)uploadedAt
+                        checksum:(nullable NSString *)checksum {
+    if ((self = [super init])) {
+        _tagName = [tagName copy] ?: @"";
+        _cabDisplayName = bds_cabDisplayNameFromTag(_tagName);
+        _displayName = _cabDisplayName.length > 0 ? _cabDisplayName : _tagName;
+        _byteSize = byteSize;
+        _uploadedAt = [uploadedAt copy];
+        _checksum = [checksum copy];
+    }
+    return self;
+}
+
+- (NSString *)tagName { return _tagName; }
+- (NSString *)cabDisplayName { return _cabDisplayName; }
+- (NSString *)displayName { return _displayName; }
+- (unsigned long long)byteSize { return _byteSize; }
+- (NSString *)uploadedAt { return _uploadedAt; }
+- (NSString *)checksum { return _checksum; }
+
+@end
+
+#pragma mark - BundleDoctorService
+
 @implementation BundleDoctorService
 
 + (BOOL)isUploadCompressionEnabled {
@@ -972,56 +1022,7 @@ didFinishDownloadingToURL:(NSURL *)location {
     });
 }
 
-@end
-
-#pragma mark - BundleDoctorProcessedRelease
-
-@implementation BundleDoctorProcessedRelease {
-    NSString *_tagName;
-    NSString *_cabDisplayName;
-    NSString *_displayName;
-    unsigned long long _byteSize;
-    NSString *_uploadedAt;
-    NSString *_checksum;
-}
-
-- (instancetype)initWithTagName:(NSString *)tagName
-                        byteSize:(unsigned long long)byteSize
-                      uploadedAt:(nullable NSString *)uploadedAt
-                        checksum:(nullable NSString *)checksum {
-    if ((self = [super init])) {
-        _tagName = [tagName copy] ?: @"";
-        _cabDisplayName = bds_cabDisplayNameFromTag(_tagName);
-        _displayName = _cabDisplayName.length > 0 ? _cabDisplayName : _tagName;
-        _byteSize = byteSize;
-        _uploadedAt = [uploadedAt copy];
-        _checksum = [checksum copy];
-    }
-    return self;
-}
-
-- (NSString *)tagName { return _tagName; }
-- (NSString *)cabDisplayName { return _cabDisplayName; }
-- (NSString *)displayName { return _displayName; }
-- (unsigned long long)byteSize { return _byteSize; }
-- (NSString *)uploadedAt { return _uploadedAt; }
-- (NSString *)checksum { return _checksum; }
-
-@end
-
 #pragma mark - Processed Bundles listing (6)
-
-// Reopens BundleDoctorService's own @implementation (not a category -
-// this needs to be the primary implementation so it satisfies the
-// bds_ declarations in the class-continuation interface above; a
-// named category wouldn't). Split into two @implementation blocks
-// purely because BundleDoctorProcessedRelease's own @implementation
-// sits physically between them in this file - multiple primary
-// @implementation blocks for one class in the same translation unit
-// is valid, unlike nesting one @implementation inside another (which
-// is what this file had before the "no known class method"/"missing
-// context for method declaration" build failures - see progress.md).
-@implementation BundleDoctorService
 
 + (void)listProcessedReleasesForConfig:(BundleDoctorConfig *)rawConfig
                               completion:(void (^)(NSArray<BundleDoctorProcessedRelease *> * _Nullable, NSError * _Nullable))completion {
