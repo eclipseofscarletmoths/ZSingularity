@@ -469,23 +469,67 @@ static void gd_configure_glass_button_fixed_corner_radius(UIButton *button, CGFl
     SEL getBackground = NSSelectorFromString(@"background");
     if ([configuration respondsToSelector:getBackground]) {
         id background = ((id (*)(id, SEL))objc_msgSend)(configuration, getBackground);
-        SEL setCornerRadius = NSSelectorFromString(@"setCornerRadius:");
-        if (background && [background respondsToSelector:setCornerRadius]) {
-            ((void (*)(id, SEL, CGFloat))objc_msgSend)(background, setCornerRadius, radius);
-
+        if (background) {
             // UIBackgroundConfiguration is a value-style config object -
             // -background hands back a copy, not the live instance
-            // `configuration` holds internally. Mutating that copy (just
-            // above) silently goes nowhere unless it's explicitly written
-            // back via -setBackground: before -setConfiguration: below.
-            // This was the actual reason changing kGDAuthFieldCornerRadius
-            // had zero visible effect: -setCornerStyle: above IS a direct
-            // property on `configuration` so it took effect fine (that's
-            // why Fixed's square-ish shape showed up at all), but the
-            // radius value on the *background* was being thrown away every
-            // time, leaving whatever default radius Fixed falls back to
-            // with no custom background - no matter what this function
+            // `configuration` holds internally. Mutating that copy (below)
+            // silently goes nowhere unless it's explicitly written back via
+            // -setBackground: before -setConfiguration: at the bottom of
+            // this function. This was the reason an earlier pass at this
+            // exact fix had zero visible effect: -setCornerStyle: above IS
+            // a direct property on `configuration` so it took effect fine
+            // (that's why Fixed's square-ish shape showed up at all), but
+            // whatever got written onto the fetched `background` copy was
+            // being thrown away every time - no matter what this function
             // was asked for.
+            SEL setCornerRadius = NSSelectorFromString(@"setCornerRadius:");
+            if ([background respondsToSelector:setCornerRadius]) {
+                ((void (*)(id, SEL, CGFloat))objc_msgSend)(background, setCornerRadius, radius);
+            }
+
+            // -setCornerRadius: above is the pre-Liquid-Glass
+            // UIBackgroundConfiguration property, and it's a genuine no-op
+            // for a *glass* background specifically: a glassButtonConfiguration's
+            // background material computes its own shape from
+            // -cornerConfiguration (a UICornerConfiguration, exactly the
+            // type gd_configure_glass_corners above already uses for every
+            // plain glass view in this file), not from the legacy scalar
+            // -cornerRadius. Writing -setCornerRadius: alone landed on a
+            // property that took the write (so nothing threw, nothing
+            // asserted, `background.cornerRadius` reads back correctly if
+            // you log it) but that the glass rebuild never actually
+            // consults - the same "assumed the wrong property is read"
+            // failure this function's header already tells the story of
+            // twice over, now a third time. Setting cornerConfiguration too
+            // is the actual fix for the glass case; -setCornerRadius: above
+            // is left in place as a harmless write for the non-glass Fixed
+            // background case (nothing here on this file's iOS 26 devices,
+            // but cheap insurance if this helper is ever reused off a
+            // non-glass configuration).
+            Class radiusClass = NSClassFromString(@"UICornerRadius");
+            Class cornerConfigClass = NSClassFromString(@"UICornerConfiguration");
+            SEL setCornerConfiguration = NSSelectorFromString(@"setCornerConfiguration:");
+            if (radiusClass && cornerConfigClass && [background respondsToSelector:setCornerConfiguration]) {
+                SEL fixedRadiusSelector = NSSelectorFromString(@"fixedRadius:");
+                SEL configWithRadiusSelector = NSSelectorFromString(@"configurationWithRadius:");
+                if ([radiusClass respondsToSelector:fixedRadiusSelector] &&
+                    [cornerConfigClass respondsToSelector:configWithRadiusSelector]) {
+                    id radiusObject = ((id (*)(id, SEL, CGFloat))objc_msgSend)(radiusClass,
+                                                                                fixedRadiusSelector,
+                                                                                radius);
+                    if (radiusObject) {
+                        id cornerConfiguration = ((id (*)(id, SEL, id))objc_msgSend)(cornerConfigClass,
+                                                                                      configWithRadiusSelector,
+                                                                                      radiusObject);
+                        if (cornerConfiguration) {
+                            ((void (*)(id, SEL, id))objc_msgSend)(background,
+                                                                   setCornerConfiguration,
+                                                                   cornerConfiguration);
+                        }
+                    }
+                }
+            }
+
             SEL setBackground = NSSelectorFromString(@"setBackground:");
             if ([configuration respondsToSelector:setBackground]) {
                 ((void (*)(id, SEL, id))objc_msgSend)(configuration, setBackground, background);
