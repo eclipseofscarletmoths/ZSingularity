@@ -473,14 +473,24 @@ static void gd_configure_glass_button_fixed_corner_radius(UIButton *button, CGFl
     }
 }
 
-// Same 6pt radius as the Auth section's own text fields
-// (gd_wrap_field_in_native_glass's own cornerRadius argument at its two
-// call sites) - kept as a named constant so every square button/field in
-// the panel can't drift apart. Moved up here (was originally declared
-// just above gd_style_auth_verify_button) so gd_style_button_as_native_glass_with_font
-// below can reference it directly instead of every call site re-applying
-// it by hand - see that function's own "4:" comments.
-static const CGFloat kGDAuthFieldCornerRadius = 6;
+// Radius for the panel's three intentionally square-ish controls (Auth's
+// Verify/Remove button, the syslog button, and the Config re-encode
+// dropdown) - meant to read as the same shape family as the square-ish
+// text fields they sit next to (gd_wrap_field_in_native_glass's own 6pt
+// cornerRadius argument at its call sites).
+//
+// NOT literally 6pt, on purpose: a UIButtonConfiguration with cornerStyle
+// = Fixed renders visibly rounder than a plain CALayer.cornerRadius at the
+// same numeric value (compare the syslog button against the Blacklist
+// keywords field beside it, both previously set to 6 - the button's
+// corners came out noticeably softer, not sharper as reported). Measuring
+// that pair in the reference screenshot put the button's rendered corner
+// at roughly 1.8x the field's for the same input radius, so this constant
+// is scaled down accordingly (6 / 1.8 ~= 3.3, rounded to 3) rather than
+// left equal to the field's own 6pt. This is a visual calibration off a
+// compressed screenshot, not measured from a design spec - nudge it up or
+// down a point if it doesn't quite land on-device.
+static const CGFloat kGDAuthFieldCornerRadius = 3;
 
 // Native Liquid Glass BUTTON styling - distinct from the hand-rolled
 // UIGlassEffect/UIGlassContainerEffect compositing used for the dock/pills
@@ -553,20 +563,20 @@ static void gd_style_button_as_native_glass_with_font(UIButton *button, NSString
                 if ([button respondsToSelector:setConfig]) {
                     ((void (*)(id, SEL, id))objc_msgSend)(button, setConfig, configuration);
                     button.contentHorizontalAlignment = UIControlContentHorizontalAlignmentCenter;
-                    // 4: Capsule is glassButtonConfiguration's own default
-                    // cornerStyle - override it to the same fixed 6pt every
-                    // square text field on this panel uses, so a button
-                    // that never asked for a specific shape doesn't default
-                    // to a pill. See kGDAuthFieldCornerRadius/
-                    // gd_configure_glass_button_fixed_corner_radius below.
-                    gd_configure_glass_button_fixed_corner_radius(button, kGDAuthFieldCornerRadius);
-                    SEL setUpdateHandler = NSSelectorFromString(@"setConfigurationUpdateHandler:");
-                    if ([button respondsToSelector:setUpdateHandler]) {
-                        void (^reassertCorners)(__kindof UIButton *) = ^(__kindof UIButton *btn) {
-                            gd_configure_glass_button_fixed_corner_radius(btn, kGDAuthFieldCornerRadius);
-                        };
-                        ((void (*)(id, SEL, id))objc_msgSend)(button, setUpdateHandler, reassertCorners);
-                    }
+                    // Capsule is glassButtonConfiguration's own default
+                    // cornerStyle - left alone here on purpose. A previous
+                    // pass force-squared every button styled through this
+                    // shared function (fixed kGDAuthFieldCornerRadius corner,
+                    // same as below), which was the actual bug behind "every
+                    // button in the GUI is squared" - only the three call
+                    // sites that explicitly want the square-ish text-field
+                    // shape (gd_style_auth_verify_button/_remove_button,
+                    // the syslogButton setup, gd_style_reencode_format_button)
+                    // apply gd_configure_glass_button_fixed_corner_radius
+                    // themselves, after calling this function. Every other
+                    // button - Reset/Reapply, Restore Originals, Load Mods,
+                    // etc. - is meant to fall through to iOS 26's default
+                    // Capsule pill, so nothing else is done here.
                     return;
                 }
             }
@@ -586,12 +596,15 @@ static void gd_style_button_as_native_glass_with_font(UIButton *button, NSString
     button.layer.borderWidth = 1;
     button.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.18].CGColor;
     button.layer.cornerCurve = kCACornerCurveContinuous;
-    // 4: this fallback used to leave cornerRadius at its default of 0 -
-    // i.e. actually, literally square corners - which is the "too sharp"
-    // case reported against the reference image (the square-ish 6pt-radius
-    // text fields). Matches kGDAuthFieldCornerRadius so a device on this
-    // fallback path reads the same shape family as one on native glass.
-    button.layer.cornerRadius = kGDAuthFieldCornerRadius;
+    // Matches the iOS 26 path's Capsule default (see the comment above)
+    // rather than the square-ish kGDAuthFieldCornerRadius - this
+    // fallback is for the same buttons that get a pill on native glass, so
+    // it should read as a pill here too. A CALayer clamps cornerRadius to
+    // half of whichever dimension (width/height) is smaller, so any value
+    // at least that large - this button will never be over ~120pt tall -
+    // reliably yields a full capsule regardless of the button's actual
+    // final size, without needing to know it up front.
+    button.layer.cornerRadius = 200;
     button.clipsToBounds = YES;
     button.contentHorizontalAlignment = UIControlContentHorizontalAlignmentCenter;
 }
@@ -8223,7 +8236,16 @@ static NSURL *gd_mods_live_stock_url_for_entry(ModAssetLibraryEntry *entry) {
     // uses - gd_wrap_field_in_native_glass returns nil pre-iOS-26, in
     // which case `field` itself (already flat-styled by that call) IS
     // the container.
-    UIVisualEffectView *glass = gd_wrap_field_in_native_glass(field, kGDAuthFieldCornerRadius);
+    //
+    // Literal 6, not kGDAuthFieldCornerRadius: this is a text field, not
+    // one of the three square-ish buttons - matches the other fields'
+    // own hardcoded 6 (gd_make_button_and_glass_field_row's two call
+    // sites). kGDAuthFieldCornerRadius is calibrated to *look* like that
+    // same 6pt field radius when rendered through a button's glass
+    // chrome specifically - reusing it on an actual field here would
+    // just make this one field's corners noticeably tighter than every
+    // other field in the panel.
+    UIVisualEffectView *glass = gd_wrap_field_in_native_glass(field, 6);
     UIView *container = glass ?: field;
     container.translatesAutoresizingMaskIntoConstraints = NO;
     [window addSubview:container];
