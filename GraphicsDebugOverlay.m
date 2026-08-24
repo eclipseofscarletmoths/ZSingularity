@@ -473,6 +473,15 @@ static void gd_configure_glass_button_fixed_corner_radius(UIButton *button, CGFl
     }
 }
 
+// Same 6pt radius as the Auth section's own text fields
+// (gd_wrap_field_in_native_glass's own cornerRadius argument at its two
+// call sites) - kept as a named constant so every square button/field in
+// the panel can't drift apart. Moved up here (was originally declared
+// just above gd_style_auth_verify_button) so gd_style_button_as_native_glass_with_font
+// below can reference it directly instead of every call site re-applying
+// it by hand - see that function's own "4:" comments.
+static const CGFloat kGDAuthFieldCornerRadius = 6;
+
 // Native Liquid Glass BUTTON styling - distinct from the hand-rolled
 // UIGlassEffect/UIGlassContainerEffect compositing used for the dock/pills
 // above. iOS 26 gives UIButton a first-class glass look via
@@ -497,6 +506,24 @@ static void gd_configure_glass_button_fixed_corner_radius(UIButton *button, CGFl
 // setTitle:, so the size survives the configuration system's own re-layout.
 // gd_style_button_as_native_glass (below) is unchanged in behavior - just a
 // thin wrapper over this with font:nil.
+//
+// 4: every "square" text button in this panel (as opposed to the capsule
+// pill controls like the mode slider/delete-hold pill) is meant to read as
+// the same shape family as the square-ish text fields it sits next to -
+// see kGDAuthFieldCornerRadius below. That 6pt radius used to only get
+// applied by hand at a handful of call sites (Verify, the Auth Remove
+// button, the syslog toggle) via gd_configure_glass_button_fixed_corner_radius,
+// which is exactly why it hadn't propagated to every other square button
+// built through this shared function (Reset/Reapply, Restore Originals,
+// Load Mods, the re-encode format button, ...): each of those skipped the
+// per-call-site fixup and so fell back to whatever this function's two
+// paths default to on their own - iOS 26's glassButtonConfiguration
+// defaults to a fully-rounded Capsule cornerStyle, and the pre-26
+// fallback below never set a cornerRadius at all, i.e. literal 0, the
+// sharp square corners the person is seeing. Baking the same fixed
+// 6pt radius in here once, for both paths, means every button styled
+// through gd_style_button_as_native_glass/_with_font gets it automatically
+// instead of relying on every call site to remember to ask for it.
 static void gd_style_button_as_native_glass_with_font(UIButton *button, NSString *title, UIColor *tintColor, UIFont *font) {
     if (@available(iOS 26.0, *)) {
         Class configClass = NSClassFromString(@"UIButtonConfiguration");
@@ -526,6 +553,20 @@ static void gd_style_button_as_native_glass_with_font(UIButton *button, NSString
                 if ([button respondsToSelector:setConfig]) {
                     ((void (*)(id, SEL, id))objc_msgSend)(button, setConfig, configuration);
                     button.contentHorizontalAlignment = UIControlContentHorizontalAlignmentCenter;
+                    // 4: Capsule is glassButtonConfiguration's own default
+                    // cornerStyle - override it to the same fixed 6pt every
+                    // square text field on this panel uses, so a button
+                    // that never asked for a specific shape doesn't default
+                    // to a pill. See kGDAuthFieldCornerRadius/
+                    // gd_configure_glass_button_fixed_corner_radius below.
+                    gd_configure_glass_button_fixed_corner_radius(button, kGDAuthFieldCornerRadius);
+                    SEL setUpdateHandler = NSSelectorFromString(@"setConfigurationUpdateHandler:");
+                    if ([button respondsToSelector:setUpdateHandler]) {
+                        void (^reassertCorners)(__kindof UIButton *) = ^(__kindof UIButton *btn) {
+                            gd_configure_glass_button_fixed_corner_radius(btn, kGDAuthFieldCornerRadius);
+                        };
+                        ((void (*)(id, SEL, id))objc_msgSend)(button, setUpdateHandler, reassertCorners);
+                    }
                     return;
                 }
             }
@@ -545,6 +586,12 @@ static void gd_style_button_as_native_glass_with_font(UIButton *button, NSString
     button.layer.borderWidth = 1;
     button.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.18].CGColor;
     button.layer.cornerCurve = kCACornerCurveContinuous;
+    // 4: this fallback used to leave cornerRadius at its default of 0 -
+    // i.e. actually, literally square corners - which is the "too sharp"
+    // case reported against the reference image (the square-ish 6pt-radius
+    // text fields). Matches kGDAuthFieldCornerRadius so a device on this
+    // fallback path reads the same shape family as one on native glass.
+    button.layer.cornerRadius = kGDAuthFieldCornerRadius;
     button.clipsToBounds = YES;
     button.contentHorizontalAlignment = UIControlContentHorizontalAlignmentCenter;
 }
@@ -596,12 +643,6 @@ static void gd_style_icon_button_as_native_glass(UIButton *button, UIImage *imag
     button.clipsToBounds = YES;
     button.contentHorizontalAlignment = UIControlContentHorizontalAlignmentCenter;
 }
-
-// Same 6pt radius as the Auth section's own text fields
-// (gd_wrap_field_in_native_glass's own cornerRadius argument at its two
-// call sites) - kept as a named constant so the Verify button below and
-// the fields it sits next to can't drift apart.
-static const CGFloat kGDAuthFieldCornerRadius = 6;
 
 // Auth section's "Verify" button - gd_style_button_as_native_glass on
 // its own gives every button iOS 26's default fully-rounded glass pill,
@@ -2794,24 +2835,6 @@ static NSString *gd_sanitize_personal_access_token(NSString *raw) {
     return s;
 }
 
-// Associated-object keys stashed on the UITextField itself by
-// gd_make_labeled_glass_field_row below - the field's real glass-wrapped
-// container, the row it originally lives in, and the exact constraints
-// that pin it there. -gd_floatAuthField:/-gd_restoreAuthField: use these
-// to lift the field out of the scrolling panel and back again while it's
-// being edited, without having to rebuild any of that geometry from
-// scratch. Only ever set on authRepoLinkField/authTokenField in
-// practice (the only two fields built via this row), but keyed
-// per-field rather than hardcoded so the mechanism isn't tied to those
-// two specifically.
-static void * const kGDAuthFieldContainerKey = (void *)&kGDAuthFieldContainerKey;   // the glass view (or bare field, pre-iOS-26) that visually IS the field
-static void * const kGDAuthFieldRowKey = (void *)&kGDAuthFieldRowKey;               // fieldContainer's original superview
-static void * const kGDAuthFieldRowConstraintsKey = (void *)&kGDAuthFieldRowConstraintsKey; // the constraints pinning fieldContainer inside that row - deactivated while floated, reactivated on restore
-// Set only while the field is actually floated (nil the rest of the
-// time) - the constraints pinning it above the keyboard, so
-// -gd_restoreAuthField: knows what to tear down.
-static void * const kGDAuthFieldFloatingConstraintsKey = (void *)&kGDAuthFieldFloatingConstraintsKey;
-
 // Bare native-glass field row - the Auth section's GitHub Repository
 // Link and Personal Access Token fields use this instead of
 // gd_make_button_and_glass_field_row's button+field split, since
@@ -2831,6 +2854,14 @@ static void * const kGDAuthFieldFloatingConstraintsKey = (void *)&kGDAuthFieldFl
 // the full width it takes when trailingButton is nil) to make room for
 // it. Only the PAT row passes one (its Verify button, see -buildPanel:'s
 // Auth section below).
+//
+// 7: the field itself no longer becomes first responder in place (see
+// -textFieldShouldBeginEditing: - it now routes to the shared custom
+// floating field instead), so this row is just a static display + tap
+// trigger now. The row/container/constraints associated-object stash
+// this used to leave on `field` for -gd_floatAuthField:/-gd_restoreAuthField:
+// to reparent by is gone along with those two methods - nothing needs
+// to reach back into this row's own layout from outside it anymore.
 static GDRow *gd_make_labeled_glass_field_row(NSString *placeholder, BOOL secure, UIButton *trailingButton) {
     GDRow *row = [[GDRow alloc] initWithFrame:CGRectZero];
     row.translatesAutoresizingMaskIntoConstraints = NO;
@@ -2854,10 +2885,11 @@ static GDRow *gd_make_labeled_glass_field_row(NSString *placeholder, BOOL secure
     UIView *fieldContainer = fieldGlass ?: field;
     fieldContainer.translatesAutoresizingMaskIntoConstraints = NO;
     [row addSubview:fieldContainer];
+    // 5: exposed so callers (the Auth section) can grey this out / disable
+    // its interactive glass once the field it wraps is locked - see
+    // -gd_setAuthFieldsLocked:.
+    objc_setAssociatedObject(row, "gd_fieldContainer", fieldContainer, OBJC_ASSOCIATION_RETAIN);
 
-    // Named/kept as their own array (rather than folded into a single
-    // activateConstraints: call) so -gd_floatAuthField: can deactivate
-    // exactly these later - see kGDAuthFieldRowConstraintsKey above.
     NSMutableArray<NSLayoutConstraint *> *fieldConstraints = [NSMutableArray arrayWithArray:@[
         [fieldContainer.leadingAnchor constraintEqualToAnchor:row.leadingAnchor],
         [fieldContainer.topAnchor constraintEqualToAnchor:row.topAnchor],
@@ -2881,12 +2913,7 @@ static GDRow *gd_make_labeled_glass_field_row(NSString *placeholder, BOOL secure
         [fieldConstraints addObject:[fieldContainer.trailingAnchor constraintEqualToAnchor:row.trailingAnchor]];
     }
 
-    NSArray<NSLayoutConstraint *> *finalFieldConstraints = [fieldConstraints copy];
-    [NSLayoutConstraint activateConstraints:finalFieldConstraints];
-
-    objc_setAssociatedObject(field, kGDAuthFieldContainerKey, fieldContainer, OBJC_ASSOCIATION_RETAIN);
-    objc_setAssociatedObject(field, kGDAuthFieldRowKey, row, OBJC_ASSOCIATION_RETAIN);
-    objc_setAssociatedObject(field, kGDAuthFieldRowConstraintsKey, finalFieldConstraints, OBJC_ASSOCIATION_RETAIN);
+    [NSLayoutConstraint activateConstraints:[fieldConstraints copy]];
 
     return row;
 }
@@ -3337,8 +3364,10 @@ static UIButton *gd_make_mods_options_row_button(NSDictionary<NSString *, id> *o
 // mod keeps its old behavior (same picker as the old "+"), Delete keeps
 // its old underlying -gd_deleteModFolderConfirmed: (just reached via a
 // destructive confirm alert now instead of a press-and-hold capsule,
-// same reasoning as the file row's own Delete), and Cache folder is a
-// future-feature stub. The person's original spec for this dropdown
+// same reasoning as the file row's own Delete), and Cache folder now
+// runs -gd_cacheModFolder: (added in a later pass - loops every entry
+// through the same core the per-file "Cache bundle" row uses; see that
+// method's own header). The person's original spec for this dropdown
 // listed only four rows and didn't mention Rename - flagged as a
 // question in a prior pass's progress.md rather than guessed at. The
 // person has since confirmed the omission was accidental and Rename
@@ -3730,17 +3759,31 @@ static UIView *gd_make_mods_entry_info_panel(ModAssetLibraryEntry *entry, BOOL d
             [panel addArrangedSubview:platformLabel];
         }
 
-        // Uploading/Processing show their live percent right in this
+        // Uploading/Downloading show their live byte count right in this
         // Status line now, instead of just a static "Not installed" -
-        // same underlying doctorUploadProgress/doctorProcessProgress
+        // same underlying doctorUploadProgress/doctorDownloadProgress
         // the compact row capsule already reads (see
         // gd_make_mods_entry_row), just surfaced here too per the
-        // person's spec. ReadyToDownload/NotDispatched-in-flight have no
-        // byte-level percent to show (a single Contents API GET and a
-        // direct on-disk install respectively - see
+        // person's spec. These used to be a percent (entry.
+        // doctorUploadProgress/doctorDownloadProgress as a 0.0-1.0
+        // fraction of a known total) - Downloading's total wasn't always
+        // knowable (GitHub's blob-storage proxy doesn't always report a
+        // Content-Length, and its "size" field fallback wasn't always
+        // present either), which is exactly what left that line stuck at
+        // "0% Downloading" even as the download itself finished fine.
+        // Now both fields hold a raw cumulative byte count straight off
+        // the transfer with no dependency on any expected total, so
+        // "Bytes Uploaded"/"Bytes Downloaded" replaces the percent for
+        // both, for consistency, even though Uploading's total was
+        // always knowable on its own. Processing is a workflow-run
+        // percent (completed/total steps, not a byte transfer - see
+        // +fetchRunStatusForHandle:...), unaffected by any of this and
+        // still shown as a percent. ReadyToDownload/NotDispatched-in-
+        // flight have no byte-level count to show (a single Contents API
+        // GET and a direct on-disk install respectively - see
         // -gd_modsLibraryEntryDownloadTapped:'s and
         // -gd_doctorStartOrInstallForEntry:folderName:'s own headers), so
-        // those just say what's happening instead of a percentage.
+        // those just say what's happening instead.
         // 7: "the status will display 'Stored'" - overrides the ordinary
         // doctorStatus-driven text below entirely while sitting in
         // Stored Bundles, same as the Filepath row being skipped above -
@@ -3754,8 +3797,8 @@ static UIView *gd_make_mods_entry_info_panel(ModAssetLibraryEntry *entry, BOOL d
         } else
         switch (entry.doctorStatus) {
             case ModAssetLibraryDoctorStatusUploading: {
-                NSInteger percent = (NSInteger)round(MAX(0.0, MIN(1.0, entry.doctorUploadProgress)) * 100.0);
-                statusText = [NSString stringWithFormat:@"%ld%% Uploaded", (long)percent];
+                unsigned long long bytesSent = (unsigned long long)MAX((int64_t)0, entry.doctorUploadProgress);
+                statusText = [NSString stringWithFormat:@"%llu Bytes Uploaded", bytesSent];
                 break;
             }
             case ModAssetLibraryDoctorStatusProcessing: {
@@ -3767,12 +3810,15 @@ static UIView *gd_make_mods_entry_info_panel(ModAssetLibraryEntry *entry, BOOL d
                 if (downloadInFlight) {
                     // 3.3: this used to just say "Downloading…" with no
                     // percent, unlike the Uploaded/Processed lines right
-                    // above it - now backed by entry.doctorDownloadProgress
-                    // (see -gd_doctorHandleDownloadProgress:forEntryPath:inFolder:
+                    // above it - then backed by a percent derived from
+                    // entry.doctorDownloadProgress (see
+                    // -gd_doctorHandleDownloadProgress:forEntryPath:inFolder:
                     // and BundleDoctorService's download-side progress
-                    // delegate), same "XX% Downloading" shape as the rest.
-                    NSInteger percent = (NSInteger)round(MAX(0.0, MIN(1.0, entry.doctorDownloadProgress)) * 100.0);
-                    statusText = [NSString stringWithFormat:@"%ld%% Downloading", (long)percent];
+                    // delegate) - now backed by the same field holding a
+                    // raw byte count instead, per this switch's own
+                    // header comment above on why.
+                    unsigned long long bytesWritten = (unsigned long long)MAX((int64_t)0, entry.doctorDownloadProgress);
+                    statusText = [NSString stringWithFormat:@"%llu Bytes Downloaded", bytesWritten];
                 } else {
                     statusText = @"Not installed";
                 }
@@ -4217,6 +4263,14 @@ static UIView *gd_make_title_block(void) {
 // path - that's still a later checklist step.
 @property (nonatomic, strong) UITextField *authRepoLinkField;
 @property (nonatomic, strong) UITextField *authTokenField;
+// 5: the glass container each field sits in (a UIVisualEffectView on
+// Liquid Glass devices, `field` itself pre-26 - see
+// gd_wrap_field_in_native_glass's own return contract) - stashed here so
+// -gd_setAuthFieldsLocked: can grey it out and kill its interactive glass
+// animation once credentials are confirmed, without reaching back into
+// gd_make_labeled_glass_field_row's layout from outside it.
+@property (nonatomic, strong) UIView *authRepoLinkFieldContainer;
+@property (nonatomic, strong) UIView *authTokenFieldContainer;
 @property (nonatomic, strong) UIButton *authVerifyButton; // "Verify" - see -gd_authVerifyTapped:
 // Small subtext row directly under the PAT field - replaces the old
 // "Credentials Verified"/"Verification Failed" popups for the success
@@ -4368,21 +4422,28 @@ static UIView *gd_make_title_block(void) {
 // Stopped (and removed) the moment that entry leaves Processing, for
 // any reason (succeeded, failed, or reset via Retry).
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSTimer *> *doctorPollTimers;
-// doctorUploadProgressLastPercent/doctorProcessProgressLastPercent -
-// last rounded 0-100 percent actually written to the manifest (and
-// rebuilt onto screen) for each entry, so a burst of upload-progress
-// callbacks or a poll tick that reports the same percentage as last
-// time is a no-op rather than another read-modify-write manifest
-// write plus a full accordion rebuild.
-@property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *doctorUploadProgressLastPercent;
+// doctorUploadProgressLastBytes/doctorProcessProgressLastPercent -
+// doctorUploadProgressLastBytes is the last raw byte count actually
+// written to the manifest (and rebuilt onto screen) for each entry, so
+// a burst of upload-progress callbacks that reports the same byte count
+// as last time (or one that hasn't moved far enough to matter - see
+// -gd_doctorHandleUploadProgress:forEntryPath:inFolder:'s own throttle
+// threshold) is a no-op rather than another read-modify-write manifest
+// write plus a full accordion rebuild. doctorProcessProgressLastPercent
+// is the same idea for the workflow-run poll, which is still a rounded
+// 0-100 percent (see +fetchRunStatusForHandle:...) rather than a byte
+// count - that phase has no bytes to report.
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *doctorUploadProgressLastBytes;
 @property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *doctorProcessProgressLastPercent;
-// Same throttling purpose as the two above, for
+// Same throttling purpose as doctorUploadProgressLastBytes above, for
 // -gd_doctorHandleDownloadProgress:forEntryPath:inFolder:'s
 // entry.doctorDownloadProgress writes (see BundleDoctorService's
 // download-side progress delegate) - added alongside the 3.3 fix that
-// gave the Info dropdown's "Downloading…" status line a real percent
-// instead of none at all.
-@property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *doctorDownloadProgressLastPercent;
+// gave the Info dropdown's "Downloading…" status line a real value
+// instead of none at all, and switched from a rounded percent to a raw
+// byte count once the underlying percent proved unreliable (see that
+// method's own header comment for why).
+@property (nonatomic, strong) NSMutableDictionary<NSString *, NSNumber *> *doctorDownloadProgressLastBytes;
 // Entries (by path) whose "download" tap is currently being handled -
 // fetch from GitHub, then (CAB match failing) a target-file pick, then
 // install, all of which is NOT a manifest-persisted doctorStatus the
@@ -4392,7 +4453,7 @@ static UIView *gd_make_title_block(void) {
 // state needs -gd_recoverStaleDoctorStateForThisLaunch to handle - the
 // row just falls back to a plain, re-tappable "download" capsule if the
 // app dies mid-flight). Purely in-memory, same purpose as
-// doctorUploadProgressLastPercent above: -gd_modsLibraryEntryDownloadTapped:
+// doctorUploadProgressLastBytes above: -gd_modsLibraryEntryDownloadTapped:
 // checks this set first to ignore a second tap on the same row
 // mid-flight, and gd_make_mods_entry_info_panel checks it (via the
 // downloadInFlight parameter threaded down from -gd_rebuildModsLibrary)
@@ -4437,36 +4498,36 @@ static UIView *gd_make_title_block(void) {
 @property (nonatomic, assign) BOOL holdConfirmTriggered;
 @property (nonatomic, strong) CADisplayLink *holdConfirmDisplayLink;
 
-// Auth section GitHub repo link / PAT fields: floated above the
-// keyboard while being edited (see -gd_floatAuthField:/
-// -gd_restoreAuthField:), since the panel sits low enough on screen
-// that the system keyboard otherwise fully covers both fields. nil
-// whenever neither auth field is being edited. gd_lastKeyboardFrame is
-// updated on every -gd_keyboardWillChangeFrame: (in window coordinates)
-// so a field can be positioned correctly the moment it's floated,
-// without waiting on a fresh notification; authFieldFloatingBottomConstraint
-// is the one constraint that same notification handler nudges directly
-// (no fade) to track keyboard height changes - e.g. the predictive text
-// bar - while a field is already floated.
-@property (nonatomic, weak) UITextField *authFieldCurrentlyFloated;
-@property (nonatomic, weak) NSLayoutConstraint *authFieldFloatingBottomConstraint;
+// gd_lastKeyboardFrame is updated on every -gd_keyboardWillChangeFrame:
+// (in window coordinates) so a floating field (see the generic custom
+// floating text field below) can be positioned correctly the moment
+// it's presented, without waiting on a fresh notification.
 @property (nonatomic, assign) CGRect gd_lastKeyboardFrame;
 
-// 10 "Add remark": a standalone floating field opened straight from a
-// file's options dropdown in Mod asset library - unlike the Auth fields
-// above, it has no existing row anywhere to lift from/restore into, so
-// it's built fresh directly in the key window each time and torn down
-// completely on commit. modsRemarkFloatingBackdrop is a full-screen,
-// effectively-invisible tap target behind it (tapping outside the field
-// resigns it, same as Return does - see -gd_modsRemarkBackdropTapped).
-// modsRemarkFloatingEntry/FolderName identify what gets saved once the
-// field resigns; both nil whenever the field isn't up.
-@property (nonatomic, strong) UIView *modsRemarkFloatingBackdrop;
-@property (nonatomic, strong) UIView *modsRemarkFloatingContainer;
-@property (nonatomic, strong) UITextField *modsRemarkFloatingField;
-@property (nonatomic, weak) NSLayoutConstraint *modsRemarkFloatingBottomConstraint;
-@property (nonatomic, strong) ModAssetLibraryEntry *modsRemarkFloatingEntry;
-@property (nonatomic, copy) NSString *modsRemarkFloatingFolderName;
+// 7: one generic custom floating text field, shared by every place that
+// used to have its own text-entry flow - originally "Add remark" (10),
+// since generalized to also cover folder remarks and, this pass, the
+// Auth section's repo-link/PAT fields (see -textFieldShouldBeginEditing:
+// below - those two rows now just display their current value and
+// trigger this instead of ever becoming first responder themselves,
+// replacing the old reparent-the-real-field-above-the-keyboard dance
+// -gd_floatAuthField:/-gd_restoreAuthField: used to do). Built fresh
+// directly in the key window each time
+// -gd_presentFloatingTextFieldWithInitialText:placeholder:secure:
+// completion: is called, and torn down completely on commit -
+// gdFloatingFieldBackdrop is a full-screen, effectively-invisible tap
+// target behind it (tapping outside the field resigns it, same as
+// Return does - see -gd_floatingFieldBackdropTapped). gdFloatingFieldCompletion
+// is invoked with the trimmed, committed text (nil if cleared) once the
+// field resigns - it's what lets each call site decide what "committed"
+// actually means (save a remark, write a config field, etc.) without
+// this shared mechanism needing to know. All nil/NULL whenever no
+// floating field is up.
+@property (nonatomic, strong) UIView *gdFloatingFieldBackdrop;
+@property (nonatomic, strong) UIView *gdFloatingFieldContainer;
+@property (nonatomic, strong) UITextField *gdFloatingField;
+@property (nonatomic, weak) NSLayoutConstraint *gdFloatingFieldBottomConstraint;
+@property (nonatomic, copy) void (^gdFloatingFieldCompletion)(NSString * _Nullable trimmedText);
 
 // Same idea as the block above, but for wide pill/text buttons that
 // confirm a hold with a left-to-right fill sweeping across the whole
@@ -4530,12 +4591,12 @@ static const NSTimeInterval kSaveDebounceInterval = 0.4;
                                                   name:UIDeviceOrientationDidChangeNotification
                                                 object:nil];
 
-    // Drives the Auth section's floating-field-above-the-keyboard
-    // behavior - see -gd_keyboardWillChangeFrame: and the
-    // authFieldCurrentlyFloated/gd_lastKeyboardFrame property comments
-    // above. WillChangeFrame (not WillShow/WillHide separately) covers
-    // show, hide, and in-place height changes (e.g. the predictive text
-    // bar toggling) through the one handler.
+    // Drives the shared custom floating text field's above-the-keyboard
+    // positioning - see -gd_keyboardWillChangeFrame: and the
+    // gdFloatingField/gd_lastKeyboardFrame property comments above.
+    // WillChangeFrame (not WillShow/WillHide separately) covers show,
+    // hide, and in-place height changes (e.g. the predictive text bar
+    // toggling) through the one handler.
     [[NSNotificationCenter defaultCenter] addObserver:self
                                               selector:@selector(gd_keyboardWillChangeFrame:)
                                                   name:UIKeyboardWillChangeFrameNotification
@@ -5308,6 +5369,7 @@ static const CGFloat kContentFadeHeight = 22;
     self.authRepoLinkField = objc_getAssociatedObject(repoLinkRow, "gd_textfield");
     self.authRepoLinkField.keyboardType = UIKeyboardTypeURL;
     self.authRepoLinkField.delegate = self;
+    self.authRepoLinkFieldContainer = objc_getAssociatedObject(repoLinkRow, "gd_fieldContainer");
     [self.stack addArrangedSubview:repoLinkRow];
     [self.stack setCustomSpacing:8 afterView:repoLinkRow];
 
@@ -5324,6 +5386,7 @@ static const CGFloat kContentFadeHeight = 22;
     GDRow *authTokenRow = gd_make_labeled_glass_field_row(@"ghp_xxxxxxxxxxxxxxxxxxxx", YES, self.authVerifyButton);
     self.authTokenField = objc_getAssociatedObject(authTokenRow, "gd_textfield");
     self.authTokenField.delegate = self;
+    self.authTokenFieldContainer = objc_getAssociatedObject(authTokenRow, "gd_fieldContainer");
     [self.stack addArrangedSubview:authTokenRow];
     [self.stack setCustomSpacing:4 afterView:authTokenRow];
 
@@ -6125,6 +6188,18 @@ static const CGFloat kContentFadeHeight = 22;
 // than per-queue-item) shape; see -gd_modsLibraryEntryDownloadTapped:'s
 // own header for the full three steps.
 
+// Minimum change in raw bytes transferred (doctorUploadProgress/
+// doctorDownloadProgress) before -gd_doctorHandleUploadProgress:...
+// and -gd_doctorHandleDownloadProgress:... bother with a manifest
+// read-modify-write and the accordion rebuild it triggers - the byte-
+// count equivalent of the rounded-whole-number-percent throttle these
+// two used before switching from a 0.0-1.0 fraction to a raw count (see
+// each method's own header comment). 32KB keeps the Status line's text
+// visibly ticking up without rebuilding on literally every
+// didSendBodyData:/didWriteData: callback, which can fire many times a
+// second per BundleDoctorService's own header.
+static const int64_t kGDDoctorProgressByteThreshold = 32 * 1024;
+
 // ModAssetLibraryEntry doesn't carry the name of the folder it lives in
 // (see ModAssetLibrary.h's own header on why - it's bookkeeping the
 // panel itself owns) but every call into
@@ -6259,7 +6334,7 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
     }
 
     NSString *entryPath = entry.path; // captured now - stays valid as a manifest lookup key even once `entry` itself is stale
-    [self.doctorUploadProgressLastPercent removeObjectForKey:entryPath];
+    [self.doctorUploadProgressLastBytes removeObjectForKey:entryPath];
     [self.doctorProcessProgressLastPercent removeObjectForKey:entryPath];
 
     NSError *stateError = nil;
@@ -6267,7 +6342,7 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
                                                                         inFolder:folderName
                                                                       applyBlock:^(ModAssetLibraryEntry *entryToMutate) {
         entryToMutate.doctorStatus = ModAssetLibraryDoctorStatusUploading;
-        entryToMutate.doctorUploadProgress = 0.0;
+        entryToMutate.doctorUploadProgress = 0;
         entryToMutate.doctorProcessProgress = 0.0;
         entryToMutate.doctorLastError = nil;
     }
@@ -6283,8 +6358,8 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
     [BundleDoctorService dispatchBundleAtURL:bundleURL
                                         config:config
                          previousScratchBranch:previousScratchBranch
-                                uploadProgress:^(double fractionComplete) {
-        [weakSelf gd_doctorHandleUploadProgress:fractionComplete forEntryPath:entryPath inFolder:folderName];
+                                uploadProgress:^(int64_t bytesSent) {
+        [weakSelf gd_doctorHandleUploadProgress:bytesSent forEntryPath:entryPath inFolder:folderName];
     }
                                     completion:^(BundleDoctorHandle * _Nullable handle, NSError * _Nullable error) {
         [weakSelf gd_doctorDispatchCompletedForEntryPath:entryPath inFolder:folderName handle:handle error:error];
@@ -6309,7 +6384,7 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
     if (!folderName) return;
 
     [self gd_stopDoctorPollTimerForEntryPath:entry.path];
-    [self.doctorUploadProgressLastPercent removeObjectForKey:entry.path];
+    [self.doctorUploadProgressLastBytes removeObjectForKey:entry.path];
     [self.doctorProcessProgressLastPercent removeObjectForKey:entry.path];
 
     // Captured BEFORE the reset block below nils the persisted field -
@@ -6326,7 +6401,7 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
                                                                         inFolder:folderName
                                                                       applyBlock:^(ModAssetLibraryEntry *entryToMutate) {
         entryToMutate.doctorStatus = ModAssetLibraryDoctorStatusNotDispatched;
-        entryToMutate.doctorUploadProgress = 0.0;
+        entryToMutate.doctorUploadProgress = 0;
         entryToMutate.doctorProcessProgress = 0.0;
         entryToMutate.doctorScratchBranch = nil;
         entryToMutate.doctorRunID = nil;
@@ -6344,21 +6419,24 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
 
 // Throttled write-back for phase 1's uploadProgress callback - skips
 // the manifest read-modify-write (and the accordion rebuild it would
-// otherwise trigger) unless the rounded whole-number percent actually
-// moved since the last call, since uploadProgress can fire many times
-// a second per BundleDoctorService's own header.
-- (void)gd_doctorHandleUploadProgress:(double)fractionComplete forEntryPath:(NSString *)entryPath inFolder:(NSString *)folderName {
-    NSInteger percent = (NSInteger)round(MAX(0.0, MIN(1.0, fractionComplete)) * 100.0);
-    if (!self.doctorUploadProgressLastPercent) self.doctorUploadProgressLastPercent = [NSMutableDictionary dictionary];
-    NSNumber *last = self.doctorUploadProgressLastPercent[entryPath];
-    if (last && last.integerValue == percent) return;
-    self.doctorUploadProgressLastPercent[entryPath] = @(percent);
+// otherwise trigger) unless the reported byte count has moved by at
+// least kGDDoctorProgressByteThreshold since the last call, since
+// uploadProgress can fire many times a second per BundleDoctorService's
+// own header. Used to throttle by rounded whole-number percent instead,
+// back when this field held a 0.0-1.0 fraction - a fixed byte threshold
+// is the equivalent now that it holds a raw count with no fixed 0-100
+// range to round against.
+- (void)gd_doctorHandleUploadProgress:(int64_t)bytesSent forEntryPath:(NSString *)entryPath inFolder:(NSString *)folderName {
+    if (!self.doctorUploadProgressLastBytes) self.doctorUploadProgressLastBytes = [NSMutableDictionary dictionary];
+    NSNumber *last = self.doctorUploadProgressLastBytes[entryPath];
+    if (last && llabs(bytesSent - last.longLongValue) < kGDDoctorProgressByteThreshold) return;
+    self.doctorUploadProgressLastBytes[entryPath] = @(bytesSent);
 
     NSError *error = nil;
     ModAssetLibraryEntry *updated = [ModAssetLibrary updateDoctorStateForEntry:gd_mods_entry_placeholder_for_path(entryPath)
                                                                         inFolder:folderName
                                                                       applyBlock:^(ModAssetLibraryEntry *entryToMutate) {
-        entryToMutate.doctorUploadProgress = fractionComplete;
+        entryToMutate.doctorUploadProgress = bytesSent;
     }
                                                                            error:&error];
     if (!updated) return; // entry deleted mid-upload - nothing left to show progress on
@@ -6379,7 +6457,7 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
                                         inFolder:(NSString *)folderName
                                           handle:(BundleDoctorHandle *)handle
                                            error:(NSError *)error {
-    [self.doctorUploadProgressLastPercent removeObjectForKey:entryPath];
+    [self.doctorUploadProgressLastBytes removeObjectForKey:entryPath];
 
     if (!handle) {
         [self gd_doctorFailEntryAtPath:entryPath inFolder:folderName error:error];
@@ -6399,7 +6477,12 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
                                                                             inFolder:folderName
                                                                           applyBlock:^(ModAssetLibraryEntry *entryToMutate) {
             entryToMutate.doctorStatus = ModAssetLibraryDoctorStatusReadyToDownload;
-            entryToMutate.doctorUploadProgress = 1.0;
+            // No entryToMutate.doctorUploadProgress write here (used to
+            // force a clean 1.0) - a cache hit never actually uploads
+            // anything (alreadyComplete skips straight past that step),
+            // and the field is meaningful only while doctorStatus ==
+            // Uploading per its own header, so it's simply irrelevant
+            // the moment status moves to ReadyToDownload right below.
             entryToMutate.doctorProcessProgress = 1.0;
             entryToMutate.doctorScratchBranch = handle.scratchBranch;
             entryToMutate.doctorRunID = nil;
@@ -6419,7 +6502,13 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
                                                                         inFolder:folderName
                                                                       applyBlock:^(ModAssetLibraryEntry *entryToMutate) {
         entryToMutate.doctorStatus = ModAssetLibraryDoctorStatusProcessing;
-        entryToMutate.doctorUploadProgress = 1.0;
+        // No doctorUploadProgress write here either - by the time this
+        // completion block runs, +dispatchBundleAtURL:... has already
+        // reported its own final byte count via uploadProgress (see that
+        // method's own "clean total" landing calls), so the field
+        // already holds the real total; forcing it to anything else here
+        // would just be wrong. Same "irrelevant once Uploading ends"
+        // reasoning as the cache-hit branch above either way.
         entryToMutate.doctorProcessProgress = 0.0;
         entryToMutate.doctorScratchBranch = handle.scratchBranch;
         entryToMutate.doctorRunID = handle.runID;
@@ -6803,16 +6892,38 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
 - (void)gd_rebuildModsLibrary {
     if (!self.modsLibraryStack) return;
 
-    // 3.4: a rebuild can be triggered by something other than the
+    // 3: a rebuild can be triggered by something other than the
     // dropdown's own row taps (e.g. a background doctor-poll tick's
-    // progress update elsewhere in this file) while the options
-    // dropdown is still open. Its button lives inside the row about to
-    // be torn down below, so close it first, unanimated - once that row
-    // view is gone there'd be nothing left to shrink the overlay back
-    // into.
-    if (self.modsOptionsDropdownOpen) {
-        [self gd_closeModsOptionsDropdownAnimated:NO];
-    }
+    // progress update elsewhere in this file) while the options dropdown
+    // is still open on some OTHER, unrelated row. This used to
+    // unconditionally close the dropdown right here, which is exactly why
+    // a row's own "XX% Uploaded/Processed/Downloaded" subtext refreshing
+    // (see -gd_doctorHandleUploadProgress:forEntryPath:/-gd_rebuildModsLibrary
+    // callers below kGDDoctorProgressLastPercent-style gates) auto-closed
+    // any dropdown left open elsewhere in the list, even though nothing
+    // about that dropdown's own row actually changed.
+    //
+    // modsOptionsDropdownOverlay/Scrim live in self.contentOverlay, NOT
+    // inside modsLibraryStack (see -gd_openModsOptionsDropdownForButton:
+    // entry:folderName:'s own header) - the loop below that tears every
+    // row down doesn't touch them directly. The only thing that actually
+    // goes stale is modsOptionsDropdownButton, since it points at a
+    // button living inside the row about to be destroyed (it's `weak`,
+    // so that destruction just silently nils it out rather than
+    // crashing). So instead of closing unconditionally: remember what
+    // this dropdown was open for, let the rebuild run exactly as before,
+    // then try to re-find the same target's freshly-rebuilt options
+    // button afterward (see the reattachment block right after the
+    // Stored Bundles section below) and quietly re-point
+    // modsOptionsDropdownButton/Entry at it - overlay/scrim never move,
+    // so the open menu never even flickers. Only if that target genuinely
+    // isn't in the new list any more (its entry/folder was itself
+    // deleted/moved by whatever triggered this rebuild) does the
+    // reattachment step fall back to actually closing it.
+    BOOL wasDropdownOpen = self.modsOptionsDropdownOpen;
+    BOOL dropdownWasFolderMode = wasDropdownOpen && (self.modsOptionsDropdownEntry == nil);
+    NSString *dropdownTargetFolderName = wasDropdownOpen ? self.modsOptionsDropdownFolderName : nil;
+    NSString *dropdownTargetEntryPath = (wasDropdownOpen && !dropdownWasFolderMode) ? self.modsOptionsDropdownEntry.path : nil;
 
     // One-shot per launch, not per rebuild - see
     // -gd_recoverStaleDoctorStateForThisLaunch's own header comment for
@@ -7010,6 +7121,68 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
                     [self.modsLibraryStack addArrangedSubview:infoPanel];
                 }
             }
+        }
+    }
+
+    // 3: reattach (or, failing that, close) the dropdown captured at the
+    // top of this method - see that block's own header comment for why
+    // this runs here rather than closing up front. Deliberately placed
+    // after real folders + Stored Bundles (the only two row kinds a
+    // dropdown can ever be open for - gd_make_processed_bundle_row below
+    // has no optionsAction/dropdown of its own) and before Processed
+    // Bundles, so it always runs regardless of that section's several
+    // early returns (loading/error/empty) further down.
+    if (wasDropdownOpen) {
+        UIButton *newButton = nil;
+        ModAssetLibraryEntry *newEntry = nil;
+        for (UIView *view in self.modsLibraryStack.arrangedSubviews) {
+            if (dropdownWasFolderMode) {
+                NSString *rowFolderName = objc_getAssociatedObject(view, "gd_modsFolderName");
+                if (rowFolderName && [rowFolderName isEqualToString:dropdownTargetFolderName]) {
+                    newButton = objc_getAssociatedObject(view, "gd_button_options");
+                    break;
+                }
+            } else {
+                ModAssetLibraryEntry *rowEntry = objc_getAssociatedObject(view, "gd_modsEntry");
+                if (rowEntry && [rowEntry.path isEqualToString:dropdownTargetEntryPath]) {
+                    newButton = objc_getAssociatedObject(view, "gd_button_options");
+                    newEntry = rowEntry;
+                    break;
+                }
+            }
+        }
+
+        if (newButton) {
+            // Same "hidden while its dropdown is open" invariant
+            // -gd_openModsOptionsDropdownForButton:entry:folderName: sets
+            // on the original button.
+            newButton.hidden = YES;
+            self.modsOptionsDropdownButton = newButton;
+            if (newEntry) self.modsOptionsDropdownEntry = newEntry; // fresh entry object - keeps Delete/Cache/Restore/etc. off stale progress-tick data
+
+            // Re-anchor to the new button's current top-trailing corner,
+            // in case this rebuild also reordered rows above it - same
+            // top-trailing math -gd_openModsOptionsDropdownForButton:
+            // entry:folderName: used to open it, applied as a silent
+            // offset rather than a fresh open/close so the already-
+            // visible overlay never flickers.
+            CGRect newButtonFrame = [newButton convertRect:newButton.bounds toView:self.contentOverlay];
+            CGRect currentFrame = self.modsOptionsDropdownOverlay.frame;
+            CGFloat dx = CGRectGetMaxX(newButtonFrame) - CGRectGetMaxX(currentFrame);
+            CGFloat dy = CGRectGetMinY(newButtonFrame) - CGRectGetMinY(currentFrame);
+            if (dx != 0 || dy != 0) {
+                self.modsOptionsDropdownOverlay.frame = CGRectOffset(currentFrame, dx, dy);
+            }
+        } else {
+            // Target genuinely isn't in the rebuilt list any more (its
+            // entry/folder was itself deleted or moved by whatever
+            // triggered this particular rebuild) - nothing left to
+            // reattach to, so fall back to the old unconditional
+            // behavior. modsOptionsDropdownButton is already nil at this
+            // point (weak, and its old row was already torn down above),
+            // so this only tears down the overlay/scrim directly rather
+            // than trying to shrink back into a button that's gone.
+            [self gd_closeModsOptionsDropdownAnimated:NO];
         }
     }
 
@@ -7659,8 +7832,7 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
         } else if ([title isEqualToString:@"Rename"]) {
             [self gd_promptForModFolderRenameForFolder:folderName];
         } else if ([title isEqualToString:@"Cache folder"]) {
-            [self gd_presentModsAlertWithTitle:@"Coming Soon"
-                                        message:@"Caching folders isn't implemented yet."];
+            [self gd_cacheModFolder:folderName];
         } else if ([title isEqualToString:@"Add remark"]) {
             [self gd_promptForModFolderRemarkForFolder:folderName];
         } else if ([title isEqualToString:@"Delete"]) {
@@ -7733,14 +7905,30 @@ static NSURL *gd_mods_live_stock_url_for_entry(ModAssetLibraryEntry *entry) {
 // of its own to restore, so this just moves the entry's existing
 // on-disk library copy into Stored Bundles as-is - replacementBytesURL
 // stays nil in that case rather than snapshotting/restoring anything.
-- (void)gd_cacheBundleEntry:(ModAssetLibraryEntry *)entry inFolder:(NSString *)folderName {
+// 6: extracted core of what was previously all of
+// -gd_cacheBundleEntry:inFolder:'s body, so a whole-folder "Cache
+// folder" (-gd_cacheModFolder: below) can run the exact same per-entry
+// work without each entry popping its own alert along the way. Presents
+// nothing itself - just does the live-swap-back-to-original (when
+// applicable) + move-into-Stored-Bundles work and reports success/
+// failure via the return value, *outPartlyFailed, and *outError.
+// *outPartlyFailed is only ever set YES for the one failure mode where
+// the live file was ALREADY swapped back to original before the
+// library-side move into Stored Bundles failed - the single case a
+// caller might want to word differently even though, either way, it's
+// already logged via ZLog.
+- (BOOL)gd_cacheBundleEntryCore:(ModAssetLibraryEntry *)entry
+                        inFolder:(NSString *)folderName
+                    partlyFailed:(BOOL *)outPartlyFailed
+                           error:(NSError **)outError {
+    if (outPartlyFailed) *outPartlyFailed = NO;
     BOOL isLiveInstalledBundle = entry.isAssetBundle && entry.doctorStatus == ModAssetLibraryDoctorStatusInstalled;
 
     NSURL *stockURL = isLiveInstalledBundle ? gd_mods_live_stock_url_for_entry(entry) : nil;
     if (isLiveInstalledBundle && !stockURL) {
-        [self gd_presentModsAlertWithTitle:@"Can't Store"
-                                    message:@"This entry's live location isn't known."];
-        return;
+        if (outError) *outError = [NSError errorWithDomain:@"GDModsCache" code:1
+                                                    userInfo:@{NSLocalizedDescriptionKey: @"This entry's live location isn't known."}];
+        return NO;
     }
 
     NSString *tempPath = nil;
@@ -7758,17 +7946,17 @@ static NSURL *gd_mods_live_stock_url_for_entry(ModAssetLibraryEntry *entry) {
         BOOL snapshotted = [NSFileManager.defaultManager copyItemAtURL:stockURL toURL:[NSURL fileURLWithPath:tempPath] error:&snapshotErr];
         if (scoped) [stockURL stopAccessingSecurityScopedResource];
         if (!snapshotted) {
-            [self gd_presentModsAlertWithTitle:@"Store Failed"
-                                        message:snapshotErr.localizedDescription ?: @"Couldn't read the live bundle."];
-            return;
+            if (outError) *outError = snapshotErr ?: [NSError errorWithDomain:@"GDModsCache" code:2
+                                                                       userInfo:@{NSLocalizedDescriptionKey: @"Couldn't read the live bundle."}];
+            return NO;
         }
 
         NSError *cacheErr = nil;
         if (![BundleDoctorInstaller cacheOriginalBackForStockBundleURL:stockURL error:&cacheErr]) {
             [NSFileManager.defaultManager removeItemAtPath:tempPath error:nil];
-            [self gd_presentModsAlertWithTitle:@"Store Failed"
-                                        message:cacheErr.localizedDescription ?: @"Unknown error."];
-            return;
+            if (outError) *outError = cacheErr ?: [NSError errorWithDomain:@"GDModsCache" code:3
+                                                                     userInfo:@{NSLocalizedDescriptionKey: @"Unknown error."}];
+            return NO;
         }
         replacementBytesURL = [NSURL fileURLWithPath:tempPath];
     }
@@ -7782,9 +7970,9 @@ static NSURL *gd_mods_live_stock_url_for_entry(ModAssetLibraryEntry *entry) {
     if (![ModAssetLibrary createFolderNamed:kGDStoredBundlesFolderName error:&createErr]
         && createErr.code != ModAssetLibraryErrorFolderAlreadyExists) {
         if (tempPath) [NSFileManager.defaultManager removeItemAtPath:tempPath error:nil];
-        [self gd_presentModsAlertWithTitle:@"Store Failed"
-                                    message:createErr.localizedDescription ?: @"Couldn't prepare Stored Bundles."];
-        return;
+        if (outError) *outError = createErr ?: [NSError errorWithDomain:@"GDModsCache" code:4
+                                                                  userInfo:@{NSLocalizedDescriptionKey: @"Couldn't prepare Stored Bundles."}];
+        return NO;
     }
 
     entry.cachedFromFolder = folderName;
@@ -7801,16 +7989,77 @@ static NSURL *gd_mods_live_stock_url_for_entry(ModAssetLibraryEntry *entry) {
         // un-cache it from here - log it plainly rather than pretending
         // this half failed too.
         ZLog(@"[Mods Library] couldn't move %@ into Stored Bundles: %@", entry.fileName, moveErr.localizedDescription);
-        [self gd_presentModsAlertWithTitle:@"Store Partly Failed"
-                                    message:replacementBytesURL
+        if (outPartlyFailed) *outPartlyFailed = (replacementBytesURL != nil);
+        if (outError) *outError = moveErr ?: [NSError errorWithDomain:@"GDModsCache" code:5
+                                                                userInfo:@{NSLocalizedDescriptionKey: @"The entry couldn't be moved into Stored Bundles."}];
+        return NO;
+    }
+
+    return YES;
+}
+
+- (void)gd_cacheBundleEntry:(ModAssetLibraryEntry *)entry inFolder:(NSString *)folderName {
+    BOOL partlyFailed = NO;
+    NSError *error = nil;
+    BOOL ok = [self gd_cacheBundleEntryCore:entry inFolder:folderName partlyFailed:&partlyFailed error:&error];
+    if (!ok) {
+        [self gd_presentModsAlertWithTitle:partlyFailed ? @"Store Partly Failed" : @"Store Failed"
+                                    message:partlyFailed
                                         ? @"The live bundle was restored, but the entry couldn't be moved into Stored Bundles. See syslog."
-                                        : @"The entry couldn't be moved into Stored Bundles. See syslog."];
+                                        : (error.localizedDescription ?: @"Unknown error.")];
         [self gd_rebuildModsLibrary];
         return;
     }
 
     UINotificationFeedbackGenerator *haptic = [UINotificationFeedbackGenerator new];
     [haptic notificationOccurred:UINotificationFeedbackTypeSuccess];
+    [self gd_rebuildModsLibrary];
+}
+
+// 6 "Cache folder" - loops every entry in the folder through the same
+// -gd_cacheBundleEntryCore:inFolder:partlyFailed:error: the per-file
+// "Cache bundle" row uses, same shape as -gd_deleteModFolderConfirmed:'s
+// own per-entry loop, just Cache instead of Delete-and-restore.
+// Non-destructive (nothing is deleted - everything ends up moved into
+// Stored Bundles rather than gone), so unlike folder Delete this isn't
+// gated behind its own confirm alert; it's wired straight from the
+// folder options dropdown.
+//
+// entries is snapshotted up front via +entriesInFolder: because every
+// successful cache moves its entry OUT of folderName and into Stored
+// Bundles as the loop runs - walking the live folder while mutating it
+// underneath itself would skip whatever the move had already carried
+// off. One haptic and, only if anything failed, one summary alert cover
+// the whole batch rather than popping a dialog per entry.
+- (void)gd_cacheModFolder:(NSString *)folderName {
+    NSError *entriesErr = nil;
+    NSArray<ModAssetLibraryEntry *> *entries = [ModAssetLibrary entriesInFolder:folderName error:&entriesErr] ?: @[];
+    if (entries.count == 0) {
+        [self gd_presentModsAlertWithTitle:@"Nothing to Cache" message:@"This folder has no mods in it."];
+        return;
+    }
+
+    NSInteger failureCount = 0;
+    BOOL anyPartlyFailed = NO;
+    for (ModAssetLibraryEntry *entry in entries) {
+        BOOL partlyFailed = NO;
+        NSError *error = nil;
+        BOOL ok = [self gd_cacheBundleEntryCore:entry inFolder:folderName partlyFailed:&partlyFailed error:&error];
+        if (!ok) {
+            failureCount++;
+            if (partlyFailed) anyPartlyFailed = YES;
+            ZLog(@"[Mods Library] Cache folder %@: couldn't cache %@: %@", folderName, entry.fileName, error.localizedDescription);
+        }
+    }
+
+    UINotificationFeedbackGenerator *haptic = [UINotificationFeedbackGenerator new];
+    [haptic notificationOccurred:failureCount == 0 ? UINotificationFeedbackTypeSuccess : UINotificationFeedbackTypeError];
+    if (failureCount > 0) {
+        NSString *message = [NSString stringWithFormat:@"%ld of %ld mod%@ couldn't be moved into Stored Bundles.%@ See syslog.",
+                              (long)failureCount, (long)entries.count, entries.count == 1 ? @"" : @"s",
+                              anyPartlyFailed ? @" Some live bundles were already restored before the move failed." : @""];
+        [self gd_presentModsAlertWithTitle:@"Cache Folder Partly Failed" message:message];
+    }
     [self gd_rebuildModsLibrary];
 }
 
@@ -7917,44 +8166,39 @@ static NSURL *gd_mods_live_stock_url_for_entry(ModAssetLibraryEntry *entry) {
     [self gd_rebuildModsLibrary];
 }
 
-// "Add remark" (10) - no longer a UIAlertController prompt (see the old
-// comment this replaces, kept in spirit below): the keyboard now comes
-// up straight over a floating wide rectangular field, built fresh in
-// the key window and pinned just above the keyboard the same way the
-// Auth section's fields float (-gd_floatAuthField:), but full-width
-// within the safe area (minus margins) rather than narrow/right-aligned
-// - "wide rectangular" per spec - and with no row anywhere to restore
-// into afterward, since this one isn't parented in the scrolling panel
-// to begin with. Pre-filled with the entry's existing remark (if any)
-// so editing doesn't mean retyping it from scratch. Committing (Return,
-// tapping outside the field, or the keyboard otherwise going away) saves
-// via the same -gd_saveModRemark:forEntry:inFolder: this always used,
-// which rebuilds the library so the new remark shows up at the very top
-// of this file's dropdown (see gd_make_mods_entry_info_panel's own 3.4
-// comment - that placement was already correct and untouched here). An
-// empty submission clears the remark, same nil-not-empty-string
-// convention as before.
-- (void)gd_promptForModRemarkForEntry:(ModAssetLibraryEntry *)entry inFolder:(NSString *)folderName {
+// 7: generic custom floating text field - see gdFloatingField and
+// friends' property comments above for the shared state this manages.
+// Builds a full-screen invisible tap-to-dismiss backdrop plus a
+// floating, wide, glass-wrapped UITextField, pinned just above the
+// keyboard in the key window ("wide rectangular" per the original "Add
+// remark" spec this generalizes from), pre-filled with `initialText`.
+// Committing - Return, tapping outside the field, or the keyboard
+// otherwise going away - invokes `completion` with the trimmed text
+// (nil if the field was left/cleared empty) and tears the whole thing
+// down; there's no separate Cancel per spec, so every dismissal path
+// commits. If a previous floating field is somehow still up when this
+// is called (shouldn't normally happen - whatever presented it is
+// already gone once this is reachable again) it's committed first
+// rather than stranding it un-saved.
+- (void)gd_presentFloatingTextFieldWithInitialText:(NSString *)initialText
+                                        placeholder:(NSString *)placeholder
+                                             secure:(BOOL)secure
+                                         completion:(void (^)(NSString * _Nullable trimmedText))completion {
     UIWindow *window = gd_key_window();
-    if (!window || !entry) return;
-    if (self.modsRemarkFloatingField) {
-        // Shouldn't normally happen (the dropdown that reaches this is
-        // gone once one of these is up), but don't strand a previous one
-        // un-saved if it does - same defensive shape as
-        // -gd_floatAuthField:'s own stray-field check.
-        [self gd_commitModsRemarkFloatingField];
+    if (!window) return;
+    if (self.gdFloatingField) {
+        [self gd_commitFloatingFieldSaving:YES];
     }
 
-    self.modsRemarkFloatingEntry = entry;
-    self.modsRemarkFloatingFolderName = folderName;
+    self.gdFloatingFieldCompletion = completion;
 
     UIView *backdrop = [[UIView alloc] init];
     backdrop.translatesAutoresizingMaskIntoConstraints = NO;
     backdrop.backgroundColor = UIColor.clearColor; // just a tap target, not a visible dim - the field floating above everything is cue enough
     backdrop.userInteractionEnabled = YES;
-    [backdrop addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(gd_modsRemarkBackdropTapped)]];
+    [backdrop addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(gd_floatingFieldBackdropTapped)]];
     [window addSubview:backdrop];
-    self.modsRemarkFloatingBackdrop = backdrop;
+    self.gdFloatingFieldBackdrop = backdrop;
     [NSLayoutConstraint activateConstraints:@[
         [backdrop.leadingAnchor constraintEqualToAnchor:window.leadingAnchor],
         [backdrop.trailingAnchor constraintEqualToAnchor:window.trailingAnchor],
@@ -7963,30 +8207,32 @@ static NSURL *gd_mods_live_stock_url_for_entry(ModAssetLibraryEntry *entry) {
     ]];
 
     UITextField *field = [[UITextField alloc] init];
-    field.text = entry.remark;
-    field.placeholder = @"Remark";
+    field.text = initialText;
+    field.placeholder = placeholder;
+    field.secureTextEntry = secure;
     field.textColor = UIColor.whiteColor;
     field.font = [UIFont systemFontOfSize:15 weight:UIFontWeightRegular];
     field.returnKeyType = UIReturnKeyDone;
-    field.autocapitalizationType = UITextAutocapitalizationTypeSentences;
+    field.autocapitalizationType = secure ? UITextAutocapitalizationTypeNone : UITextAutocapitalizationTypeSentences;
+    field.autocorrectionType = secure ? UITextAutocorrectionTypeNo : UITextAutocorrectionTypeDefault;
     field.clearButtonMode = UITextFieldViewModeWhileEditing;
     field.delegate = self;
-    self.modsRemarkFloatingField = field;
+    self.gdFloatingField = field;
 
-    // Same real-glass-vs-flat-fallback wrapper the Auth fields use -
-    // gd_wrap_field_in_native_glass returns nil pre-iOS-26, in which
-    // case `field` itself (already flat-styled by that call) IS the
-    // container.
+    // Same real-glass-vs-flat-fallback wrapper the rest of this file
+    // uses - gd_wrap_field_in_native_glass returns nil pre-iOS-26, in
+    // which case `field` itself (already flat-styled by that call) IS
+    // the container.
     UIVisualEffectView *glass = gd_wrap_field_in_native_glass(field, kGDAuthFieldCornerRadius);
     UIView *container = glass ?: field;
     container.translatesAutoresizingMaskIntoConstraints = NO;
     [window addSubview:container];
     [window bringSubviewToFront:container];
-    self.modsRemarkFloatingContainer = container;
+    self.gdFloatingFieldContainer = container;
 
     container.alpha = 0;
     NSLayoutConstraint *bottom = [container.bottomAnchor constraintEqualToAnchor:window.bottomAnchor constant:-8];
-    self.modsRemarkFloatingBottomConstraint = bottom;
+    self.gdFloatingFieldBottomConstraint = bottom;
     [NSLayoutConstraint activateConstraints:@[
         [container.leadingAnchor constraintEqualToAnchor:window.safeAreaLayoutGuide.leadingAnchor constant:16],
         [container.trailingAnchor constraintEqualToAnchor:window.safeAreaLayoutGuide.trailingAnchor constant:-16],
@@ -7995,9 +8241,9 @@ static NSURL *gd_mods_live_stock_url_for_entry(ModAssetLibraryEntry *entry) {
     ]];
 
     // gd_lastKeyboardFrame is normally already correct by the time this
-    // runs (kept warm by every prior -gd_keyboardWillChangeFrame:, same
-    // as -gd_floatAuthField: relies on) - the fallback only matters if
-    // this is somehow the very first keyboard appearance of the session.
+    // runs (kept warm by every prior -gd_keyboardWillChangeFrame:) - the
+    // fallback only matters if this is somehow the very first keyboard
+    // appearance of the session.
     CGFloat bottomInset = window.safeAreaInsets.bottom + 291;
     if (!CGRectIsEmpty(self.gd_lastKeyboardFrame)) {
         CGFloat inset = CGRectGetHeight(window.bounds) - CGRectGetMinY(self.gd_lastKeyboardFrame);
@@ -8013,27 +8259,24 @@ static NSURL *gd_mods_live_stock_url_for_entry(ModAssetLibraryEntry *entry) {
     [field becomeFirstResponder];
 }
 
-// Tears down the floating remark field/backdrop and, unless `saving` is
-// NO (only the stray-field defensive path above passes NO - Cancel
-// isn't otherwise reachable, per spec there's no Cancel button here),
-// persists whatever's currently typed via the same
-// -gd_saveModRemark:forEntry:inFolder: the old alert-based Save button
-// used. Reads entry/folderName/text into locals before tearing down
-// (which nils the properties) so the save still has what it needs.
-- (void)gd_commitModsRemarkFloatingFieldSaving:(BOOL)saving {
-    ModAssetLibraryEntry *entry = self.modsRemarkFloatingEntry;
-    NSString *folderName = self.modsRemarkFloatingFolderName;
-    NSString *trimmed = [(self.modsRemarkFloatingField.text ?: @"")
+// Tears down the floating field/backdrop and, unless `saving` is NO
+// (only the stray-field defensive path above passes NO - there's no
+// user-facing Cancel here, per spec), invokes whichever completion
+// block the call site that presented this field supplied. Reads the
+// completion/text into locals before tearing down (which nils the
+// properties) so the call still has what it needs.
+- (void)gd_commitFloatingFieldSaving:(BOOL)saving {
+    void (^completion)(NSString * _Nullable) = self.gdFloatingFieldCompletion;
+    NSString *trimmed = [(self.gdFloatingField.text ?: @"")
         stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
 
-    UIView *backdrop = self.modsRemarkFloatingBackdrop;
-    UIView *container = self.modsRemarkFloatingContainer;
-    self.modsRemarkFloatingBackdrop = nil;
-    self.modsRemarkFloatingContainer = nil;
-    self.modsRemarkFloatingField = nil;
-    self.modsRemarkFloatingBottomConstraint = nil;
-    self.modsRemarkFloatingEntry = nil;
-    self.modsRemarkFloatingFolderName = nil;
+    UIView *backdrop = self.gdFloatingFieldBackdrop;
+    UIView *container = self.gdFloatingFieldContainer;
+    self.gdFloatingFieldBackdrop = nil;
+    self.gdFloatingFieldContainer = nil;
+    self.gdFloatingField = nil;
+    self.gdFloatingFieldBottomConstraint = nil;
+    self.gdFloatingFieldCompletion = nil;
 
     [UIView animateWithDuration:0.15 animations:^{
         backdrop.alpha = 0;
@@ -8043,23 +8286,42 @@ static NSURL *gd_mods_live_stock_url_for_entry(ModAssetLibraryEntry *entry) {
         [container removeFromSuperview];
     }];
 
-    if (saving && entry) {
-        [self gd_saveModRemark:(trimmed.length > 0 ? trimmed : nil) forEntry:entry inFolder:folderName];
+    if (saving && completion) {
+        completion(trimmed.length > 0 ? trimmed : nil);
     }
 }
 
 // Convenience for the normal (saving) teardown path - see the BOOL
 // overload above for the one defensive exception that skips saving.
-- (void)gd_commitModsRemarkFloatingField {
-    [self gd_commitModsRemarkFloatingFieldSaving:YES];
+- (void)gd_commitFloatingField {
+    [self gd_commitFloatingFieldSaving:YES];
 }
 
 // Tapping anywhere outside the floating field resigns it, which reaches
 // -textFieldDidEndEditing: below and commits exactly like Return does -
-// there's no separate "tap outside to cancel" per spec (no Cancel
-// button was specified for this field, unlike the old alert's).
-- (void)gd_modsRemarkBackdropTapped {
-    [self.modsRemarkFloatingField resignFirstResponder];
+// there's no separate "tap outside to cancel" per spec.
+- (void)gd_floatingFieldBackdropTapped {
+    [self.gdFloatingField resignFirstResponder];
+}
+
+// "Add remark" (10) - presents the shared floating field pre-filled
+// with the entry's existing remark (if any), so editing doesn't mean
+// retyping it from scratch. Committing saves via the same
+// -gd_saveModRemark:forEntry:inFolder: this always used, which rebuilds
+// the library so the new remark shows up at the very top of this
+// file's dropdown (see gd_make_mods_entry_info_panel's own 3.4 comment
+// - that placement was already correct and untouched here). An empty
+// submission clears the remark, same nil-not-empty-string convention
+// as before.
+- (void)gd_promptForModRemarkForEntry:(ModAssetLibraryEntry *)entry inFolder:(NSString *)folderName {
+    if (!entry) return;
+    __weak typeof(self) weakSelf = self;
+    [self gd_presentFloatingTextFieldWithInitialText:entry.remark
+                                          placeholder:@"Remark"
+                                               secure:NO
+                                           completion:^(NSString * _Nullable trimmedText) {
+        [weakSelf gd_saveModRemark:trimmedText forEntry:entry inFolder:folderName];
+    }];
 }
 
 // Persists the remark via the same updateDoctorStateForEntry:inFolder:
@@ -8142,33 +8404,24 @@ static NSURL *gd_mods_live_stock_url_for_entry(ModAssetLibraryEntry *entry) {
     [self gd_rebuildModsLibrary];
 }
 
-// "Add remark" (3.4.5) - folder equivalent of
-// -gd_promptForModRemarkForEntry:inFolder: above. Pre-filled with the
-// folder's existing remark via +[ModAssetLibrary remarkForFolder:] (see
-// that method's own header in ModAssetLibrary.h for why it's a sibling
-// remark.txt rather than a manifest.json field). Same terse title-only
-// shape, same empty-submission-clears-it convention as the file-row
-// version.
+// "Add remark" (3.4.5, migrated onto the shared floating field this
+// pass - 7) - folder equivalent of -gd_promptForModRemarkForEntry:
+// inFolder: above, now sharing that same
+// -gd_presentFloatingTextFieldWithInitialText:placeholder:secure:
+// completion: instead of its own UIAlertController prompt. Pre-filled
+// with the folder's existing remark via +[ModAssetLibrary
+// remarkForFolder:] (see that method's own header in ModAssetLibrary.h
+// for why it's a sibling remark.txt rather than a manifest.json field).
+// Same empty-submission-clears-it convention as the file-row version.
 - (void)gd_promptForModFolderRemarkForFolder:(NSString *)folderName {
-    UIViewController *presenter = gd_key_window().rootViewController;
-    if (!presenter) return;
-
-    UIAlertController *prompt = [UIAlertController alertControllerWithTitle:@"Add Remark"
-                                                                      message:nil
-                                                               preferredStyle:UIAlertControllerStyleAlert];
-    [prompt addTextFieldWithConfigurationHandler:^(UITextField *field) {
-        field.placeholder = @"Remark";
-        field.text = [ModAssetLibrary remarkForFolder:folderName];
-        field.autocapitalizationType = UITextAutocapitalizationTypeSentences;
-    }];
-    [prompt addAction:[UIAlertAction actionWithTitle:@"Cancel" style:UIAlertActionStyleCancel handler:nil]];
+    if (!folderName) return;
     __weak typeof(self) weakSelf = self;
-    [prompt addAction:[UIAlertAction actionWithTitle:@"Save" style:UIAlertActionStyleDefault handler:^(UIAlertAction *action) {
-        NSString *trimmed = [(prompt.textFields.firstObject.text ?: @"")
-            stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-        [weakSelf gd_saveModFolderRemark:(trimmed.length > 0 ? trimmed : nil) forFolder:folderName];
-    }]];
-    [presenter presentViewController:prompt animated:YES completion:nil];
+    [self gd_presentFloatingTextFieldWithInitialText:[ModAssetLibrary remarkForFolder:folderName]
+                                          placeholder:@"Remark"
+                                               secure:NO
+                                           completion:^(NSString * _Nullable trimmedText) {
+        [weakSelf gd_saveModFolderRemark:trimmedText forFolder:folderName];
+    }];
 }
 
 // Persists via +[ModAssetLibrary setRemark:forFolder:error:] (the
@@ -8277,17 +8530,17 @@ static NSURL *gd_mods_live_stock_url_for_entry(ModAssetLibraryEntry *entry) {
 
     NSString *entryPath = entry.path; // captured now, same reasoning as the dispatch handler's own entryPath capture
     [self.doctorDownloadInFlightPaths addObject:entryPath];
-    [self.doctorDownloadProgressLastPercent removeObjectForKey:entryPath]; // stale % from a previous attempt, if any
+    [self.doctorDownloadProgressLastBytes removeObjectForKey:entryPath]; // stale count from a previous attempt, if any
     NSError *resetError = nil;
     [ModAssetLibrary updateDoctorStateForEntry:entry inFolder:folderName applyBlock:^(ModAssetLibraryEntry *entryToMutate) {
-        entryToMutate.doctorDownloadProgress = 0.0;
+        entryToMutate.doctorDownloadProgress = 0;
     } error:&resetError];
     [self gd_rebuildModsLibrary];
 
     __weak typeof(self) weakSelf = self;
     [BundleDoctorService fetchDoctoredBundleForHandle:handle config:config
-        progress:^(double fractionComplete) {
-            [weakSelf gd_doctorHandleDownloadProgress:fractionComplete forEntryPath:entryPath inFolder:folderName];
+        progress:^(int64_t bytesWritten) {
+            [weakSelf gd_doctorHandleDownloadProgress:bytesWritten forEntryPath:entryPath inFolder:folderName];
         }
         completion:^(NSURL * _Nullable doctoredBundleURL, NSError * _Nullable error) {
         typeof(self) strongSelf = weakSelf;
@@ -8301,22 +8554,25 @@ static NSURL *gd_mods_live_stock_url_for_entry(ModAssetLibraryEntry *entry) {
 }
 
 // Throttled write-back for the download step's progress callback - same
-// "skip the read-modify-write + rebuild unless the rounded percent
-// actually moved" reasoning as -gd_doctorHandleUploadProgress:...
-// above, added as part of the 3.3 fix that gave the Info dropdown's
-// "Downloading…" status line a real percent.
-- (void)gd_doctorHandleDownloadProgress:(double)fractionComplete forEntryPath:(NSString *)entryPath inFolder:(NSString *)folderName {
-    NSInteger percent = (NSInteger)round(MAX(0.0, MIN(1.0, fractionComplete)) * 100.0);
-    if (!self.doctorDownloadProgressLastPercent) self.doctorDownloadProgressLastPercent = [NSMutableDictionary dictionary];
-    NSNumber *last = self.doctorDownloadProgressLastPercent[entryPath];
-    if (last && last.integerValue == percent) return;
-    self.doctorDownloadProgressLastPercent[entryPath] = @(percent);
+// "skip the read-modify-write + rebuild unless it's moved by at least
+// kGDDoctorProgressByteThreshold" reasoning as
+// -gd_doctorHandleUploadProgress:... above, added as part of the 3.3 fix
+// that gave the Info dropdown's "Downloading…" status line a real value
+// - originally a percent, since switched to a raw byte count (see this
+// method's own header note above via gd_doctorHandleUploadProgress:'s
+// header for why: the percent's expected-total denominator wasn't
+// always knowable, which is what left it stuck at 0%).
+- (void)gd_doctorHandleDownloadProgress:(int64_t)bytesWritten forEntryPath:(NSString *)entryPath inFolder:(NSString *)folderName {
+    if (!self.doctorDownloadProgressLastBytes) self.doctorDownloadProgressLastBytes = [NSMutableDictionary dictionary];
+    NSNumber *last = self.doctorDownloadProgressLastBytes[entryPath];
+    if (last && llabs(bytesWritten - last.longLongValue) < kGDDoctorProgressByteThreshold) return;
+    self.doctorDownloadProgressLastBytes[entryPath] = @(bytesWritten);
 
     NSError *error = nil;
     ModAssetLibraryEntry *updated = [ModAssetLibrary updateDoctorStateForEntry:gd_mods_entry_placeholder_for_path(entryPath)
                                                                         inFolder:folderName
                                                                       applyBlock:^(ModAssetLibraryEntry *entryToMutate) {
-        entryToMutate.doctorDownloadProgress = fractionComplete;
+        entryToMutate.doctorDownloadProgress = bytesWritten;
     }
                                                                            error:&error];
     if (!updated) return; // entry deleted mid-download - nothing left to show progress on
@@ -8563,17 +8819,44 @@ static NSURL *gd_mods_live_stock_url_for_entry(ModAssetLibraryEntry *entry) {
 // Best-effort restore of one tracked entry's swapped-in file back to
 // stock before it's forgotten (as part of a per-entry delete OR a
 // whole-folder delete - see -gd_deleteModEntryConfirmed:inFolder:/
-// -gd_deleteModFolderConfirmed: below). Only a .bank filename can
-// actually match a real backup (+[BankTransplant
-// restoreBackedUpBankNamed:error:]) now that CAB-based bundle restore
-// is gone - calling it for anything else is a harmless no-op (0
-// restored), which isn't worth surfacing here; the delete itself
-// should never be blocked by that.
+// -gd_deleteModFolderConfirmed: below).
+//
+// FIX (1): this used to only try +[BankTransplant
+// restoreBackedUpBankNamed:error:], which can only ever match a .bank
+// entry - the comment here literally admitted a bundle entry was a
+// "harmless no-op" now that the old CAB-based bundle restore was
+// removed from this method. That's exactly why deleting a bundle-kind
+// mod (or a whole folder containing one) removed it from the Mod
+// Asset Library's UI while leaving the doctored bytes live in the
+// game's own AssetBundle cache - the only thing that ever put them
+// back was the global "Restore Originals" button, not a delete. A
+// live-installed bundle entry (isAssetBundle + livePathDescription
+// resolvable via gd_mods_live_stock_url_for_entry, same "has this
+// actually been swapped in" test -gd_cacheBundleEntry:inFolder: and
+// -gd_restoreStoredBundleEntry:inFolder: already use) now also gets
+// swapped back to its backed-up original via +[BundleDoctorInstaller
+// cacheOriginalBackForStockBundleURL:error:] - the same single-bundle
+// restore path "Cache bundle" already relies on - before the entry is
+// forgotten. Still best-effort: a bundle that was never actually
+// live-installed (no resolvable stock URL) has nothing to restore here
+// and is silently skipped, same as a .bank entry with no backup on
+// file; the delete itself is never blocked by a restore failure.
 - (void)gd_restoreModEntryBestEffort:(ModAssetLibraryEntry *)entry {
-    NSError *error = nil;
-    [BankTransplant restoreBackedUpBankNamed:entry.fileName error:&error];
-    if (error) {
-        ZLog(@"[Mods Library] couldn't restore %@ before removing it from the library: %@", entry.fileName, error.localizedDescription);
+    NSError *bankError = nil;
+    [BankTransplant restoreBackedUpBankNamed:entry.fileName error:&bankError];
+    if (bankError) {
+        ZLog(@"[Mods Library] couldn't restore %@ before removing it from the library: %@", entry.fileName, bankError.localizedDescription);
+    }
+
+    if (entry.isAssetBundle) {
+        NSURL *stockURL = gd_mods_live_stock_url_for_entry(entry);
+        if (stockURL) {
+            NSError *bundleError = nil;
+            BOOL restored = [BundleDoctorInstaller cacheOriginalBackForStockBundleURL:stockURL error:&bundleError];
+            if (!restored) {
+                ZLog(@"[Mods Library] couldn't restore %@'s live bundle at %@ before removing it from the library: %@", entry.fileName, stockURL.path, bundleError.localizedDescription);
+            }
+        }
     }
 }
 
@@ -9317,9 +9600,12 @@ static NSURL *gd_mods_live_stock_url_for_entry(ModAssetLibraryEntry *entry) {
 }
 
 // Writes authRepoLinkField/authTokenField back out via
-// +[BundleDoctorSettings saveConfig:error:] - called from
-// -textFieldDidEndEditing: below, i.e. once per field per edit (on
-// blur/Return), not per keystroke. +saveConfig: is a full replace (see
+// +[BundleDoctorSettings saveConfig:error:] - called once per field per
+// edit, from the completion block -textFieldShouldBeginEditing: hands
+// -gd_presentFloatingTextFieldWithInitialText:placeholder:secure:
+// completion: (see that delegate method below), right after the
+// committed text has already been written back onto the field itself.
+// +saveConfig: is a full replace (see
 // that method's own header comment), so this loads the current config
 // first and only overwrites the two fields this section owns, leaving
 // ref/workflowFile/outputFormat exactly as BundleDoctorService/a future
@@ -9375,6 +9661,40 @@ static NSURL *gd_mods_live_stock_url_for_entry(ModAssetLibraryEntry *entry) {
     self.authStatusLabel.hidden = (text.length == 0);
 }
 
+// 5: greys out the Auth fields and turns off their glass "press"
+// animation once credentials are confirmed (verified or stale - both
+// -gd_authEnterVerifiedState/-gd_authEnterStaleState call this with
+// locked:YES) - `field.enabled = NO` alone already stops the field from
+// ever becoming first responder (-textFieldShouldBeginEditing: never
+// even fires for a disabled field), but that left two things still
+// reading as interactive to the eye: the field's own bright white text,
+// and the wrapping glass container's own UIGlassEffect, which animates
+// on touch independently of the field it wraps - `interactive` is a
+// property of the effect/container (see gd_wrap_field_in_native_glass/
+// gd_make_glass_effect), not something the field's own enabled state
+// touches. Reassigning `.effect` with interactive:NO kills that
+// animation; the container's own cornerConfiguration (set separately,
+// on the view, by gd_configure_glass_corners) isn't part of the effect
+// object and survives the swap untouched. `locked:NO`
+// (-gd_authRemoveCredentialsConfirmed) restores every bit of this.
+- (void)gd_setAuthFieldsLocked:(BOOL)locked {
+    self.authRepoLinkField.enabled = !locked;
+    self.authTokenField.enabled = !locked;
+
+    UIColor *textColor = locked ? [UIColor colorWithWhite:1 alpha:0.35] : UIColor.whiteColor;
+    self.authRepoLinkField.textColor = textColor;
+    self.authTokenField.textColor = textColor;
+
+    NSArray<UIView *> *fieldContainers = @[self.authRepoLinkFieldContainer, self.authTokenFieldContainer];
+    for (UIView *container in fieldContainers) {
+        if (!container) continue;
+        container.alpha = locked ? 0.5 : 1.0;
+        if (gd_has_liquid_glass() && [container isKindOfClass:[UIVisualEffectView class]]) {
+            ((UIVisualEffectView *)container).effect = gd_make_glass_effect(!locked);
+        }
+    }
+}
+
 // Locks the Auth section into its "credentials confirmed" state: fields
 // non-interactable, authVerifyButton crossfades to a red 1s
 // hold-to-confirm "Remove" (reusing the same gd_attach_pill_hold_to_confirm_duration
@@ -9386,8 +9706,7 @@ static NSURL *gd_mods_live_stock_url_for_entry(ModAssetLibraryEntry *entry) {
 - (void)gd_authEnterVerifiedState {
     self.authCredentialsStale = NO;
     self.authInRemoveMode = YES;
-    self.authRepoLinkField.enabled = NO;
-    self.authTokenField.enabled = NO;
+    [self gd_setAuthFieldsLocked:YES];
 
     gd_remove_pill_hold_to_confirm_gestures(self.authVerifyButton); // defensive - see that function's own header
     __weak typeof(self) weakSelf = self;
@@ -9414,8 +9733,7 @@ static NSURL *gd_mods_live_stock_url_for_entry(ModAssetLibraryEntry *entry) {
 - (void)gd_authEnterStaleState {
     self.authCredentialsStale = YES;
     self.authInRemoveMode = YES;
-    self.authRepoLinkField.enabled = NO;
-    self.authTokenField.enabled = NO;
+    [self gd_setAuthFieldsLocked:YES];
 
     gd_remove_pill_hold_to_confirm_gestures(self.authVerifyButton);
     __weak typeof(self) weakSelf = self;
@@ -9452,8 +9770,7 @@ static NSURL *gd_mods_live_stock_url_for_entry(ModAssetLibraryEntry *entry) {
 
     self.authRepoLinkField.text = @"";
     self.authTokenField.text = @"";
-    self.authRepoLinkField.enabled = YES;
-    self.authTokenField.enabled = YES;
+    [self gd_setAuthFieldsLocked:NO];
 
     self.authVerifyButton.enabled = YES;
     gd_crossfade_auth_button_to_verify(self.authVerifyButton);
@@ -9810,17 +10127,18 @@ static NSURL *gd_mods_live_stock_url_for_entry(ModAssetLibraryEntry *entry) {
 }
 
 // Tracks the keyboard's current frame (window coordinates) at all times
-// - -gd_floatAuthField: reads gd_lastKeyboardFrame rather than waiting
-// on a fresh notification, since switching first responder directly
-// between the two Auth fields (same keyboard type, so the frame doesn't
-// actually change) doesn't reliably re-post this notification. If a
-// field is already floated when this fires - a height change mid-edit,
-// e.g. the predictive text bar appearing, or a rotation - just nudge
-// its bottom constraint to the new position instead of a full fade
-// cycle; if the keyboard has gone away entirely while a field is still
-// marked floated (e.g. the person swiped it down without blurring,
-// which iPadOS allows), restore defensively rather than leaving it
-// stranded.
+// - -gd_presentFloatingTextFieldWithInitialText:placeholder:secure:
+// completion: reads gd_lastKeyboardFrame rather than waiting on a fresh
+// notification, since presenting a new floating field from within
+// another one's commit (see that method's stray-field check) doesn't
+// reliably get a fresh notification of its own. If the shared floating
+// field is already up when this fires - a height change mid-edit, e.g.
+// the predictive text bar appearing, or a rotation - just nudge its
+// bottom constraint to the new position instead of a full fade cycle;
+// if the keyboard has gone away entirely while it's still up (e.g. an
+// external-keyboard toggle, or the "dismiss keyboard" swipe), resigning
+// is the same commit path Return/tapping outside use - see
+// -textFieldDidEndEditing:.
 - (void)gd_keyboardWillChangeFrame:(NSNotification *)note {
     UIWindow *window = gd_key_window();
     if (!window) return;
@@ -9833,171 +10151,55 @@ static NSURL *gd_mods_live_stock_url_for_entry(ModAssetLibraryEntry *entry) {
     NSTimeInterval duration = [note.userInfo[UIKeyboardAnimationDurationUserInfoKey] doubleValue];
     if (duration <= 0) duration = 0.25;
 
-    if (self.authFieldCurrentlyFloated && keyboardVisible) {
+    if (self.gdFloatingField && keyboardVisible) {
         CGFloat bottomInset = CGRectGetHeight(window.bounds) - CGRectGetMinY(endFrameInWindow);
-        self.authFieldFloatingBottomConstraint.constant = -(bottomInset + 8);
+        self.gdFloatingFieldBottomConstraint.constant = -(bottomInset + 8);
         [UIView animateWithDuration:duration animations:^{
             [window layoutIfNeeded];
         }];
-    } else if (self.authFieldCurrentlyFloated && !keyboardVisible) {
-        [self gd_restoreAuthField:self.authFieldCurrentlyFloated];
-    }
-
-    // 10: same height-tracking for the standalone "Add remark" floating
-    // field - it has no row to restore into, so there's nothing to do
-    // here but keep it pinned above the keyboard while both are up.
-    // If the keyboard goes away out from under it (e.g. an external-
-    // keyboard toggle, or the "dismiss keyboard" swipe), resigning is
-    // the same commit path Return/tapping outside use - see
-    // -textFieldDidEndEditing:.
-    if (self.modsRemarkFloatingField && keyboardVisible) {
-        CGFloat bottomInset = CGRectGetHeight(window.bounds) - CGRectGetMinY(endFrameInWindow);
-        self.modsRemarkFloatingBottomConstraint.constant = -(bottomInset + 8);
-        [UIView animateWithDuration:duration animations:^{
-            [window layoutIfNeeded];
-        }];
-    } else if (self.modsRemarkFloatingField && !keyboardVisible) {
-        [self.modsRemarkFloatingField resignFirstResponder];
+    } else if (self.gdFloatingField && !keyboardVisible) {
+        [self.gdFloatingField resignFirstResponder];
     }
 }
 
-// Lifts `field`'s real glass-wrapped container out of its row in the
-// scrolling panel and parents it directly in the key window, right-
-// aligned and pinned just above the keyboard - see
-// kGDAuthFieldContainerKey and friends above for how the container/row/
-// constraints were stashed at build time. The move itself is a simple
-// cross-fade per spec (fade out at the row position, reparent, fade in
-// at the floating position), not a slide/morph - see -gd_restoreAuthField:
-// for the reverse. No-op if `field` is already the floated one.
-- (void)gd_floatAuthField:(UITextField *)field {
-    if (!field || self.authFieldCurrentlyFloated == field) return;
-    if (self.authFieldCurrentlyFloated) {
-        // Shouldn't normally happen - -textFieldDidEndEditing: restores
-        // the previous field before this ever runs for a new one - but
-        // don't leave a stale floated field stranded if it does.
-        [self gd_restoreAuthField:self.authFieldCurrentlyFloated];
-    }
-
-    UIView *fieldContainer = objc_getAssociatedObject(field, kGDAuthFieldContainerKey);
-    NSArray<NSLayoutConstraint *> *rowConstraints = objc_getAssociatedObject(field, kGDAuthFieldRowConstraintsKey);
-    UIWindow *window = gd_key_window();
-    if (!fieldContainer || !rowConstraints || !window) return; // defensive - only ever set by gd_make_labeled_glass_field_row
-
-    CGFloat savedWidth = fieldContainer.bounds.size.width;
-    self.authFieldCurrentlyFloated = field;
-
-    [UIView animateWithDuration:0.15 animations:^{
-        fieldContainer.alpha = 0;
-    } completion:^(BOOL finished) {
-        [NSLayoutConstraint deactivateConstraints:rowConstraints];
-
-        // Reparent via -addSubview: directly rather than calling
-        // -removeFromSuperview first. field is `field`'s live
-        // UITextField and is still first responder at this point - an
-        // explicit -removeFromSuperview momentarily detaches
-        // fieldContainer (and therefore `field`) from any window before
-        // the follow-up -addSubview: reattaches it, and UIKit resigns
-        // first-responder status the instant a responder's view goes
-        // windowless. That resignation fires -textFieldDidEndEditing:
-        // mid-float, which calls -gd_restoreAuthField: right back
-        // (since authFieldCurrentlyFloated is already set to `field` -
-        // see above) - undoing this exact move a frame after it starts
-        // and dropping the keyboard. window here is the same UIWindow
-        // fieldContainer's row already lives in (see gd_key_window()),
-        // so -addSubview: below reparents it in one atomic step without
-        // ever making it windowless, and first-responder status survives.
-        fieldContainer.translatesAutoresizingMaskIntoConstraints = NO;
-        [window addSubview:fieldContainer];
-        [window bringSubviewToFront:fieldContainer];
-
-        // gd_lastKeyboardFrame is normally already correct by the time
-        // this runs (see the header comment above) - the fallback below
-        // only matters if this is somehow reached before the keyboard's
-        // very first WillChangeFrame notification of the session.
-        CGFloat bottomInset = CGRectGetHeight(window.bounds) - CGRectGetMinY(self.gd_lastKeyboardFrame);
-        if (CGRectIsEmpty(self.gd_lastKeyboardFrame) || bottomInset < 8) {
-            bottomInset = window.safeAreaInsets.bottom + 291; // typical current-generation iPhone portrait keyboard height
-        }
-
-        NSLayoutConstraint *bottomConstraint =
-            [fieldContainer.bottomAnchor constraintEqualToAnchor:window.bottomAnchor constant:-(bottomInset + 8)];
-        NSArray<NSLayoutConstraint *> *floatConstraints = @[
-            [fieldContainer.trailingAnchor constraintEqualToAnchor:window.safeAreaLayoutGuide.trailingAnchor constant:-16],
-            bottomConstraint,
-            [fieldContainer.widthAnchor constraintEqualToConstant:savedWidth],
-            [fieldContainer.heightAnchor constraintEqualToConstant:28],
-        ];
-        [NSLayoutConstraint activateConstraints:floatConstraints];
-        objc_setAssociatedObject(field, kGDAuthFieldFloatingConstraintsKey, floatConstraints, OBJC_ASSOCIATION_RETAIN);
-        self.authFieldFloatingBottomConstraint = bottomConstraint;
-        [window layoutIfNeeded];
-
-        [UIView animateWithDuration:0.15 animations:^{
-            fieldContainer.alpha = 1;
-        }];
-    }];
-}
-
-// Reverse of -gd_floatAuthField: above - fades `field`'s container out
-// of its floating window-level position, reparents it back into its
-// original row using the exact constraints -gd_floatAuthField: deactivated
-// (not rebuilt from scratch), and fades it back in there. No-op if
-// `field` isn't the currently-floated one.
-- (void)gd_restoreAuthField:(UITextField *)field {
-    if (!field || self.authFieldCurrentlyFloated != field) return;
-
-    UIView *fieldContainer = objc_getAssociatedObject(field, kGDAuthFieldContainerKey);
-    UIView *originalRow = objc_getAssociatedObject(field, kGDAuthFieldRowKey);
-    NSArray<NSLayoutConstraint *> *rowConstraints = objc_getAssociatedObject(field, kGDAuthFieldRowConstraintsKey);
-    NSArray<NSLayoutConstraint *> *floatConstraints = objc_getAssociatedObject(field, kGDAuthFieldFloatingConstraintsKey);
-    if (!fieldContainer || !originalRow || !rowConstraints) {
-        self.authFieldCurrentlyFloated = nil;
-        self.authFieldFloatingBottomConstraint = nil;
-        return;
-    }
-
-    self.authFieldCurrentlyFloated = nil;
-    self.authFieldFloatingBottomConstraint = nil;
-
-    [UIView animateWithDuration:0.15 animations:^{
-        fieldContainer.alpha = 0;
-    } completion:^(BOOL finished) {
-        if (floatConstraints) [NSLayoutConstraint deactivateConstraints:floatConstraints];
-        objc_setAssociatedObject(field, kGDAuthFieldFloatingConstraintsKey, nil, OBJC_ASSOCIATION_RETAIN);
-
-        // Same atomic-reparent reasoning as -gd_floatAuthField: above -
-        // -addSubview: directly instead of -removeFromSuperview then
-        // -addSubview:, so `field` never goes windowless if it's still
-        // first responder here (e.g. a defensive restore from
-        // -gd_keyboardWillChangeFrame: while the person is still typing).
-        fieldContainer.translatesAutoresizingMaskIntoConstraints = NO;
-        [originalRow addSubview:fieldContainer];
-        [NSLayoutConstraint activateConstraints:rowConstraints];
-        [originalRow layoutIfNeeded];
-
-        [UIView animateWithDuration:0.15 animations:^{
-            fieldContainer.alpha = 1;
-        }];
-    }];
-}
-
-- (void)textFieldDidBeginEditing:(UITextField *)textField {
+// 7: the Auth section's repo-link/PAT rows never actually become first
+// responder themselves any more - returning NO here (instead of the
+// old -gd_floatAuthField: reparent-in-place dance) routes both of them
+// through the same shared custom floating field every other text entry
+// point in this file now uses. The row field keeps showing its current
+// value (masked, for the PAT field, via its own secureTextEntry) as a
+// static display; tapping it presents the floating field pre-filled
+// with that same value, and its completion writes the committed text
+// straight back onto the row field before persisting - so from
+// -gd_persistAuthFields's point of view (which just reads
+// authRepoLinkField.text/authTokenField.text) nothing about how the
+// value got there matters.
+- (BOOL)textFieldShouldBeginEditing:(UITextField *)textField {
     if (textField == self.authRepoLinkField || textField == self.authTokenField) {
-        [self gd_floatAuthField:textField];
+        __weak typeof(self) weakSelf = self;
+        __weak UITextField *weakField = textField;
+        [self gd_presentFloatingTextFieldWithInitialText:textField.text
+                                              placeholder:textField.placeholder
+                                                   secure:textField.secureTextEntry
+                                               completion:^(NSString * _Nullable trimmedText) {
+            __strong typeof(weakSelf) strongSelf = weakSelf;
+            __strong UITextField *strongField = weakField;
+            if (!strongSelf || !strongField) return;
+            strongField.text = trimmedText ?: @"";
+            [strongSelf gd_persistAuthFields];
+        }];
+        return NO;
     }
+    return YES;
 }
 
 - (void)textFieldDidEndEditing:(UITextField *)textField {
-    if (textField == self.authRepoLinkField || textField == self.authTokenField) {
-        [self gd_restoreAuthField:textField];
-        [self gd_persistAuthFields];
-        return;
-    }
-    if (textField == self.modsRemarkFloatingField) {
-        // 10: resigning is the commit for the floating remark field,
-        // same shape as the Auth fields' resign-to-persist above - see
-        // -gd_promptForModRemarkForEntry:inFolder:'s own header comment.
-        [self gd_commitModsRemarkFloatingField];
+    if (textField == self.gdFloatingField) {
+        // 7/10: resigning is the commit for the shared floating field,
+        // whichever call site presented it - see
+        // -gd_presentFloatingTextFieldWithInitialText:placeholder:
+        // secure:completion:'s own header comment.
+        [self gd_commitFloatingField];
         return;
     }
 }
@@ -10005,18 +10207,10 @@ static NSURL *gd_mods_live_stock_url_for_entry(ModAssetLibraryEntry *entry) {
 #pragma mark Syslog blacklist
 
 - (BOOL)textFieldShouldReturn:(UITextField *)textField {
-    // Return just dismisses the keyboard for the Auth fields - resigning
-    // first responder is what actually triggers the save, via
-    // -textFieldDidEndEditing: above (see -gd_persistAuthFields).
-    if (textField == self.authRepoLinkField || textField == self.authTokenField) {
-        [textField resignFirstResponder];
-        return YES;
-    }
-    if (textField == self.modsRemarkFloatingField) {
-        // 10: Done just dismisses the keyboard - resigning first
+    if (textField == self.gdFloatingField) {
+        // 7/10: Done just dismisses the keyboard - resigning first
         // responder is what actually commits, via
-        // -textFieldDidEndEditing: above (matches the Auth fields'
-        // return-key shape immediately above this one).
+        // -textFieldDidEndEditing: above.
         [textField resignFirstResponder];
         return YES;
     }

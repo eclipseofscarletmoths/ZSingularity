@@ -20,6 +20,7 @@
 #import <pthread.h>
 #import <string.h>
 #import "GDScripts.h"
+#import "GDFileIndex.h" // 2 - startup file index, see file_index_worker below
 #import "ZTweakLog.h"
 
 #pragma mark - Unity view discovery
@@ -56,6 +57,24 @@ static void configure_metal_layer(UIView *unityView) {
 }
 
 #pragma mark - Startup
+
+// 2 - indexes Library/UnityCache/Shared and the FMOD mobile builds
+// folder once at launch (see GDFileIndex.h for the full why/shape). Run
+// on its own thread, entirely independent of background_worker's own
+// wait for the Unity view/IL2CPP below - indexing is pure filesystem
+// work that needs neither, and every real consumer of the index (mod
+// import, the doctor pipeline's install resolve) only ever runs off a
+// person's own interaction with the Mods panel, which is always well
+// after dylib load. Keeping this off background_worker's thread means a
+// slow first-time (or changed-since-last-launch) re-index never adds to
+// the Unity-view wait that gates FPS control coming up.
+static void *file_index_worker(void *arg) {
+    (void)arg;
+    @autoreleasepool {
+        [GDFileIndex ensureIndexUpToDate];
+    }
+    return NULL;
+}
 
 static void *background_worker(void *arg) {
     (void)arg;
@@ -111,6 +130,11 @@ static void *background_worker(void *arg) {
 __attribute__((constructor))
 static void fps120_init(void) {
     ZLog(@"dylib loaded - starting background worker");
+
+    pthread_t indexThread;
+    pthread_create(&indexThread, NULL, file_index_worker, NULL);
+    pthread_detach(indexThread);
+
     pthread_t t;
     pthread_create(&t, NULL, background_worker, NULL);
     pthread_detach(t);

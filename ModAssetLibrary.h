@@ -185,15 +185,24 @@ typedef NS_ENUM(NSInteger, ModAssetLibraryDoctorStatus) {
 // call sites via +updateDoctorStateForEntry:inFolder:applyBlock:error:
 // below - this class never calls BundleDoctorService itself.
 @property (nonatomic, assign) ModAssetLibraryDoctorStatus doctorStatus;
-@property (nonatomic, assign) double doctorUploadProgress;   // 0.0-1.0; meaningful only while doctorStatus == Uploading
+// Raw cumulative bytes transferred so far, not a 0.0-1.0 fraction - see
+// BundleDoctorService.h's uploadProgress/downloadProgress contracts.
+// doctorUploadProgress is meaningful only while doctorStatus ==
+// Uploading; doctorProcessProgress is still a 0.0-1.0 fraction (derived
+// from the run's own completed-steps/total-steps, not a byte transfer -
+// see +fetchRunStatusForHandle:...) and is meaningful only while
+// doctorStatus == Processing.
+@property (nonatomic, assign) int64_t doctorUploadProgress;
 @property (nonatomic, assign) double doctorProcessProgress;  // 0.0-1.0; meaningful only while doctorStatus == Processing
-// 0.0-1.0; meaningful only while doctorStatus == ReadyToDownload AND the
-// row's download is actually in flight (see GraphicsDebugOverlay's
-// doctorDownloadInFlightPaths - unlike Uploading/Processing, "downloading"
-// isn't its own doctorStatus value, so this field alone doesn't imply a
-// download is running). Reset to 0.0 at the start of each download
-// attempt, same convention as doctorUploadProgress.
-@property (nonatomic, assign) double doctorDownloadProgress;
+// Raw cumulative bytes written so far, not a 0.0-1.0 fraction - same
+// reasoning as doctorUploadProgress above. Meaningful only while
+// doctorStatus == ReadyToDownload AND the row's download is actually in
+// flight (see GraphicsDebugOverlay's doctorDownloadInFlightPaths -
+// unlike Uploading/Processing, "downloading" isn't its own doctorStatus
+// value, so this field alone doesn't imply a download is running). Reset
+// to 0 at the start of each download attempt, same convention as
+// doctorUploadProgress.
+@property (nonatomic, assign) int64_t doctorDownloadProgress;
 @property (nonatomic, copy, nullable) NSString *doctorScratchBranch; // BundleDoctorHandle.scratchBranch, once dispatched
 @property (nonatomic, copy, nullable) NSString *doctorRunID;         // filled in once +resolveRunForHandle:... finds it
 @property (nonatomic, copy, nullable) NSString *doctorRunURL;        // for surfacing "view run" on failure

@@ -244,6 +244,41 @@ NSArray<NSString *> *gd_tracked_asset_paths(void);
 // to - see GraphicsDebugOverlay.m's -hardAssetsResetTapped.
 void gd_clear_tracked_asset_paths(void);
 
+#pragma mark - File index (Mod Loader Pipeline caching - see GDFileIndex.h)
+//
+// GDFileIndex.h/.m owns building/using the actual index (the CAB map,
+// the FMOD filename set, and both folders' change-fingerprints) - this
+// file only owns making sure whatever it builds round-trips through the
+// same GraphicsDebugOverlaySettings.json every other control here does,
+// under its own "fileIndex" entry, with the same "never silently
+// dropped by an unrelated settings save" guarantee
+// gd_current_settings_dictionary()'s own comment already promises
+// trackedAssetPaths above. GDScripts.h/.m never builds or interprets
+// this dictionary's contents - it's opaque here, GDFileIndex.m is the
+// only reader/writer of what's actually inside it.
+
+// Whatever GDFileIndex last computed - nil until +[GDFileIndex
+// ensureIndexUpToDate] has run at least once this session, or
+// gd_ensure_file_index_snapshot_loaded() has pulled in whatever a
+// previous session left on disk.
+extern NSDictionary *g_fileIndexSnapshot;
+
+// Lazily loads g_fileIndexSnapshot from whatever's already in the
+// settings JSON exactly once - same "don't assume buildPanel's own load
+// has already run" reasoning as gd_ensure_tracked_asset_paths_loaded()
+// above, since indexing needs to happen at startup (fps120.m), well
+// before the graphics panel is ever built.
+void gd_ensure_file_index_snapshot_loaded(void);
+
+// Replaces g_fileIndexSnapshot and persists the full settings dictionary
+// immediately - see gd_track_asset_path()'s own comment for why an
+// immediate write matters here too: the index needs to survive a
+// relaunch for the very next launch's cheap fingerprint check (see
+// GDFileIndex.h) to have anything on file to compare against. Pass nil
+// to clear it back out (not currently exercised by anything, but kept
+// symmetrical with the tracked-asset-paths accessors above).
+void gd_set_file_index_snapshot(NSDictionary * _Nullable snapshot);
+
 #pragma mark - Apply-everything entry points
 
 // Full parity with every setting this file knows about - FPS, texture

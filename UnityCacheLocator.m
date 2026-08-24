@@ -2,6 +2,7 @@
 
 #import "UnityCacheLocator.h"
 #import "UnityBundleCAB.h"
+#import "GDFileIndex.h" // 2 - cached CAB map, see +allBundlePathsForCAB: below
 #import "ZTweakLog.h"
 
 NSString * const UnityCacheLocatorErrorDomain = @"UnityCacheLocatorErrorDomain";
@@ -74,6 +75,24 @@ static void ucl_search(NSString *dirPath, NSUInteger depthRemaining, NSMutableAr
 }
 
 + (NSArray<NSString *> *)allBundlePathsForCAB:(NSString *)cab {
+    // 2 - GDFileIndex.h builds and maintains exactly this CAB -> path
+    // map once at startup (refreshed only when UnityCache/Shared's own
+    // contents actually change - see that class's header), specifically
+    // so this method doesn't re-open and re-parse every cached file on
+    // every single call the way the live scan below always used to. Only
+    // fall back to that live scan if the index hasn't been built AT ALL
+    // this session (+hasIndex false) - shouldn't happen in practice,
+    // since fps120.m kicks the index off on its own background thread at
+    // dylib load and every real caller of this method only ever runs off
+    // a person's own interaction with the Mods panel, well after that -
+    // but this method has no way to enforce that ordering itself, so it
+    // stays correct (if slow, same as before) rather than assuming it.
+    if ([GDFileIndex hasIndex]) {
+        return [GDFileIndex cachedPathsForCAB:cab] ?: @[];
+    }
+
+    ZLog(@"[UnityCacheLocator] file index not built yet this session - falling back to a live scan for CAB %@", cab);
+
     NSMutableArray<NSString *> *matches = [NSMutableArray array];
     NSFileManager *fm = NSFileManager.defaultManager;
 

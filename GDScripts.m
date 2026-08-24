@@ -534,6 +534,7 @@ NSInteger g_menuFPS        = 60;
 NSInteger g_combatFPS      = 60;
 NSArray<NSString *> *g_syslogBlacklist = nil;
 NSMutableArray<NSString *> *g_trackedAssetPaths = nil;
+NSDictionary *g_fileIndexSnapshot = nil;
 
 #pragma mark - Settings persistence (JSON in Documents)
 //
@@ -618,14 +619,43 @@ void gd_clear_tracked_asset_paths(void) {
     gd_write_settings_dictionary(gd_current_settings_dictionary());
 }
 
+#pragma mark - File index (Mod Loader Pipeline caching)
+//
+// See GDScripts.h's own comment on this section - GDFileIndex.m is the
+// only thing that ever reads/writes what's actually inside this
+// dictionary. Same lazy-load-once shape as
+// gd_ensure_tracked_asset_paths_loaded() above.
+
+static void gd_ensure_file_index_snapshot_loaded_impl(void) {
+    if (g_fileIndexSnapshot) return;
+    NSDictionary *saved = gd_load_settings_dictionary();
+    NSDictionary *savedIndex = [saved[@"fileIndex"] isKindOfClass:[NSDictionary class]] ? saved[@"fileIndex"] : nil;
+    // Always non-nil once "loaded" (even if there was nothing on disk
+    // yet) so this function's own `if (g_fileIndexSnapshot) return;`
+    // guard only ever runs the actual load once per launch.
+    g_fileIndexSnapshot = savedIndex ?: @{};
+}
+
+void gd_ensure_file_index_snapshot_loaded(void) {
+    gd_ensure_file_index_snapshot_loaded_impl();
+}
+
+void gd_set_file_index_snapshot(NSDictionary *snapshot) {
+    g_fileIndexSnapshot = snapshot ?: @{};
+    gd_write_settings_dictionary(gd_current_settings_dictionary());
+}
+
 NSDictionary *gd_current_settings_dictionary(void) {
     // Every snapshot - even one triggered by an unrelated graphics
     // slider - must include whatever's currently tracked, or a save
     // from before any track/clear call this session would silently
     // drop the key gd_write_settings_dictionary() below is about to
     // overwrite the file with (that function is a full replace, not a
-    // merge - see its own header).
+    // merge - see its own header). Same reasoning applies to
+    // g_fileIndexSnapshot - a graphics slider changing shouldn't ever be
+    // able to wipe out an index GDFileIndex spent real time building.
     gd_ensure_tracked_asset_paths_loaded();
+    gd_ensure_file_index_snapshot_loaded_impl();
 
     NSMutableDictionary *urp = [NSMutableDictionary new];
     for (int i = 0; i < kURPPostEffectCount; i++) {
@@ -649,6 +679,7 @@ NSDictionary *gd_current_settings_dictionary(void) {
         @"dithering": @(g_ditheringOn),
         @"syslogBlacklist": g_syslogBlacklist ?: @[],
         @"trackedAssetPaths": g_trackedAssetPaths ?: @[],
+        @"fileIndex": g_fileIndexSnapshot ?: @{},
     };
 }
 

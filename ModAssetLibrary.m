@@ -38,7 +38,7 @@ static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
     // that never enters the pipeline, e.g. a .bank) stays exactly as
     // compact as it always was.
     if (self.doctorStatus != ModAssetLibraryDoctorStatusNotDispatched) d[@"doctorStatus"] = @(self.doctorStatus);
-    if (self.doctorUploadProgress != 0.0) d[@"doctorUploadProgress"] = @(self.doctorUploadProgress);
+    if (self.doctorUploadProgress != 0) d[@"doctorUploadProgress"] = @(self.doctorUploadProgress);
     if (self.doctorProcessProgress != 0.0) d[@"doctorProcessProgress"] = @(self.doctorProcessProgress);
     if (self.doctorScratchBranch) d[@"doctorScratchBranch"] = self.doctorScratchBranch;
     if (self.doctorRunID) d[@"doctorRunID"] = self.doctorRunID;
@@ -79,7 +79,7 @@ static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
     NSInteger status = [rawStatus isKindOfClass:NSNumber.class] ? [rawStatus integerValue] : ModAssetLibraryDoctorStatusNotDispatched;
     e.doctorStatus = (status >= ModAssetLibraryDoctorStatusNotDispatched && status <= ModAssetLibraryDoctorStatusInstalled)
         ? (ModAssetLibraryDoctorStatus)status : ModAssetLibraryDoctorStatusNotDispatched;
-    e.doctorUploadProgress = [d[@"doctorUploadProgress"] isKindOfClass:NSNumber.class] ? [d[@"doctorUploadProgress"] doubleValue] : 0.0;
+    e.doctorUploadProgress = [d[@"doctorUploadProgress"] isKindOfClass:NSNumber.class] ? [d[@"doctorUploadProgress"] longLongValue] : 0;
     e.doctorProcessProgress = [d[@"doctorProcessProgress"] isKindOfClass:NSNumber.class] ? [d[@"doctorProcessProgress"] doubleValue] : 0.0;
     e.doctorScratchBranch = [d[@"doctorScratchBranch"] isKindOfClass:NSString.class] ? d[@"doctorScratchBranch"] : nil;
     e.doctorRunID = [d[@"doctorRunID"] isKindOfClass:NSString.class] ? d[@"doctorRunID"] : nil;

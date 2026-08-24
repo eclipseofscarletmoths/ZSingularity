@@ -262,8 +262,16 @@ static NSData *bds_prepareBundleDataForUpload(NSData *data, NSError **error) {
 // response/data are the completion handler's own parameters - see
 // +bds_uploadReleaseAssetData:... below, which reads them from there
 // now instead.
+// onProgress reports the raw cumulative byte count straight off the
+// task, not a 0.0-1.0 fraction - see this file's header on why: a
+// fraction needs a known total (totalBytesExpectedToSend), and GitHub's
+// blob-storage proxy doesn't always give the download side one (see
+// BDSDownloadProgressDelegate below). Reporting bytes directly means
+// neither delegate has any precondition on a total being known - this
+// callback fires with real progress on every single didSendBodyData:,
+// same as before.
 @interface BDSUploadProgressDelegate : NSObject <NSURLSessionTaskDelegate>
-@property (nonatomic, copy, nullable) void (^onProgress)(double fractionComplete);
+@property (nonatomic, copy, nullable) void (^onProgress)(int64_t bytesSent);
 @end
 
 @implementation BDSUploadProgressDelegate
@@ -273,9 +281,8 @@ static NSData *bds_prepareBundleDataForUpload(NSData *data, NSError **error) {
     didSendBodyData:(int64_t)bytesSent
      totalBytesSent:(int64_t)totalBytesSent
 totalBytesExpectedToSend:(int64_t)totalBytesExpectedToSend {
-    if (!self.onProgress || totalBytesExpectedToSend <= 0) return;
-    double fraction = (double)totalBytesSent / (double)totalBytesExpectedToSend;
-    self.onProgress(MIN(MAX(fraction, 0.0), 1.0));
+    if (!self.onProgress) return;
+    self.onProgress(totalBytesSent);
 }
 
 @end
@@ -297,16 +304,20 @@ totalBytesExpectedToSend:(int64_t)totalBytesExpectedToSend {
 // download task's completion handler already hands back a location, not
 // accumulated data, so there was never a didReceiveData: substitute to
 // route around here.
-@interface BDSDownloadProgressDelegate : NSObject <NSURLSessionDownloadDelegate>
-@property (nonatomic, copy, nullable) void (^onProgress)(double fractionComplete);
-// Set before the task starts, from the release asset's own "size" field
-// (see +bds_downloadReleaseAssetNamed:...) - falls back into use below
-// whenever totalBytesExpectedToWrite comes back <= 0, which GitHub's
+//
+// onProgress used to report a 0.0-1.0 fraction derived from
+// totalBytesWritten / totalBytesExpectedToWrite, with a fallback to the
+// release asset's own "size" field (from the GitHub API response)
+// whenever totalBytesExpectedToWrite came back <= 0 - which GitHub's
 // blob-storage proxy does for a chunked-transfer response with no
-// Content-Length. Without this, onProgress was never called at all for
-// such a response (matches the reported "indicator stuck at 0%, even
-// though the download itself finishes fine" symptom exactly).
-@property (nonatomic, assign) int64_t fallbackExpectedByteCount;
+// Content-Length. That fallback still left onProgress uncalled whenever
+// the asset's own "size" field was itself missing/malformed (matches the
+// reported "indicator stuck at 0%, even though the download itself
+// finishes fine" symptom). Reporting the raw byte count instead removes
+// the dependency on any expected total entirely - this fires with real
+// progress on every single didWriteData:, unconditionally.
+@interface BDSDownloadProgressDelegate : NSObject <NSURLSessionDownloadDelegate>
+@property (nonatomic, copy, nullable) void (^onProgress)(int64_t bytesWritten);
 @end
 
 @implementation BDSDownloadProgressDelegate
@@ -317,10 +328,7 @@ totalBytesExpectedToSend:(int64_t)totalBytesExpectedToSend {
  totalBytesWritten:(int64_t)totalBytesWritten
 totalBytesExpectedToWrite:(int64_t)totalBytesExpectedToWrite {
     if (!self.onProgress) return;
-    int64_t expected = totalBytesExpectedToWrite > 0 ? totalBytesExpectedToWrite : self.fallbackExpectedByteCount;
-    if (expected <= 0) return;
-    double fraction = (double)totalBytesWritten / (double)expected;
-    self.onProgress(MIN(MAX(fraction, 0.0), 1.0));
+    self.onProgress(totalBytesWritten);
 }
 
 // NSURLSessionDownloadDelegate's one @required method, so this class has
@@ -368,7 +376,7 @@ didFinishDownloadingToURL:(NSURL *)location {
 + (BOOL)bds_uploadReleaseAssetData:(NSData *)data
                                 name:(NSString *)name
                    uploadURLTemplate:(NSString *)uploadURLTemplate
-                            progress:(nullable void (^)(double fractionComplete))progress
+                            progress:(nullable void (^)(int64_t bytesSent))progress
                               config:(BundleDoctorConfig *)config
                                error:(NSError **)error;
 + (nullable NSDictionary *)bds_fetchReleaseByTag:(NSString *)tagName config:(BundleDoctorConfig *)config error:(NSError **)error;
@@ -376,7 +384,7 @@ didFinishDownloadingToURL:(NSURL *)location {
 + (BOOL)bds_downloadReleaseAssetNamed:(NSString *)name
                        fromReleaseTag:(NSString *)releaseTag
                                config:(BundleDoctorConfig *)config
-                             progress:(nullable void (^)(double fractionComplete))progress
+                             progress:(nullable void (^)(int64_t bytesWritten))progress
                                  data:(NSData **)outData
                                 error:(NSError **)error;
 + (void)bds_deleteReleaseWithTag:(NSString *)tagName config:(BundleDoctorConfig *)config;
@@ -398,8 +406,7 @@ didFinishDownloadingToURL:(NSURL *)location {
 + (nullable NSMutableURLRequest *)bds_requestForPath:(NSString *)path config:(BundleDoctorConfig *)config;
 + (nullable NSData *)bds_downloadBinaryAtAbsoluteURLString:(NSString *)urlString
                                                        config:(BundleDoctorConfig *)config
-                                          expectedByteCount:(int64_t)expectedByteCount
-                                                     progress:(nullable void (^)(double fractionComplete))progress
+                                                     progress:(nullable void (^)(int64_t bytesWritten))progress
                                                         error:(NSError **)error;
 + (nullable id)bds_getJSON:(NSString *)path config:(BundleDoctorConfig *)config error:(NSError **)error;
 + (nullable id)bds_postJSON:(NSString *)path body:(NSDictionary *)body config:(BundleDoctorConfig *)config error:(NSError **)error;
@@ -648,11 +655,11 @@ didFinishDownloadingToURL:(NSURL *)location {
 + (void)dispatchBundleAtURL:(NSURL *)moddedBundleURL
                        config:(BundleDoctorConfig *)rawConfig
         previousScratchBranch:(nullable NSString *)previousScratchBranch
-               uploadProgress:(void (^)(double))uploadProgress
+               uploadProgress:(void (^)(int64_t))uploadProgress
                    completion:(void (^)(BundleDoctorHandle * _Nullable, NSError * _Nullable))completion {
-    void (^reportProgress)(double) = ^(double fraction) {
+    void (^reportProgress)(int64_t) = ^(int64_t bytesSent) {
         if (!uploadProgress) return;
-        dispatch_async(dispatch_get_main_queue(), ^{ uploadProgress(fraction); });
+        dispatch_async(dispatch_get_main_queue(), ^{ uploadProgress(bytesSent); });
     };
     void (^finish)(BundleDoctorHandle * _Nullable, NSError * _Nullable) = ^(BundleDoctorHandle * _Nullable handle, NSError * _Nullable error) {
         dispatch_async(dispatch_get_main_queue(), ^{ completion(handle, error); });
@@ -759,22 +766,21 @@ didFinishDownloadingToURL:(NSURL *)location {
         // progress:nil), that forced 1.0 was a lie: the caller's progress
         // UI would sit at 100% while original.bundle's own multi-second
         // upload was still happening underneath it. Now both assets share
-        // one 0.0-1.0 space, split by their relative byte sizes, so 100%
+        // one running byte-count total, so "moddedBytes + originalBytes"
         // means "both PUTs are actually done" - or, when there's no
         // originalData at all (shader-restore lookup came up empty), the
-        // modded upload alone still spans the full range exactly as
-        // before.
+        // modded upload alone still accounts for the whole total exactly
+        // as before. reportModdedProgress reports raw bytes as-sent;
+        // reportOriginalProgress adds moddedBytes on top since that asset
+        // is already fully sent by the time original.bundle's own upload
+        // starts.
         unsigned long long moddedBytes = uploadData.length;
         unsigned long long originalBytes = originalData.length;
-        double totalUploadBytes = (double)(moddedBytes + originalBytes);
-        double moddedShare = (originalData && totalUploadBytes > 0.0)
-            ? (double)moddedBytes / totalUploadBytes
-            : 1.0;
-        void (^reportModdedProgress)(double) = ^(double fraction) {
-            reportProgress(fraction * moddedShare);
+        void (^reportModdedProgress)(int64_t) = ^(int64_t bytesSent) {
+            reportProgress(bytesSent);
         };
-        void (^reportOriginalProgress)(double) = ^(double fraction) {
-            reportProgress(moddedShare + fraction * (1.0 - moddedShare));
+        void (^reportOriginalProgress)(int64_t) = ^(int64_t bytesSent) {
+            reportProgress((int64_t)moddedBytes + bytesSent);
         };
 
         if (![self bds_uploadReleaseAssetData:uploadData name:kBDSInputAssetName
@@ -784,14 +790,14 @@ didFinishDownloadingToURL:(NSURL *)location {
             finish(nil, error);
             return;
         }
-        if (!originalData) reportProgress(1.0); // nothing more to send - land on a clean 100% same as before
+        if (!originalData) reportProgress((int64_t)moddedBytes); // nothing more to send - land on a clean total same as before
 
         // A failure uploading original.bundle is NOT fatal to the whole
         // submission: it just means the workflow proceeds without it and
         // BundleDoctor falls back to skipping the shader-restore pass,
         // same as if originalData had been nil to begin with - but the
         // progress space it was allotted above still needs closing out to
-        // a clean 100% either way.
+        // a clean total either way.
         if (originalData) {
             NSError *originalUploadError = nil;
             if (![self bds_uploadReleaseAssetData:originalData name:kBDSOriginalAssetName
@@ -800,7 +806,7 @@ didFinishDownloadingToURL:(NSURL *)location {
                 ZLog(@"[BundleDoctorService] couldn't upload original.bundle (proceeding without shader-restore): %@",
                      originalUploadError.localizedDescription);
             }
-            reportProgress(1.0);
+            reportProgress((int64_t)(moddedBytes + originalBytes));
         }
 
         if (![self bds_dispatchWorkflowOnBranch:scratchBranch config:config error:&error]) {
@@ -951,11 +957,11 @@ didFinishDownloadingToURL:(NSURL *)location {
 
 + (void)fetchDoctoredBundleForHandle:(BundleDoctorHandle *)handle
                                 config:(BundleDoctorConfig *)rawConfig
-                              progress:(nullable void (^)(double fractionComplete))downloadProgress
+                              progress:(nullable void (^)(int64_t bytesWritten))downloadProgress
                             completion:(void (^)(NSURL * _Nullable, NSError * _Nullable))completion {
-    void (^reportProgress)(double) = ^(double fraction) {
+    void (^reportProgress)(int64_t) = ^(int64_t bytesWritten) {
         if (!downloadProgress) return;
-        dispatch_async(dispatch_get_main_queue(), ^{ downloadProgress(fraction); });
+        dispatch_async(dispatch_get_main_queue(), ^{ downloadProgress(bytesWritten); });
     };
     void (^finish)(NSURL * _Nullable, NSError * _Nullable) = ^(NSURL * _Nullable url, NSError * _Nullable error) {
         dispatch_async(dispatch_get_main_queue(), ^{ completion(url, error); });
@@ -976,7 +982,7 @@ didFinishDownloadingToURL:(NSURL *)location {
             finish(nil, error);
             return;
         }
-        reportProgress(1.0); // land on a clean 100% even if the last didWriteData: callback landed a hair short
+        reportProgress((int64_t)doctoredData.length); // land on the real final count even if the last didWriteData: callback landed a hair short
 
         // Every tag is unique per submission again (see this file's
         // header's "Unique release naming + per-entry resume check"
@@ -1116,11 +1122,11 @@ didFinishDownloadingToURL:(NSURL *)location {
 
 + (void)downloadProcessedRelease:(BundleDoctorProcessedRelease *)release
                             config:(BundleDoctorConfig *)rawConfig
-                          progress:(nullable void (^)(double fractionComplete))downloadProgress
+                          progress:(nullable void (^)(int64_t bytesWritten))downloadProgress
                         completion:(void (^)(NSURL * _Nullable, NSError * _Nullable))completion {
-    void (^reportProgress)(double) = ^(double fraction) {
+    void (^reportProgress)(int64_t) = ^(int64_t bytesWritten) {
         if (!downloadProgress) return;
-        dispatch_async(dispatch_get_main_queue(), ^{ downloadProgress(fraction); });
+        dispatch_async(dispatch_get_main_queue(), ^{ downloadProgress(bytesWritten); });
     };
     void (^finish)(NSURL * _Nullable, NSError * _Nullable) = ^(NSURL * _Nullable url, NSError * _Nullable error) {
         dispatch_async(dispatch_get_main_queue(), ^{ completion(url, error); });
@@ -1141,7 +1147,7 @@ didFinishDownloadingToURL:(NSURL *)location {
             finish(nil, error);
             return;
         }
-        reportProgress(1.0); // same clean-100%-landing reasoning as +fetchDoctoredBundleForHandle:...
+        reportProgress((int64_t)bundleData.length); // same clean-final-count reasoning as +fetchDoctoredBundleForHandle:...
 
         // No +bds_cleanupScratchSubmission:... here - see this method's
         // own header on why a Processed Bundles release outlives this
@@ -1391,14 +1397,14 @@ didFinishDownloadingToURL:(NSURL *)location {
 // Content-Type: application/octet-stream - not JSON/base64. That's the
 // entire point of moving off the git Blob API: no ~1.33x base64
 // inflation, and release assets support up to 2GB versus the Blob API's
-// much lower practical ceiling. progress, when non-nil, is called with a
-// 0.0-1.0 fraction as the body is sent - see +dispatchBundleAtURL:...'s
-// uploadProgress and this file's header on why this is the only phase
-// worth reporting byte-level progress for.
+// much lower practical ceiling. progress, when non-nil, is called with
+// the raw cumulative byte count as the body is sent - see
+// +dispatchBundleAtURL:...'s uploadProgress and this file's header on
+// why this is the only phase worth reporting byte-level progress for.
 + (BOOL)bds_uploadReleaseAssetData:(NSData *)data
                                 name:(NSString *)name
                    uploadURLTemplate:(NSString *)uploadURLTemplate
-                            progress:(nullable void (^)(double fractionComplete))progress
+                            progress:(nullable void (^)(int64_t bytesSent))progress
                               config:(BundleDoctorConfig *)config
                                error:(NSError **)error {
     NSRange templateStart = [uploadURLTemplate rangeOfString:@"{"];
@@ -1504,7 +1510,7 @@ didFinishDownloadingToURL:(NSURL *)location {
 + (BOOL)bds_downloadReleaseAssetNamed:(NSString *)name
                        fromReleaseTag:(NSString *)releaseTag
                                config:(BundleDoctorConfig *)config
-                             progress:(nullable void (^)(double fractionComplete))progress
+                             progress:(nullable void (^)(int64_t bytesWritten))progress
                                  data:(NSData **)outData
                                 error:(NSError **)error {
     NSDictionary *release = [self bds_fetchReleaseByTag:releaseTag config:config error:error];
@@ -1543,17 +1549,7 @@ didFinishDownloadingToURL:(NSURL *)location {
         return NO;
     }
 
-    // GitHub's standard release-asset field, the authoritative expected
-    // byte count straight from the API response we already have in
-    // scope - used as a fallback when the download response itself
-    // never reports a Content-Length (see BDSDownloadProgressDelegate's
-    // fallbackExpectedByteCount). 0 if missing/malformed, which
-    // -bds_downloadBinaryAtAbsoluteURLString:...'s own fallback handles
-    // the same as "no fallback available" (progress just never renders,
-    // same as before this fix - the download itself is unaffected).
-    int64_t expectedByteCount = [asset[@"size"] respondsToSelector:@selector(longLongValue)] ? [asset[@"size"] longLongValue] : 0;
-
-    NSData *data = [self bds_downloadBinaryAtAbsoluteURLString:assetAPIURL config:config expectedByteCount:expectedByteCount progress:progress error:error];
+    NSData *data = [self bds_downloadBinaryAtAbsoluteURLString:assetAPIURL config:config progress:progress error:error];
     if (!data) return NO;
     if (outData) *outData = data;
     return YES;
@@ -1744,8 +1740,7 @@ didFinishDownloadingToURL:(NSURL *)location {
 // returns the raw file instead of JSON metadata about it.
 + (nullable NSData *)bds_downloadBinaryAtAbsoluteURLString:(NSString *)urlString
                                                        config:(BundleDoctorConfig *)config
-                                          expectedByteCount:(int64_t)expectedByteCount
-                                                     progress:(nullable void (^)(double fractionComplete))progress
+                                                     progress:(nullable void (^)(int64_t bytesWritten))progress
                                                         error:(NSError **)error {
     NSMutableURLRequest *request = [self bds_requestForAbsoluteURLString:urlString config:config];
     if (!request) {
@@ -1767,7 +1762,6 @@ didFinishDownloadingToURL:(NSURL *)location {
 
     BDSDownloadProgressDelegate *delegate = [BDSDownloadProgressDelegate new];
     delegate.onProgress = progress;
-    delegate.fallbackExpectedByteCount = expectedByteCount;
     NSURLSession *session = [NSURLSession sessionWithConfiguration:NSURLSessionConfiguration.defaultSessionConfiguration
                                                              delegate:delegate
                                                         delegateQueue:nil];

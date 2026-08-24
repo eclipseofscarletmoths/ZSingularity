@@ -115,9 +115,9 @@
 //
 //   1. +dispatchBundleAtURL:config:uploadProgress:completion: - branch
 //      + release + asset upload + workflow_dispatch. Real byte-level
-//      progress (0.0-1.0) via uploadProgress, since the release-asset
-//      upload is the only phase with an actual multi-second body to
-//      send. Returns a BundleDoctorHandle the caller persists
+//      progress (a raw cumulative byte count) via uploadProgress, since
+//      the release-asset upload is the only phase with an actual
+//      multi-second body to send. Returns a BundleDoctorHandle the caller persists
 //      (ModAssetLibrary's doctorScratchBranch/doctorRunID/doctorRunURL
 //      fields exist specifically to round-trip this across app
 //      relaunches; scratchBranch doubles as the release's tag name -
@@ -365,15 +365,17 @@ typedef NS_ENUM(NSInteger, BundleDoctorRunStatus) {
 // other phase below is a single small JSON request with nothing
 // meaningful to report mid-flight), and dispatches the doctor-bundle
 // workflow on the scratch branch with that release's tag as an input.
-// uploadProgress is called on the main queue zero or more times with a
-// 0.0-1.0 fraction as the asset's body is sent; completion is called
-// exactly once, also on the main queue. On success, the returned
-// handle's runID/runURL are still nil - call
+// uploadProgress is called on the main queue zero or more times with the
+// raw cumulative byte count sent so far (across both the modded bundle
+// and, when present, the shader-restore original.bundle asset that
+// follows it on the same release - see the .m) as the asset's body is
+// sent; completion is called exactly once, also on the main queue. On
+// success, the returned handle's runID/runURL are still nil - call
 // +resolveRunForHandle:config:completion: next.
 + (void)dispatchBundleAtURL:(NSURL *)moddedBundleURL
                        config:(BundleDoctorConfig *)config
         previousScratchBranch:(nullable NSString *)previousScratchBranch
-               uploadProgress:(nullable void (^)(double fractionComplete))uploadProgress
+               uploadProgress:(nullable void (^)(int64_t bytesSent))uploadProgress
                    completion:(void (^)(BundleDoctorHandle * _Nullable handle, NSError * _Nullable error))completion;
 
 // Phase 2: single-shot lookup of the run that phase 1's dispatch call
@@ -416,19 +418,18 @@ typedef NS_ENUM(NSInteger, BundleDoctorRunStatus) {
 // more than once if the caller's own download step needs retrying - the
 // release/branch are only deleted after a successful fetch, and deleting
 // an already-deleted release/branch is itself best-effort/silent.
-// downloadProgress, when non-nil, is called on the main queue with a
-// 0.0-1.0 fraction as the doctored bundle's bytes come down - same
-// contract as +dispatchBundleAtURL:...'s uploadProgress, mirrored for
-// this side of the pipeline. Falls back to the release asset's own
-// "size" field (standard GitHub API field) when the download response
-// itself never reports a Content-Length - e.g. a chunked-transfer
-// response through GitHub's blob-storage proxy - so progress still
-// renders in that case; only an asset with no usable size of its own
-// would still leave progress at 0% (the fetch itself is unaffected
-// either way).
+// downloadProgress, when non-nil, is called on the main queue with the
+// raw cumulative byte count as the doctored bundle's bytes come down -
+// same contract as +dispatchBundleAtURL:...'s uploadProgress, mirrored
+// for this side of the pipeline. Reported directly off the download
+// task's own totalBytesWritten, so - unlike an older 0.0-1.0-fraction
+// version of this contract - it never depends on a known expected total
+// (GitHub's blob-storage proxy doesn't always give the download response
+// one; a Content-Length-less chunked-transfer response used to leave
+// progress stuck with nothing to render against).
 + (void)fetchDoctoredBundleForHandle:(BundleDoctorHandle *)handle
                                 config:(BundleDoctorConfig *)config
-                              progress:(nullable void (^)(double fractionComplete))downloadProgress
+                              progress:(nullable void (^)(int64_t bytesWritten))downloadProgress
                             completion:(void (^)(NSURL * _Nullable doctoredBundleURL, NSError * _Nullable error))completion;
 
 #pragma mark - Upload transport compression
@@ -487,12 +488,12 @@ typedef NS_ENUM(NSInteger, BundleDoctorRunStatus) {
 // with the phase-4 fetch for the same reason - it's the same "GET this
 // named asset off this tag" operation either way, just without the
 // teardown afterward. downloadProgress/completion have the exact same
-// contract (main-queue callbacks, 0.0-1.0 fraction, same
+// contract (main-queue callbacks, a raw cumulative byte count, same
 // BundleDoctorServiceErrorCode shape on failure) as
 // +fetchDoctoredBundleForHandle:config:progress:completion:.
 + (void)downloadProcessedRelease:(BundleDoctorProcessedRelease *)release
                             config:(BundleDoctorConfig *)config
-                          progress:(nullable void (^)(double fractionComplete))downloadProgress
+                          progress:(nullable void (^)(int64_t bytesWritten))downloadProgress
                         completion:(void (^)(NSURL * _Nullable bundleURL, NSError * _Nullable error))completion;
 
 #pragma mark - Delete every stored release (8)
