@@ -409,17 +409,69 @@ static void gd_configure_glass_corners(UIView *view, CGFloat radius, BOOL concen
                                            configuration);
 }
 
-// NOTE: this file used to have a gd_configure_glass_button_fixed_corner_radius
-// helper here that mutated a UIButtonConfiguration's cornerStyle/background
-// (legacy -cornerRadius, then also the newer -cornerConfiguration) to try to
-// get a custom radius out of +[UIButtonConfiguration glassButtonConfiguration].
-// Neither property reliably renders on iOS 26 for a *glass* configuration - the
-// material computes its own shape independent of what's written there. Rather
-// than keep patching that dead end, the panel's three square-ish controls
-// (Verify/Remove, the syslog button, the re-encode dropdown) now skip the native
-// glass button configuration entirely - see gd_style_button_with_fixed_corner_radius
-// below, which uses a real CALayer.cornerRadius instead.
+// Reliable custom corner radius for a UIButtonConfiguration-driven glass
+// button (+[UIButtonConfiguration glassButtonConfiguration] and friends) -
+// see gd_style_auth_verify_button's header comment below for the full
+// postmortem of why gd_configure_glass_corners (the UIView.cornerConfiguration
+// API that works fine on every plain UIVisualEffectView glass surface in
+// this file) does NOT work here.
+//
+// Short version: a configuration-driven button's glass background is an
+// internal subview that UIButton rebuilds from its *configuration object's*
+// own -cornerStyle/-background.cornerRadius on every configuration-update
+// pass - not from the button view's own cornerConfiguration property, which
+// that subview never reads. So the fix has to mutate the configuration
+// itself, not the view:
+//   1. configuration.cornerStyle = Fixed (== 1) - the one corner style that
+//      takes its radius from -background.cornerRadius verbatim, instead of
+//      Capsule (glassButtonConfiguration's default), a system Large/Medium/
+//      Small constant, or Dynamic's type-size-scaled radius.
+//   2. configuration.background.cornerRadius = radius.
+//   3. Write the mutated configuration back via -setConfiguration: so
+//      UIButton actually picks up the change - configuration structs/objects
+//      obtained via the getter are not observed in place.
+// Because the radius now lives on the model object every rebuild reads
+// from (rather than a view-side property that rebuild never consults), it
+// survives taps/highlight/disabled and any other automatic
+// configurationUpdateHandler-driven pass without needing to be reasserted -
+// though call sites still hook configurationUpdateHandler to call this
+// again defensively, since "the button rebuilds its glass shape from
+// something other than the property we just set" is exactly the failure
+// mode this function exists to route around, and re-deriving from the
+// current configuration each time costs nothing.
+//
+// Resolved dynamically like the rest of this file's Liquid Glass API
+// surface (see gd_configure_glass_corners above) - harmless no-op via
+// respondsToSelector on anything pre-iOS-26 or if Apple ever renames this.
+static void gd_configure_glass_button_fixed_corner_radius(UIButton *button, CGFloat radius) {
+    if (!button) return;
 
+    SEL getConfiguration = NSSelectorFromString(@"configuration");
+    if (![button respondsToSelector:getConfiguration]) return;
+    id configuration = ((id (*)(id, SEL))objc_msgSend)(button, getConfiguration);
+    if (!configuration) return;
+
+    // UIButtonConfigurationCornerStyleFixed == 1 on the current UIKit ABI
+    // (Dynamic=0, Fixed=1, Capsule=2, Large=3, Medium=4, Small=5).
+    SEL setCornerStyle = NSSelectorFromString(@"setCornerStyle:");
+    if ([configuration respondsToSelector:setCornerStyle]) {
+        ((void (*)(id, SEL, NSInteger))objc_msgSend)(configuration, setCornerStyle, 1 /* Fixed */);
+    }
+
+    SEL getBackground = NSSelectorFromString(@"background");
+    if ([configuration respondsToSelector:getBackground]) {
+        id background = ((id (*)(id, SEL))objc_msgSend)(configuration, getBackground);
+        SEL setCornerRadius = NSSelectorFromString(@"setCornerRadius:");
+        if (background && [background respondsToSelector:setCornerRadius]) {
+            ((void (*)(id, SEL, CGFloat))objc_msgSend)(background, setCornerRadius, radius);
+        }
+    }
+
+    SEL setConfiguration = NSSelectorFromString(@"setConfiguration:");
+    if ([button respondsToSelector:setConfiguration]) {
+        ((void (*)(id, SEL, id))objc_msgSend)(button, setConfiguration, configuration);
+    }
+}
 
 // Radius for the panel's three intentionally square-ish controls (Auth's
 // Verify/Remove button, the syslog button, and the Config re-encode
@@ -520,9 +572,8 @@ static void gd_style_button_as_native_glass_with_font(UIButton *button, NSString
                     // sites that explicitly want the square-ish text-field
                     // shape (gd_style_auth_verify_button/_remove_button,
                     // the syslogButton setup, gd_style_reencode_format_button)
-                    // apply their own fixed-corner styling (see
-                    // gd_style_button_with_fixed_corner_radius) instead of
-                    // this function. Every other
+                    // apply gd_configure_glass_button_fixed_corner_radius
+                    // themselves, after calling this function. Every other
                     // button - Reset/Reapply, Restore Originals, Load Mods,
                     // etc. - is meant to fall through to iOS 26's default
                     // Capsule pill, so nothing else is done here.
@@ -560,48 +611,6 @@ static void gd_style_button_as_native_glass_with_font(UIButton *button, NSString
 
 static void gd_style_button_as_native_glass(UIButton *button, NSString *title, UIColor *tintColor) {
     gd_style_button_as_native_glass_with_font(button, title, tintColor, nil);
-}
-
-// Square-ish text-field-matching corner for a button, WITHOUT going through
-// +[UIButtonConfiguration glassButtonConfiguration] at all.
-//
-// Why this exists, after two rounds of trying to fix a glass-configuration's
-// cornerStyle/background.cornerRadius (see this file's own NOTE, a bit
-// further up, about the now-removed gd_configure_glass_button_fixed_corner_radius
-// helper): that approach never actually renders a custom radius on real
-// iOS 26 hardware,
-// regardless of which property gets written (cornerStyle+background.cornerRadius,
-// then also background.cornerConfiguration - both tried, neither took). This
-// isn't unique to this file - it matches widely-reported iOS 26 behavior:
-// a glassButtonConfiguration's material computes its own shape independent of
-// the corner properties the docs describe for non-glass configurations, so a
-// custom Fixed radius on a *glass* button configuration is not reliable on
-// this SDK, full stop - not a bug in the mutate/write-back logic, which was
-// already verified correct.
-//
-// The fix: don't fight it - opt these three controls out of the native glass
-// button path entirely, same as they'd render pre-iOS-26, and rely on a real
-// CALayer.cornerRadius instead. That's exactly the flat-translucent style
-// gd_style_button_as_native_glass_with_font already uses as its own pre-26
-// fallback (background alpha fill + hairline border), just applied
-// unconditionally here instead of gated behind @available. It trades the
-// animated glass highlight for a corner radius that actually shows up -
-// worth it for these three, since matching the square-ish text fields
-// beside them was the actual ask. gd_wrap_field_in_native_glass (the fields
-// themselves) sidesteps the same glass-configuration trap the same way: a
-// plain view with a real UIGlassEffect material wrapped around it, rounded
-// via gd_configure_glass_corners on the *view*, never through a button
-// configuration's internal shape logic.
-static void gd_style_button_with_fixed_corner_radius(UIButton *button, NSString *title, UIColor *tintColor, CGFloat radius) {
-    [button setTitle:title forState:UIControlStateNormal];
-    if (tintColor) [button setTitleColor:tintColor forState:UIControlStateNormal];
-    button.backgroundColor = [UIColor colorWithWhite:1 alpha:0.08];
-    button.layer.borderWidth = 1;
-    button.layer.borderColor = [UIColor colorWithWhite:1 alpha:0.18].CGColor;
-    button.layer.cornerCurve = kCACornerCurveContinuous;
-    button.layer.cornerRadius = radius;
-    button.clipsToBounds = YES;
-    button.contentHorizontalAlignment = UIControlContentHorizontalAlignmentCenter;
 }
 
 // Icon-only counterpart to gd_style_button_as_native_glass - same native
@@ -651,47 +660,59 @@ static void gd_style_icon_button_as_native_glass(UIButton *button, UIImage *imag
 // Auth section's "Verify" button - gd_style_button_as_native_glass on
 // its own gives every button iOS 26's default fully-rounded glass pill,
 // which reads as a mismatched shape sitting directly against the
-// square-ish PAT field beside it.
+// square-ish (6pt corner) PAT field beside it. Per the person's spec,
+// this reapplies that same 6pt radius on top, via the identical
+// gd_configure_glass_corners call the fields themselves use - and does
+// it every time the button's glass configuration gets rebuilt, since
+// restyling (see -gd_authVerifyTapped:'s "Verifying…"/"Verify" swap)
+// replaces the configuration and would otherwise silently revert to
+// the pill. Pre-iOS-26, gd_style_button_as_native_glass's own fallback
+// never sets a cornerRadius at all (defaults to a plain square corner),
+// so the explicit 6pt there is just for consistency across OS versions
+// rather than fixing a visible mismatch.
+// THE PREVIOUS FIX, AND WHY IT STILL SHOWED A PILL: the original attempt
+// called gd_configure_glass_corners on the button itself - the same
+// UICornerConfiguration/-setCornerConfiguration: call that reliably
+// squares off every plain UIVisualEffectView glass surface elsewhere in
+// this file (the dock, the pull tab, every gd_wrap_field_in_native_glass
+// field). That's a UIView-level property. But +[UIButtonConfiguration
+// glassButtonConfiguration]'s glass material is an internal subview that
+// UIButton rebuilds from its *configuration object's* own -cornerStyle
+// (Capsule by default) and, only when that's Fixed, -background.cornerRadius
+// - never from the button view's own cornerConfiguration, which that
+// subview simply doesn't consult. A follow-up attempt reasserted the same
+// button-level cornerConfiguration from configurationUpdateHandler (fired
+// after every configuration-driven rebuild - any state change included,
+// not just this file's two restyle call sites), which is the right hook
+// but the wrong property: it kept re-setting something the rebuild never
+// reads, so the button still snapped back to the capsule the instant it
+// was pressed. Both attempts were "reassert a corner radius after the
+// rebuild" - the actual bug was which corner radius.
 //
-// HISTORY, for whoever touches this next: three separate fixes were tried
-// here before landing on the current one, each burned by the same class of
-// mistake - writing a corner radius onto a property the button's rebuild
-// doesn't actually read:
-//   1. gd_configure_glass_corners on the button itself (the UIView-level
-//      cornerConfiguration call that works for every plain UIVisualEffectView
-//      glass surface in this file - the dock, the pull tab, every
-//      gd_wrap_field_in_native_glass field). Doesn't work here because
-//      +[UIButtonConfiguration glassButtonConfiguration]'s glass material is
-//      an internal subview UIButton rebuilds from the *configuration
-//      object's* own properties, never from the button view's own
-//      cornerConfiguration.
-//   2. Reasserting that same button-level cornerConfiguration from
-//      configurationUpdateHandler - the right hook, still the wrong
-//      property.
-//   3. Mutating the configuration itself - cornerStyle = Fixed, then
-//      background.cornerRadius = radius (and, in a later pass, also
-//      background.cornerConfiguration) written back via -setBackground:/
-//      -setConfiguration:. This is the officially documented way to get a
-//      custom radius out of a *non*-glass UIButtonConfiguration, and the
-//      mutate/write-back plumbing was verified correct - but a *glass*
-//      configuration's material doesn't reliably honor either property on
-//      this SDK, so the radius still never rendered.
-// Fix: stop fighting the glass configuration - see
-// gd_style_button_with_fixed_corner_radius, used below instead of
-// gd_style_button_as_native_glass for this button. It skips
-// glassButtonConfiguration entirely and sets a real CALayer.cornerRadius,
-// which every one of the above attempts already proved is the one thing
-// that actually renders.
+// Fix: gd_configure_glass_button_fixed_corner_radius (above) mutates the
+// *configuration's* cornerStyle/background.cornerRadius instead, which is
+// what the rebuild actually reads, and writes it back via -setConfiguration:
+// so UIButton picks up the change. configurationUpdateHandler is kept as a
+// defensive re-assertion on top of that - now calling the corrected
+// function - since it costs nothing and this exact class of bug (assuming
+// a property is read that isn't) is the one that burned this control twice
+// already.
 static void gd_style_auth_verify_button(UIButton *button, NSString *title) {
-    // Opted out of the native glassButtonConfiguration path entirely - see
-    // gd_style_button_with_fixed_corner_radius's header comment for why:
-    // a glass configuration's custom Fixed radius doesn't reliably render
-    // on iOS 26 no matter which property carries it, so this uses the
-    // same flat-translucent style + real CALayer.cornerRadius as the old
-    // pre-iOS-26 fallback, applied unconditionally instead of gated behind
-    // @available.
-    gd_style_button_with_fixed_corner_radius(button, title, gd_accent_green_color(), kGDAuthFieldCornerRadius);
+    gd_style_button_as_native_glass(button, title, gd_accent_green_color());
     button.titleLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightSemibold];
+    gd_configure_glass_button_fixed_corner_radius(button, kGDAuthFieldCornerRadius);
+    if (!gd_has_liquid_glass()) {
+        button.layer.cornerRadius = kGDAuthFieldCornerRadius;
+        button.clipsToBounds = YES;
+    }
+
+    SEL setUpdateHandler = NSSelectorFromString(@"setConfigurationUpdateHandler:");
+    if ([button respondsToSelector:setUpdateHandler]) {
+        void (^reassertCorners)(__kindof UIButton *) = ^(__kindof UIButton *btn) {
+            gd_configure_glass_button_fixed_corner_radius(btn, kGDAuthFieldCornerRadius);
+        };
+        ((void (*)(id, SEL, id))objc_msgSend)(button, setUpdateHandler, reassertCorners);
+    }
 }
 
 // Swaps the Verify button between "Verify" and "Verifying…" in place -
@@ -736,12 +757,21 @@ static void gd_crossfade_auth_verify_button_title(UIButton *button, NSString *ti
 // function's existing "Verify"/"Verifying…" call sites can't accidentally
 // drift onto this styling by a stray argument.
 static void gd_style_auth_remove_button(UIButton *button, NSString *title) {
-    // Same opt-out as gd_style_auth_verify_button - see
-    // gd_style_button_with_fixed_corner_radius's header comment.
-    gd_style_button_with_fixed_corner_radius(button, title,
-                                              [UIColor colorWithRed:1.0 green:0.42 blue:0.42 alpha:1.0],
-                                              kGDAuthFieldCornerRadius);
+    gd_style_button_as_native_glass(button, title, [UIColor colorWithRed:1.0 green:0.42 blue:0.42 alpha:1.0]);
     button.titleLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightSemibold];
+    gd_configure_glass_button_fixed_corner_radius(button, kGDAuthFieldCornerRadius);
+    if (!gd_has_liquid_glass()) {
+        button.layer.cornerRadius = kGDAuthFieldCornerRadius;
+        button.clipsToBounds = YES;
+    }
+
+    SEL setUpdateHandler = NSSelectorFromString(@"setConfigurationUpdateHandler:");
+    if ([button respondsToSelector:setUpdateHandler]) {
+        void (^reassertCorners)(__kindof UIButton *) = ^(__kindof UIButton *btn) {
+            gd_configure_glass_button_fixed_corner_radius(btn, kGDAuthFieldCornerRadius);
+        };
+        ((void (*)(id, SEL, id))objc_msgSend)(button, setUpdateHandler, reassertCorners);
+    }
 }
 
 // Cross-dissolve counterparts to gd_crossfade_auth_verify_button_title
@@ -2552,25 +2582,52 @@ static UIImageView *gd_reencode_chevron_view(UIButton *button) {
 // refresh (-gd_reencodeFormatSelected:) so they can never drift out of
 // sync with each other.
 static void gd_style_reencode_format_button(UIButton *button, NSString *format) {
-    // Opted out of the native glassButtonConfiguration path - see
-    // gd_style_button_with_fixed_corner_radius's header comment. That also
-    // means there's no more UIButtonConfiguration to hang the title's
-    // content insets off of (setContentInsets: was a configuration-only
-    // API); titleEdgeInsets is the plain-UIButton equivalent and produces
-    // the same leading/trailing padding around the label, still keyed off
-    // the same two constants so the chevron (pinned separately, see
-    // gd_reencode_chevron_view) continues to line up with the label's own
-    // trailing edge.
-    gd_style_button_with_fixed_corner_radius(button, gd_reencode_format_display_name(format),
-                                              UIColor.whiteColor, kGDAuthFieldCornerRadius);
+    // Explicit white (not nil) so this matches every other glass field's
+    // plain white text on pre-iOS-26 too - gd_style_button_as_native_glass's
+    // own fallback only sets a titleColor when it's given a non-nil tint,
+    // and would otherwise leave UIButtonTypeSystem's default blue tint.
+    gd_style_button_as_native_glass(button, gd_reencode_format_display_name(format), UIColor.whiteColor);
     button.titleLabel.font = [UIFont systemFontOfSize:11 weight:UIFontWeightRegular];
     button.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeading;
-    button.titleEdgeInsets = UIEdgeInsetsMake(
-        0, kGDReencodeHorizontalPadding,
-        0, kGDReencodeHorizontalPadding + kGDReencodeChevronReserve);
 
-    // Add (first call) or just resurface (repeat calls) the trailing
-    // chevron on top of everything else.
+    SEL getConfiguration = NSSelectorFromString(@"configuration");
+    if ([button respondsToSelector:getConfiguration]) {
+        id configuration = ((id (*)(id, SEL))objc_msgSend)(button, getConfiguration);
+        if (configuration) {
+            // No configuration.image here anymore - the chevron is a
+            // separate subview (see gd_reencode_chevron_view above) laid
+            // out independently of the title. What this configuration
+            // still needs to control is the title's own content insets,
+            // explicitly, so its leading padding is a known constant
+            // (kGDReencodeHorizontalPadding) rather than whatever
+            // glassButtonConfiguration defaults to - the chevron's
+            // trailing padding is pinned to that same constant, and the
+            // two can't match unless both come from it. Trailing gets
+            // extra room (kGDReencodeChevronReserve) so the widest label
+            // never runs in under the chevron.
+            SEL setContentInsets = NSSelectorFromString(@"setContentInsets:");
+            if ([configuration respondsToSelector:setContentInsets]) {
+                NSDirectionalEdgeInsets insets = NSDirectionalEdgeInsetsMake(
+                    6, kGDReencodeHorizontalPadding,
+                    6, kGDReencodeHorizontalPadding + kGDReencodeChevronReserve);
+                ((void (*)(id, SEL, NSDirectionalEdgeInsets))objc_msgSend)(configuration, setContentInsets, insets);
+            }
+            SEL setConfig = NSSelectorFromString(@"setConfiguration:");
+            if ([button respondsToSelector:setConfig]) {
+                ((void (*)(id, SEL, id))objc_msgSend)(button, setConfig, configuration);
+            }
+        }
+    }
+
+    gd_configure_glass_button_fixed_corner_radius(button, kGDAuthFieldCornerRadius);
+    if (!gd_has_liquid_glass()) {
+        button.layer.cornerRadius = kGDAuthFieldCornerRadius;
+        button.clipsToBounds = YES;
+    }
+
+    // Add (first call) or just resurface (repeat calls, after
+    // -setConfiguration: above may have touched the button's internal
+    // content view) the trailing chevron on top of everything else.
     [button bringSubviewToFront:gd_reencode_chevron_view(button)];
 }
 
@@ -5174,22 +5231,26 @@ static const CGFloat kContentFadeHeight = 22;
                                                             @"Blacklist keywords");
     UIButton *syslogButton = objc_getAssociatedObject(syslogRow, "gd_button");
     self.syslogButton = syslogButton;
-    // Square-ish (3pt corner) per spec, same treatment as the Auth
-    // section's Verify button - see gd_style_button_with_fixed_corner_radius's
-    // header for why this opts out of the native glassButtonConfiguration
-    // path (its custom Fixed radius doesn't reliably render on iOS 26) in
-    // favor of a real CALayer.cornerRadius. gd_make_button_and_glass_field_row
-    // already styled this button via gd_style_button_as_native_glass; this
-    // restyles it in place with the fixed-corner variant instead, same
-    // title/tint. Re-applied at both restyle call sites too
-    // (-gd_enterSyslogVerboseMode/-gd_resetSyslogVerboseMode) since each one
-    // rebuilds this button's title, same as Verify's own "Verifying…"/
-    // "Verify" swap - no configurationUpdateHandler needed anymore, since a
-    // plain CALayer property doesn't get rebuilt out from under it the way
-    // a UIButtonConfiguration does.
-    gd_style_button_with_fixed_corner_radius(syslogButton, @"Syslog",
-                                              [UIColor colorWithWhite:1 alpha:0.88],
-                                              kGDAuthFieldCornerRadius);
+    // 9: square-ish (6pt corner) per spec, same treatment as the Auth
+    // section's Verify button - see gd_configure_glass_button_fixed_corner_radius's
+    // own header for why a plain cornerConfiguration set doesn't stick
+    // on a configuration-driven glass button. Re-applied at both
+    // restyle call sites too (-gd_enterSyslogVerboseMode/
+    // -gd_resetSyslogVerboseMode), since each one rebuilds this
+    // button's UIButtonConfiguration from scratch same as Verify's own
+    // "Verifying…"/"Verify" swap does.
+    gd_configure_glass_button_fixed_corner_radius(syslogButton, kGDAuthFieldCornerRadius);
+    if (!gd_has_liquid_glass()) {
+        syslogButton.layer.cornerRadius = kGDAuthFieldCornerRadius;
+        syslogButton.clipsToBounds = YES;
+    }
+    SEL syslogSetUpdateHandler = NSSelectorFromString(@"setConfigurationUpdateHandler:");
+    if ([syslogButton respondsToSelector:syslogSetUpdateHandler]) {
+        void (^syslogReassertCorners)(__kindof UIButton *) = ^(__kindof UIButton *btn) {
+            gd_configure_glass_button_fixed_corner_radius(btn, kGDAuthFieldCornerRadius);
+        };
+        ((void (*)(id, SEL, id))objc_msgSend)(syslogButton, syslogSetUpdateHandler, syslogReassertCorners);
+    }
     [syslogButton addTarget:self action:@selector(toggleSyslogTapped) forControlEvents:UIControlEventTouchUpInside];
 
     // Hold-for-1-second (9: was 3s) -> Verbose mode. minimumPressDuration is 0
@@ -9332,7 +9393,8 @@ static NSURL *gd_mods_live_stock_url_for_entry(ModAssetLibraryEntry *entry) {
     self.syslogVerboseEnabled = YES;
     // White (not red) title text per spec - the red fill layer alone is
     // what signals "Verbose is active" now.
-    gd_style_button_with_fixed_corner_radius(self.syslogButton, @"Verbose", [UIColor colorWithWhite:1 alpha:0.95], kGDAuthFieldCornerRadius); // square-ish, matches Auth's Verify button - see gd_style_button_with_fixed_corner_radius
+    gd_style_button_as_native_glass(self.syslogButton, @"Verbose", [UIColor colorWithWhite:1 alpha:0.95]);
+    gd_configure_glass_button_fixed_corner_radius(self.syslogButton, kGDAuthFieldCornerRadius); // 9: square-ish, matches Auth's Verify button - see -buildPanel:'s syslogButton setup
 
     self.syslogTabEnabled = YES;
     self.syslogHandle.hidden = NO;
@@ -9362,7 +9424,8 @@ static NSURL *gd_mods_live_stock_url_for_entry(ModAssetLibraryEntry *entry) {
 // non-Verbose tap path hides it again.
 - (void)gd_resetSyslogVerboseMode {
     self.syslogVerboseEnabled = NO;
-    gd_style_button_with_fixed_corner_radius(self.syslogButton, @"Syslog", [UIColor colorWithWhite:1 alpha:0.88], kGDAuthFieldCornerRadius); // square-ish, matches Auth's Verify button - see gd_style_button_with_fixed_corner_radius
+    gd_style_button_as_native_glass(self.syslogButton, @"Syslog", [UIColor colorWithWhite:1 alpha:0.88]);
+    gd_configure_glass_button_fixed_corner_radius(self.syslogButton, kGDAuthFieldCornerRadius); // 9: square-ish, matches Auth's Verify button - see -buildPanel:'s syslogButton setup
 
     self.syslogHandleLabel.text = @"SYSLOG";
     [self gd_updateSyslogHandleLabelLayout];
