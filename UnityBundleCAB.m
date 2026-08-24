@@ -29,6 +29,27 @@ NSString * const UnityBundleCABLZMAPropertiesErrorKey = @"UnityBundleCABLZMAProp
 
 #pragma mark - LZMA properties header (detection/extraction only - no decoder)
 
+// Redeclares the header's readonly properties as readwrite for this file
+// only, so ubc_parse_lzma_properties below can populate a freshly-`new`'d
+// instance via the property setters. Plain `props->_propertyByte = ...`
+// ivar access (the original version of this code) does NOT work here even
+// though this function lives in the same .m file as @implementation
+// UBCLZMAProperties: auto-synthesized ivars (no explicit @synthesize/ivar
+// declaration in the @interface) default to @private, and @private means
+// private to the @implementation's own METHODS, not merely "this file" -
+// a free-standing C function is neither, so the compiler rejected the
+// direct ivar writes ("instance variable '_propertyByte' is private").
+// Property setters go through the class's own generated method, which is
+// exactly what @private is scoped to allow.
+@interface UBCLZMAProperties ()
+@property (nonatomic, assign, readwrite) uint8_t propertyByte;
+@property (nonatomic, assign, readwrite) uint8_t lc;
+@property (nonatomic, assign, readwrite) uint8_t lp;
+@property (nonatomic, assign, readwrite) uint8_t pb;
+@property (nonatomic, assign, readwrite) uint32_t dictionarySize;
+@property (nonatomic, copy, readwrite) NSData *headerBytes;
+@end
+
 @implementation UBCLZMAProperties
 @end
 
@@ -55,12 +76,12 @@ static UBCLZMAProperties *ubc_parse_lzma_properties(const uint8_t *bytes, size_t
     uint8_t pb = (uint8_t)(d / 5);
 
     UBCLZMAProperties *props = [UBCLZMAProperties new];
-    props->_propertyByte = propertyByte;
-    props->_lc = lc;
-    props->_lp = lp;
-    props->_pb = pb;
-    props->_dictionarySize = dictionarySize;
-    props->_headerBytes = [NSData dataWithBytes:bytes length:5];
+    props.propertyByte = propertyByte;
+    props.lc = lc;
+    props.lp = lp;
+    props.pb = pb;
+    props.dictionarySize = dictionarySize;
+    props.headerBytes = [NSData dataWithBytes:bytes length:5];
     return props;
 }
 
