@@ -436,9 +436,13 @@ malformed:
 // this project has seen - Unity's own LZ4 chunking, not the archive
 // total) are ever resident at once - never the whole bundle.
 static BOOL ubc_write_one_data_block(NSFileHandle *fh, const uint8_t *base, size_t fileSize,
-                                      size_t *cursor, UBCBlockEntry be, NSError **error) {
+                                      size_t *cursor, UBCBlockEntry be, NSUInteger blockIndex, NSError **error) {
     if (*cursor > fileSize || be.cSize > fileSize - *cursor) {
-        if (error) *error = [NSError errorWithDomain:UnityBundleCABErrorDomain code:UnityBundleCABErrorMalformedBlocksInfo userInfo:nil];
+        if (error) *error = [NSError errorWithDomain:UnityBundleCABErrorDomain code:UnityBundleCABErrorMalformedBlocksInfo userInfo:@{
+            NSLocalizedDescriptionKey: [NSString stringWithFormat:
+                @"Data block %lu runs past end of file: cursor=%zu, declared compressed size=%u, file size=%zu.",
+                (unsigned long)blockIndex, *cursor, be.cSize, fileSize]
+        }];
         return NO;
     }
     const uint8_t *blockBytes = base + *cursor;
@@ -529,6 +533,47 @@ static NSString *ubc_decompress_data_blocks_to_temp_file(NSData *fileData,
     size_t fileSize = fileData.length;
     const uint8_t *base = (const uint8_t *)fileData.bytes;
 
+    // Sanity-check the block table against the actual data region BEFORE
+    // decoding anything, and log the numbers either way - mirrors the
+    // dataRegionSlack check BundleDoctor's UnityFsLz4Transcoder.cs does on
+    // the C# side of this same pipeline (see that file's header comment).
+    // Without this, a bundle whose block table doesn't match its data
+    // region used to fail opaquely and only once ubc_write_one_data_block's
+    // own per-block bounds check happened to trip on whichever block first
+    // ran past EOF - returned as UnityBundleCABErrorMalformedBlocksInfo
+    // with userInfo:nil, which is why the only thing ever reached the log
+    // was Foundation's generic "The operation couldn't be completed"
+    // string. This logs the actual numbers up front every time (so a
+    // one-off failure captured in the wild still tells you something) and
+    // gives the eventual NSError a real NSLocalizedDescriptionKey instead
+    // of nil. A small (<16 byte) gap is expected/harmless (alignment
+    // padding after the last block, same as the C# side); only a negative
+    // or >=16-byte slack indicates the block table itself doesn't match
+    // this bundle's actual layout.
+    size_t dataRegionEnd = header->blocksInfoAtEnd ? (fileSize - header->compressedBlocksInfoSize) : fileSize;
+    int64_t declaredDataBytes = 0;
+    for (NSValue *v in blocks) {
+        UBCBlockEntry be; [v getValue:&be];
+        declaredDataBytes += be.cSize;
+    }
+    int64_t dataRegionSlack = (int64_t)(dataRegionEnd - dataStart) - declaredDataBytes;
+    ZLog(@"[UnityBundleCAB] blocksInfoAtEnd=%d dataStart=%zu dataRegionEnd=%zu dataRegionSize=%zu "
+          "declaredDataBytes=%lld slack=%lld blockCount=%lu",
+         header->blocksInfoAtEnd, dataStart, dataRegionEnd, dataRegionEnd - dataStart,
+         (long long)declaredDataBytes, (long long)dataRegionSlack, (unsigned long)blocks.count);
+
+    if (dataRegionEnd < dataStart || dataRegionSlack < 0 || dataRegionSlack >= 16) {
+        if (error) *error = [NSError errorWithDomain:UnityBundleCABErrorDomain code:UnityBundleCABErrorMalformedBlocksInfo userInfo:@{
+            NSLocalizedDescriptionKey: [NSString stringWithFormat:
+                @"Bundle's block table doesn't match its data region: blocks declare %lld bytes total, but the "
+                 "data region (dataStart=%zu to %@=%zu) is %zu bytes (slack=%lld, expected 0-15 for alignment "
+                 "padding). This bundle's layout doesn't match what this parser expects - see UnityBundleCAB.h.",
+                (long long)declaredDataBytes, dataStart, header->blocksInfoAtEnd ? @"blocksInfoStart" : @"EOF",
+                dataRegionEnd, dataRegionEnd - dataStart, (long long)dataRegionSlack]
+        }];
+        return nil;
+    }
+
     NSString *tmpPath = [NSTemporaryDirectory() stringByAppendingPathComponent:
         [NSString stringWithFormat:@"zsingularity-ubc-decompressed-%@", [[NSUUID UUID] UUIDString]]];
     if (![NSFileManager.defaultManager createFileAtPath:tmpPath contents:nil attributes:nil]) {
@@ -544,14 +589,16 @@ static NSString *ubc_decompress_data_blocks_to_temp_file(NSData *fileData,
 
     BOOL ok = YES;
     NSError *blockError = nil;
+    NSUInteger blockIndex = 0;
     for (NSValue *v in blocks) {
         @autoreleasepool {
             UBCBlockEntry be; [v getValue:&be];
-            if (!ubc_write_one_data_block(fh, base, fileSize, &cursor, be, &blockError)) {
+            if (!ubc_write_one_data_block(fh, base, fileSize, &cursor, be, blockIndex, &blockError)) {
                 ok = NO;
             }
         } // this block's bytes (if any were decompressed) are released here, before the next block is even read
         if (!ok) break;
+        blockIndex++;
     }
 
     [fh closeFile];
