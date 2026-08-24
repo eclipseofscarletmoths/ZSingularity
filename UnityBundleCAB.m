@@ -25,6 +25,60 @@
 #import "lz4hc.h"
 
 NSString * const UnityBundleCABErrorDomain = @"UnityBundleCABErrorDomain";
+NSString * const UnityBundleCABLZMAPropertiesErrorKey = @"UnityBundleCABLZMAPropertiesErrorKey";
+
+#pragma mark - LZMA properties header (detection/extraction only - no decoder)
+
+@implementation UBCLZMAProperties
+@end
+
+// Parses the 5-byte LZMA properties header (see UnityBundleCAB.h's comment
+// on UBCLZMAProperties for the byte layout) from the START of `bytes` -
+// i.e. the first 5 bytes of a raw LZMA stream, whether that stream is the
+// whole compressed blocks-info blob or a single compressed data block.
+// Returns nil if fewer than 5 bytes are available. This never fails on the
+// property-byte math itself - every uint8_t value decodes to *some*
+// lc/lp/pb triple (some combinations Unity's own bundles won't actually
+// produce, but nothing here needs to reject those to do its job of
+// reporting what the header literally says).
+static UBCLZMAProperties *ubc_parse_lzma_properties(const uint8_t *bytes, size_t length) {
+    if (length < 5) return nil;
+
+    uint8_t propertyByte = bytes[0];
+    uint32_t dictionarySize = (uint32_t)bytes[1] | ((uint32_t)bytes[2] << 8) |
+                               ((uint32_t)bytes[3] << 16) | ((uint32_t)bytes[4] << 24); // LE, unlike everything else in this file
+
+    uint32_t d = propertyByte;
+    uint8_t lc = (uint8_t)(d % 9);
+    d /= 9;
+    uint8_t lp = (uint8_t)(d % 5);
+    uint8_t pb = (uint8_t)(d / 5);
+
+    UBCLZMAProperties *props = [UBCLZMAProperties new];
+    props->_propertyByte = propertyByte;
+    props->_lc = lc;
+    props->_lp = lp;
+    props->_pb = pb;
+    props->_dictionarySize = dictionarySize;
+    props->_headerBytes = [NSData dataWithBytes:bytes length:5];
+    return props;
+}
+
+// Builds the NSError this file returns whenever a blob is accurately
+// identified as LZMA (rather than genuinely failing to parse) - always
+// carries the extracted UBCLZMAProperties under
+// UnityBundleCABLZMAPropertiesErrorKey when parsing that header succeeded
+// (it can still be nil if the LZMA-flagged blob was too short to even hold
+// a 5-byte header - that's a malformed archive, not a "can't decode LZMA"
+// situation, but this is still the most accurate code to surface it under).
+static NSError *ubc_lzma_detected_error(NSString *what, UBCLZMAProperties * _Nullable props) {
+    NSMutableDictionary *userInfo = [NSMutableDictionary dictionary];
+    userInfo[NSLocalizedDescriptionKey] = [NSString stringWithFormat:
+        @"%@ uses LZMA compression (type 1) - accurately detected and its properties header was extracted, "
+         "but this project has no LZMA decoder, so it cannot be decompressed. See UnityBundleCAB.h.", what];
+    if (props) userInfo[UnityBundleCABLZMAPropertiesErrorKey] = props;
+    return [NSError errorWithDomain:UnityBundleCABErrorDomain code:UnityBundleCABErrorLZMADetected userInfo:userInfo];
+}
 
 #pragma mark - Bounds-checked cursor over an in-memory buffer
 
@@ -228,9 +282,16 @@ static NSData *ubc_extract_blocks_info(NSData *fileData, const UBCHeader *header
             }
             return out;
         }
-        default: // LZMA (1) / LZHAM (4) / anything else - see header note
+        case 1: { // LZMA - accurately detected and its properties header extracted, but not decompressed (see header note)
+            UBCLZMAProperties *props = ubc_parse_lzma_properties(blobBytes, header->compressedBlocksInfoSize);
+            ZLog(@"[UnityBundleCAB] blocks-info is LZMA-compressed: lc=%u lp=%u pb=%u dictionarySize=%u",
+                 props.lc, props.lp, props.pb, props.dictionarySize);
+            if (error) *error = ubc_lzma_detected_error(@"Bundle's blocks-info", props);
+            return nil;
+        }
+        default: // LZHAM (4) / anything else - see header note
             if (error) *error = [NSError errorWithDomain:UnityBundleCABErrorDomain code:UnityBundleCABErrorUnsupportedCompression userInfo:@{
-                NSLocalizedDescriptionKey: [NSString stringWithFormat:@"Bundle uses compression type %u (not none/LZ4/LZ4HC) - unsupported, see UnityBundleCAB.h", header->compressionType]
+                NSLocalizedDescriptionKey: [NSString stringWithFormat:@"Bundle uses compression type %u (not none/LZMA/LZ4/LZ4HC) - unsupported, see UnityBundleCAB.h", header->compressionType]
             }];
             return nil;
     }
@@ -384,9 +445,16 @@ static BOOL ubc_write_one_data_block(NSFileHandle *fh, const uint8_t *base, size
                 [fh writeData:chunk]; // this one block's decompressed bytes - released when this @autoreleasepool drains, not held for the rest of the archive
                 break;
             }
+            case 1: { // LZMA - accurately detected and its properties header extracted, but not decompressed (see header note)
+                UBCLZMAProperties *props = ubc_parse_lzma_properties(blockBytes, be.cSize);
+                ZLog(@"[UnityBundleCAB] data block is LZMA-compressed: lc=%u lp=%u pb=%u dictionarySize=%u",
+                     props.lc, props.lp, props.pb, props.dictionarySize);
+                if (error) *error = ubc_lzma_detected_error(@"A data block", props);
+                return NO;
+            }
             default:
                 if (error) *error = [NSError errorWithDomain:UnityBundleCABErrorDomain code:UnityBundleCABErrorUnsupportedCompression userInfo:@{
-                    NSLocalizedDescriptionKey: [NSString stringWithFormat:@"Data block uses compression type %u (not none/LZ4/LZ4HC) - unsupported, see UnityBundleCAB.h", compType]
+                    NSLocalizedDescriptionKey: [NSString stringWithFormat:@"Data block uses compression type %u (not none/LZMA/LZ4/LZ4HC) - unsupported, see UnityBundleCAB.h", compType]
                 }];
                 return NO;
         }
@@ -761,6 +829,65 @@ static NSDictionary<NSNumber *, NSString *> *ubc_target_platform_names(void) {
     UBCHeader header;
     if (!ubc_parse_header(&c, &header, NULL, NULL, error)) return UINT8_MAX;
     return header.compressionType;
+}
+
+// Shared by +isLZMACompressedBundleAtPath:isLZMA:error: and
+// +lzmaPropertiesForBundleAtPath:error: below - reads just the header (no
+// blocks-info decompression attempted) and, if compressionType is LZMA,
+// also locates and parses that blob's 5-byte properties header. Returns NO
+// only on a genuine parse failure (bad signature, truncated file, etc.) -
+// a file that parses fine but isn't LZMA is still a YES, with
+// `outIsLZMA` = NO and `outProps` left nil.
+static BOOL ubc_detect_lzma(NSString *path, BOOL *outIsLZMA, UBCLZMAProperties **outProps, NSError **error) {
+    NSData *fileData = [NSData dataWithContentsOfFile:path options:NSDataReadingMappedIfSafe error:error];
+    if (!fileData) {
+        if (error && !*error) *error = [NSError errorWithDomain:UnityBundleCABErrorDomain code:UnityBundleCABErrorCantReadFile userInfo:nil];
+        return NO;
+    }
+
+    UBCCursor c = { .base = fileData.bytes, .size = fileData.length, .pos = 0 };
+    UBCHeader header;
+    if (!ubc_parse_header(&c, &header, NULL, NULL, error)) return NO;
+
+    BOOL isLZMA = (header.compressionType == UnityBundleCABCompressionLZMA);
+    if (outIsLZMA) *outIsLZMA = isLZMA;
+    if (!isLZMA) {
+        if (outProps) *outProps = nil;
+        return YES;
+    }
+
+    size_t fileSize = fileData.length;
+    size_t blobStart = header.blocksInfoAtEnd ? (fileSize - header.compressedBlocksInfoSize) : header.headerEndPos;
+    if (blobStart > fileSize || header.compressedBlocksInfoSize > fileSize - blobStart) {
+        if (error) *error = [NSError errorWithDomain:UnityBundleCABErrorDomain code:UnityBundleCABErrorMalformedBlocksInfo userInfo:nil];
+        return NO;
+    }
+
+    UBCLZMAProperties *props = ubc_parse_lzma_properties((const uint8_t *)fileData.bytes + blobStart, header.compressedBlocksInfoSize);
+    if (outProps) *outProps = props;
+    return YES;
+}
+
++ (BOOL)isLZMACompressedBundleAtPath:(NSString *)path isLZMA:(BOOL *)outIsLZMA error:(NSError **)error {
+    return ubc_detect_lzma(path, outIsLZMA, NULL, error);
+}
+
++ (nullable UBCLZMAProperties *)lzmaPropertiesForBundleAtPath:(NSString *)path error:(NSError **)error {
+    BOOL isLZMA = NO;
+    UBCLZMAProperties *props = nil;
+    if (!ubc_detect_lzma(path, &isLZMA, &props, error)) return nil;
+    if (!isLZMA) {
+        if (error) *error = [NSError errorWithDomain:UnityBundleCABErrorDomain code:UnityBundleCABErrorUnsupportedCompression userInfo:@{
+            NSLocalizedDescriptionKey: @"Bundle's blocks-info is not LZMA-compressed - nothing to extract a properties header from."
+        }];
+        return nil;
+    }
+    if (!props && error) {
+        *error = [NSError errorWithDomain:UnityBundleCABErrorDomain code:UnityBundleCABErrorMalformedBlocksInfo userInfo:@{
+            NSLocalizedDescriptionKey: @"Bundle's blocks-info is flagged LZMA but is too short to hold a 5-byte properties header."
+        }];
+    }
+    return props;
 }
 
 + (nullable NSData *)LZ4HCDataForBundleAtPath:(NSString *)path error:(NSError **)error {

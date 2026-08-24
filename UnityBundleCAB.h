@@ -49,14 +49,20 @@
 //
 // node[0].path is what this returns as the bundle's CAB.
 //
-// COMPRESSION SUPPORT: none and LZ4/LZ4HC (via LZ4BlockDecoder.h - see
-// that file). LZMA is NOT implemented - every real bundle this project
-// has inspected so far uses LZ4/LZ4HC (the mobile-appropriate choice;
-// LZMA trades far more CPU for a size win that matters more on the CDN
-// side than on-device), so this hasn't come up in practice, but a bundle
-// that does use it will fail extraction with
-// UnityBundleCABErrorUnsupportedCompression rather than silently
-// returning nothing or a wrong answer.
+// COMPRESSION SUPPORT: full decode/decompress support is none and
+// LZ4/LZ4HC only (via LZ4BlockDecoder.h - see that file). LZMA decompression
+// is NOT implemented - every real bundle this project has inspected so far
+// uses LZ4/LZ4HC (the mobile-appropriate choice; LZMA trades far more CPU
+// for a size win that matters more on the CDN side than on-device), so
+// decoding it hasn't come up in practice. A bundle that does use it will
+// fail full extraction with UnityBundleCABErrorLZMADetected (blocks-info)
+// or UnityBundleCABErrorUnsupportedCompression (data blocks, or LZHAM
+// anywhere) rather than silently returning nothing or a wrong answer.
+// LZMA is, however, accurately DETECTED and its 5-byte properties header
+// (lc/lp/pb + dictionary size) IS extracted, independent of whether the
+// stream itself can be decompressed - see UBCLZMAProperties,
+// +isLZMACompressedBundleAtPath:isLZMA:error:, and
+// +lzmaPropertiesForBundleAtPath:error: below.
 
 #import <Foundation/Foundation.h>
 
@@ -68,12 +74,69 @@ typedef NS_ENUM(NSInteger, UnityBundleCABErrorCode) {
     UnityBundleCABErrorCantReadFile = 1,
     UnityBundleCABErrorTooSmall,               // shorter than a minimal header
     UnityBundleCABErrorBadSignature,            // doesn't start with "UnityFS\0"
-    UnityBundleCABErrorUnsupportedCompression,  // LZMA/LZHAM - see header note above
+    UnityBundleCABErrorUnsupportedCompression,  // LZHAM, or anything else outside 0/1/2/3 - see header note above
     UnityBundleCABErrorDecompressFailed,        // LZ4BlockDecompress rejected the blocks-info blob
     UnityBundleCABErrorMalformedBlocksInfo,     // decompressed, but the node table didn't parse cleanly
     UnityBundleCABErrorNoNodes,                 // parsed fine, but the directory table is empty
     UnityBundleCABErrorMalformedSerializedFileHeader, // +targetPlatform:forBundleAtPath:error: couldn't walk the primary node's SerializedFile header far enough to reach m_TargetPlatform
+    // The blob in question (blocks-info, or one data block) IS accurately
+    // identified as LZMA (compression type 1) and its 5-byte properties
+    // header (see UBCLZMAProperties below) WAS successfully extracted -
+    // this is not a parse failure. It's kept as a distinct error code
+    // (rather than folded into UnityBundleCABErrorUnsupportedCompression)
+    // purely because this project has no LZMA decoder, so the blob's
+    // actual payload still can't be produced; callers that only care
+    // about detection + header info should treat this as a successful
+    // identification, not a failure - see +isLZMACompressedBundleAtPath:
+    // error: and +lzmaPropertiesForBundleAtPath:error: below, which
+    // surface exactly that case without erroring at all.
+    UnityBundleCABErrorLZMADetected,
 };
+
+// UnityBundleCAB compression-type byte (low 6 bits of the UnityFS header's
+// flags field, and of each data block's own per-block flags field - see
+// this file's format doc above). Named here so call sites don't have to
+// spell out the raw integers 0-4 to know what they mean.
+typedef NS_ENUM(uint8_t, UnityBundleCABCompressionType) {
+    UnityBundleCABCompressionNone  = 0,
+    UnityBundleCABCompressionLZMA  = 1,
+    UnityBundleCABCompressionLZ4   = 2,
+    UnityBundleCABCompressionLZ4HC = 3,
+    UnityBundleCABCompressionLZHAM = 4,
+};
+
+// Userinfo key under which the internal blocks-info/data-block parsers and
+// the two LZMA detection methods below attach a parsed UBCLZMAProperties
+// instance to an NSError with code UnityBundleCABErrorLZMADetected.
+extern NSString * const UnityBundleCABLZMAPropertiesErrorKey;
+
+// The 5-byte LZMA properties header every raw LZMA stream in a UnityFS
+// bundle begins with (this project's bundles never carry the extra 8-byte
+// "uncompressed size" field some standalone .lzma files have - Unity
+// already knows each block's uncompressed size from its own block table,
+// so it's omitted here; see 7-Zip's lzma-specification.txt for the
+// property-byte encoding this decodes):
+//   uint8         propertyByte    encodes lc/lp/pb - see decode below
+//   uint32 LE     dictionarySize
+// propertyByte decodes as (props = pb*45 + lp*9 + lc):
+//   lc = propertyByte % 9
+//   lp = (propertyByte / 9) % 5
+//   pb = propertyByte / 45
+// This class only parses that header - it does NOT decompress the LZMA
+// stream that follows it. No LZMA decoder is implemented anywhere in this
+// project (see the compression-support note atop this file); the value of
+// parsing this header on its own is identification/diagnostics (confirming
+// a bundle really is LZMA rather than some other unsupported scheme, and
+// recovering its dictionary size/literal-context parameters) for whatever
+// eventually needs to actually decode it.
+@interface UBCLZMAProperties : NSObject
+@property (nonatomic, assign, readonly) uint8_t propertyByte;   // raw byte, before lc/lp/pb decode
+@property (nonatomic, assign, readonly) uint8_t lc;              // literal context bits, 0-8
+@property (nonatomic, assign, readonly) uint8_t lp;              // literal position bits, 0-4
+@property (nonatomic, assign, readonly) uint8_t pb;              // position bits, 0-4
+@property (nonatomic, assign, readonly) uint32_t dictionarySize; // bytes
+@property (nonatomic, copy, readonly) NSData *headerBytes;       // the raw 5 bytes this was parsed from
+@end
 
 // One directory-table entry, WITH its offset/size (not just its name -
 // see UnityBundleCAB's own array-of-names methods below for the
@@ -136,10 +199,32 @@ typedef NS_ENUM(NSInteger, UnityBundleCABErrorCode) {
 // actually needed, use +primaryCABForBundleAtPath:error: separately.
 + (BOOL)isUnityFSBundleAtPath:(NSString *)path;
 
-// Returns the UnityFS archive-wide compression type from the header:
-// 0 = none, 2 = LZ4, 3 = LZ4HC. This only reads the small header and
-// does not decompress the bundle.
+// Returns the UnityFS archive-wide compression type from the header - see
+// UnityBundleCABCompressionType above for what the raw byte means (0 none,
+// 1 LZMA, 2 LZ4, 3 LZ4HC, 4 LZHAM). This only reads the small header and
+// does not decompress the bundle, so it works even for a bundle whose
+// blocks-info this project otherwise can't decode (LZMA/LZHAM).
 + (uint8_t)compressionTypeForBundleAtPath:(NSString *)path error:(NSError **)error;
+
+// Accurate, cheap (header-only, no decompression attempted) check for
+// whether `path`'s blocks-info is LZMA-compressed specifically - i.e.
+// UnityBundleCABCompressionLZMA (1), not just "some compression this
+// project can't decode" (which also covers LZHAM (4) and any other/future
+// value >3). Returns NO + fills `error` if the file isn't even a parseable
+// UnityFS header (bad signature, truncated, etc.); otherwise returns YES
+// and sets `outIsLZMA` regardless of the answer, so a NO/false result here
+// is a real "confirmed not LZMA," not "couldn't tell."
++ (BOOL)isLZMACompressedBundleAtPath:(NSString *)path isLZMA:(BOOL *)outIsLZMA error:(NSError **)error;
+
+// If `path`'s blocks-info is LZMA-compressed, parses and returns the
+// 5-byte LZMA properties header (lc/lp/pb + dictionary size) that blob
+// begins with - see UBCLZMAProperties above. Returns nil + an error if the
+// file isn't a parseable UnityFS header, or if it parses fine but isn't
+// LZMA-compressed (error code UnityBundleCABErrorUnsupportedCompression in
+// the latter case, distinguishable from a real parse failure). This does
+// NOT decompress the LZMA stream - see UBCLZMAProperties's own comment for
+// why that's out of scope for this project.
++ (nullable UBCLZMAProperties *)lzmaPropertiesForBundleAtPath:(NSString *)path error:(NSError **)error;
 
 // Rewrites a supported UnityFS bundle as a transport-optimized LZ4HC
 // archive. The payload is unchanged logically; only UnityFS block
