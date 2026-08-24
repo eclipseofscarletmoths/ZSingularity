@@ -27,29 +27,6 @@ jobs:
         id: sdk
         run: echo "path=$(xcrun --sdk iphoneos --show-sdk-path)" >> "$GITHUB_OUTPUT"
 
-      # Pulled at build time rather than committed, so the exact upstream
-      # bytes are always what actually got fetched from lz4/lz4 - not a
-      # manually-copied transcription that could silently drift from it.
-      # Pinned to the v1.10.0 tag (the current stable release, per
-      # github.com/lz4/lz4/releases/tag/v1.10.0 - not "dev"/"master", which
-      # move) for reproducible builds; the checksums pin the CONTENT at that
-      # tag, since a tag can technically be moved/re-pointed on GitHub,
-      # which would otherwise change what this resolves to without the
-      # fetch itself failing. BOTH lz4.c and lz4hc.c go into the compile
-      # step below, as separate translation units. lz4hc.c does
-      # `#include "lz4.c"`, but only after `#define LZ4_COMMONDEFS_ONLY` -
-      # that macro makes the included copy emit just lz4.c's internal
-      # shared helpers (LZ4_count, constants, mem routines), NOT its
-      # public API (LZ4_compressBound, LZ4_compress_default,
-      # LZ4_decompress_safe, etc.) - see lz4hc.c's own "Shared lz4.c code"
-      # section. So lz4hc.c alone never defines the public lz4.c symbols;
-      # compiling lz4.c on its own is what LZ4_COMMONDEFS_ONLY exists to
-      # make safe to do alongside it - the internal helpers it guards are
-      # confined to each translation unit, so there's no duplicate-symbol
-      # clash between the two .o files. (Previously this only compiled
-      # lz4hc.c on the mistaken assumption that its #include of lz4.c
-      # covered the public API too - it doesn't - which is why the linker
-      # was failing on undefined symbols like LZ4_compressBound.)
       - name: Fetch LZ4 reference library
         run: |
           set -euo pipefail
@@ -61,58 +38,6 @@ jobs:
           shasum -a 256 lz4.h lz4.c lz4hc.h lz4hc.c > lz4-checksums.txt
           shasum -a 256 -c lz4-checksums.txt
 
-      # libogg/libvorbis are not vendored or linked - the mobile client
-      # already plays Vorbis-coded FSB5 samples natively, so
-      # BankTransplant.m is a direct file copy, no codec linkage
-      # required.
-      #
-      # crn_decomp.h / CrunchTextureDecoder.mm are gone along with the
-      # rest of the in-process Texture2D retarget pipeline (see this
-      # repo's README, "Visual (bundle/texture) mod support - removed").
-      # That work now happens out-of-process via AssetsTools.NET on a
-      # separate GitHub Actions workflow that this tweak only talks to
-      # over HTTP (BundleDoctorService.m) - nothing here links against
-      # AssetsTools.NET or any texture codec, so there's no
-      # header-fetch/patch step left to run before the main compile.
-
-      # All .m files compile as one dylib in a single clang invocation -
-      # small enough project that per-file .o caching isn't worth the
-      # extra steps. Headers are pulled in via #import, so they don't
-      # need separate compilation.
-      #
-      # -fobjc-arc is required: several files (GraphicsDebugOverlay.m,
-      # BundleDoctorService.m, etc.) use ARC-style strong/assign
-      # property attributes and ARC-managed blocks.
-      #
-      # BankTransplant.m / PatchManifestNetwork.m are unaffected by the
-      # bundle-mod rework and still work as before (see README).
-      #
-      # BundleDoctorService.m / BundleDoctorSettings.m / -Installer.m
-      # are the new remote doctor-bundle pipeline (repo link + auth key
-      # UI forwards a modded desktop bundle to a GitHub Actions workflow
-      # running AssetsTools.NET, then slots the doctored result in place
-      # - see BundleDoctorService.h's own header for the full protocol).
-      # None of them link against AssetsTools.NET directly; they only
-      # speak GitHub's REST API over NSURLSession and read/write the
-      # Keychain for the stored PAT.
-      #
-      # ModAssetLibrary.m is back in this build - reimplemented against
-      # the current pipeline (see that file's own top comment) after its
-      # previous version was dropped along with UnityBundleCAB.m/
-      # BundleTransplant.m, which it depended on and which no longer
-      # exist. It's bookkeeping only (a manifest.json per named folder
-      # under this app's own Library directory) - GraphicsDebugOverlay.m
-      # now records into it from both the bank-swap flow and the
-      # doctor-bundle install flow; see that file's "Mods (import)"
-      # section comment.
-      #
-      # -DZS_BUILD_NUMBER=<run number> stamps the same counter the
-      # "Publish release" step below already tags each build with
-      # (build-${{ github.run_number }}) into the binary itself, so the
-      # panel's header version tag (see gd_version_string in
-      # GraphicsDebugOverlay.m) updates on its own with every push - no
-      # version bump needed here beyond the "v0.0.1" prefix baked into
-      # that function.
       - name: Compile tweak dylib
         run: |
           clang \
@@ -132,30 +57,29 @@ jobs:
             -framework Security \
             -lcompression \
             -install_name "@rpath/ZSingularity.dylib" \
-            fps120.m \
-            ZCrashLogger.m \
-            IL2CppBridge.m \
-            GraphicsDebugOverlay.m \
-            GDScripts.m \
-            ZSyslogController.m \
-            BankTransplant.m \
-            PatchManifestNetwork.m \
-            BundleDoctorService.m \
-            BundleDoctorSettings.m \
-            BundleDoctorInstaller.m \
-            ModAssetLibrary.m \
-            LZ4BlockDecoder.m \
+            -I. \
+            -ICore -IUI -IMods -IBundleTools -ITranscoder -INetwork -IDiagnostics -IResources \
+            Core/fps120.m \
+            Diagnostics/ZCrashLogger.m \
+            Core/IL2CppBridge.m \
+            UI/UserInterface.m \
+            Core/ZSScripts.m \
+            Diagnostics/ZSyslogController.m \
+            Mods/BankTransplant.m \
+            Network/PatchManifestNetwork.m \
+            Transcoder/ZTranscoderService.m \
+            Transcoder/ZTranscoderSettings.m \
+            Transcoder/ZTranscoderInstaller.m \
+            Mods/ModAssetLibrary.m \
+            BundleTools/LZ4BlockDecoder.m \
             lz4.c \
             lz4hc.c \
-            UnityBundleCAB.m \
-            UnityCacheLocator.m \
-            GDFileIndex.m \
-            LunartiqueModArchive.m \
+            BundleTools/UnityBundleCAB.m \
+            BundleTools/UnityCacheLocator.m \
+            BundleTools/ZSFileIndex.m \
+            Mods/LunartiqueModArchive.m \
             -o ZSingularity.dylib
 
-      # Ad-hoc sign so the dylib is well-formed on its own; patch-ipa.yml
-      # presumably re-signs/embeds it into the app bundle's signature
-      # anyway when it injects into the executable via insert_dylib.
       - name: Ad-hoc codesign
         run: codesign -f -s - ZSingularity.dylib
 
@@ -171,3 +95,4 @@ jobs:
           prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
