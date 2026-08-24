@@ -130,7 +130,7 @@ jobs:
             -framework CoreText \
             -framework UniformTypeIdentifiers \
             -framework Security \
-            -framework Compression \
+            -lcompression \
             -install_name "@rpath/ZSingularity.dylib" \
             fps120.m \
             ZCrashLogger.m \
