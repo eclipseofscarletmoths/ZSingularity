@@ -172,9 +172,10 @@ static BOOL ubc_read_cstring(UBCCursor *c, NSString **out) {
 typedef struct {
     uint32_t compressedBlocksInfoSize;
     uint32_t uncompressedBlocksInfoSize;
-    uint8_t  compressionType; // low 6 bits of flags
-    BOOL     blocksInfoAtEnd; // bit 6 of flags
-    size_t   headerEndPos;    // stream position immediately after the header (+ alignment)
+    uint8_t  compressionType;      // low 6 bits of flags
+    BOOL     blocksInfoAtEnd;      // bit 7 (0x80) of flags
+    BOOL     dataNeedsPaddingAtStart; // bit 9 (0x200) of flags - see ubc_decompress_data_blocks_to_temp_file
+    size_t   headerEndPos;         // stream position immediately after the header (+ alignment)
 } UBCHeader;
 
 static BOOL ubc_parse_header(UBCCursor *c, UBCHeader *out, NSString **outUnityVersion, NSString **outUnityRevision, NSError **error) {
@@ -219,30 +220,44 @@ static BOOL ubc_parse_header(UBCCursor *c, UBCHeader *out, NSString **outUnityVe
     // bit 0x80 NOT set] - only the latter was affected).
     BOOL blocksInfoAtEnd = (flags & 0x80) != 0;
 
+    // Bit 9 (0x200). Cross-checked against AssetsTools.NET's own
+    // AssetBundleHeader06.GetFileDataOffset()/GetBundleInfoOffset() (the
+    // library the project's __data samples confirm reads and transcodes
+    // both real bundles correctly, so its offset math is the reference
+    // here rather than something to re-derive from scratch): this bit
+    // does NOT gate whether the alignment below (headerEndPos itself,
+    // i.e. where blocks-info starts when inline) happens - per
+    // GetBundleInfoOffset, that alignment is unconditional whenever the
+    // format version is >=7, which is every bundle this project has ever
+    // seen. What bit 9 actually gates is a SEPARATE, later alignment: an
+    // extra round-up to 16 applied after optionally skipping past inline
+    // blocks-info, immediately before the data blocks - see
+    // ubc_decompress_data_blocks_to_temp_file below, which is the only
+    // other place this bit is consulted. Stored here (rather than
+    // decided inline) because that decision happens in a different
+    // function than the one parsing the flag.
+    BOOL dataNeedsPaddingAtStart = (flags & 0x200) != 0;
+
     // Stream alignment to a 16-byte boundary (from file start, not
-    // relative to the header) - UNCONDITIONAL, not gated on flags bit 9
-    // (0x200) as this used to be. That gating was itself a previous fix
-    // (see git history/comments this replaced) for a real bug where a
-    // 4-byte target did nothing on an already-4-aligned header - but
-    // gating the 16-byte fix on bit 9 turned out to be its own bug,
-    // caught by checking a bundle with bit 9 CLEAR: its blocks-info
-    // decompression read block_count as 0 (impossible for a real
-    // archive with data in it - see below) when read from the
-    // unaligned position 44, and a sane, size-consistent block_count
-    // when read from 48 instead - i.e. this file needed the same
-    // alignment despite bit 9 not asking for it. Confirmed against
-    // three independent real archives (two different flag combinations
-    // with bit 9 SET, one with it CLEAR) that the unconditional version
-    // below is what every one of them actually needs, both for where
-    // inline blocks-info starts and (see
-    // ubc_decompress_data_blocks_to_temp_file below) for where the data blocks that
-    // follow it start. Only applies when blocksInfo is NOT at EOF -
-    // when it's stored at EOF instead, its location comes from the
-    // archive's total size, not this stream position, so there is
-    // nothing to align here (though the data blocks that precede it in
-    // that case still get their own alignment - see
-    // ubc_decompress_data_blocks_to_temp_file).
-    if (!blocksInfoAtEnd) {
+    // relative to the header), for headerEndPos itself - UNCONDITIONAL,
+    // not gated on bit 9 (that bit governs a different, later alignment -
+    // see above) and not gated on blocksInfoAtEnd either. Both of those
+    // used to gate this specific alignment and both were bugs:
+    //  - Gating on bit 9 here was itself a fix for a real bug where a
+    //    4-byte target did nothing on an already-4-aligned header, but
+    //    that gating turned out to be its own bug - caught by a bundle
+    //    with bit 9 CLEAR whose blocks-info decompression read
+    //    block_count as 0 (impossible for a real archive with data in
+    //    it) when read from the unaligned position 44, and a sane,
+    //    size-consistent block_count when read from 48 instead. Matches
+    //    GetBundleInfoOffset's unconditional-on-fileVersion>=7 alignment.
+    //  - Gating on blocksInfoAtEnd (only aligning when blocks-info is
+    //    inline, since "there's nothing to align" for the EOF case where
+    //    blocks-info's location is computed from file size instead of
+    //    this stream position) missed that headerEndPos is ALSO where
+    //    the data blocks start when blocks-info is at EOF - see
+    //    ubc_decompress_data_blocks_to_temp_file below.
+    {
         size_t rem = c->pos % 16;
         if (rem != 0) {
             if (!ubc_skip(c, 16 - rem)) {
@@ -256,6 +271,7 @@ static BOOL ubc_parse_header(UBCCursor *c, UBCHeader *out, NSString **outUnityVe
     out->uncompressedBlocksInfoSize = uncompressedBlocksInfoSize;
     out->compressionType = (uint8_t)(flags & 0x3F);
     out->blocksInfoAtEnd = blocksInfoAtEnd;
+    out->dataNeedsPaddingAtStart = dataNeedsPaddingAtStart;
     out->headerEndPos = c->pos;
     return YES;
 }
@@ -508,23 +524,41 @@ static NSString *ubc_decompress_data_blocks_to_temp_file(NSData *fileData,
     // Data blocks are stored right after this archive's own header (never
     // at EOF regardless of where blocks-info itself lives - blocks-info's
     // own EOF placement is a separate, independent choice from where the
-    // data blocks are), 16-byte aligned from file start the same
-    // UNCONDITIONAL way ubc_parse_header now aligns blocks-info's own
-    // start (see the comment there for the evidence this isn't gated on
-    // flags bit 9). Checked against all three real archives this project
-    // has on hand: when blocks-info is inline (bit 7 clear), data starts
-    // 16-byte-aligned right after it; when blocks-info is stored at EOF
-    // instead (bit 7 set), data starts 16-byte-aligned right after the
-    // header instead, since there's no inline blocks-info bytes to skip
-    // past first - both landed on byte 48 in every sample seen so far
-    // (headerEndPos 44, next 16-byte boundary), which is why this was
-    // easy to miss as "no alignment needed" if you only ever tested
-    // already-16-aligned headers.
+    // data blocks are): when blocks-info is inline (bit 7 clear), data
+    // starts right after the compressed blocks-info bytes; when
+    // blocks-info is stored at EOF instead (bit 7 set), data starts right
+    // at the (already-aligned, by ubc_parse_header) headerEndPos, since
+    // there's no inline blocks-info bytes to skip past first.
+    //
+    // Whether there's an EXTRA 16-byte round-up on top of that is gated
+    // on flags bit 9 (0x200, header->dataNeedsPaddingAtStart) - confirmed
+    // against AssetsTools.NET's own AssetBundleHeader06.GetFileDataOffset
+    // (see ubc_parse_header's comment on this same bit): that align only
+    // runs `if ((flags & 0x200) != 0)`, after the blocksInfoAtEnd branch,
+    // not unconditionally and not keyed off blocksInfoAtEnd itself.
+    //
+    // A previous version of this function re-aligned dataStart to 16
+    // unconditionally regardless of this bit. That was a real bug,
+    // confirmed against two independently-sourced real bundles (a
+    // leiheng_Mod and a "Middle finger Tang" mod __data, both
+    // StandaloneWindows64, architecture-unrelated to which mod they are,
+    // both with bit 9 CLEAR) where the unconditional round-up forced
+    // dataStart 7 bytes past where the data blocks actually start:
+    // blocks-info happened to end at file offset ...+153 landing on a
+    // byte ≡ 9 (mod 16) in both samples, so the old code rounded up 7
+    // bytes it shouldn't have, which is exactly the "slack=-7" (block
+    // table declares 7 more bytes than the data region actually has room
+    // for, dataRegionSlack < 0) this function's own sanity check below
+    // was built to catch. Gating on bit 9 instead lands exactly on
+    // slack=0 for both samples and lets the primary node's SerializedFile
+    // header parse cleanly (m_TargetPlatform 19 - StandaloneWindows64 -
+    // for both, consistent with these being desktop-authored mod bundles
+    // awaiting iOS re-targeting, not a parser guess).
     size_t dataStart = header->headerEndPos;
     if (!header->blocksInfoAtEnd) {
         dataStart += header->compressedBlocksInfoSize;
     }
-    {
+    if (header->dataNeedsPaddingAtStart) {
         size_t rem = dataStart % 16;
         if (rem != 0) dataStart += (16 - rem);
     }
@@ -1116,7 +1150,25 @@ static NSFileHandle *ubc_open_temp_and_write_prefix(NSString *path, NSString *un
 
     ubc_append_u32_be(out, (uint32_t)blocksInfo.length); // compressed == uncompressed, type none
     ubc_append_u32_be(out, (uint32_t)blocksInfo.length);
-    ubc_append_u32_be(out, 0x40); // flags: combined bit only
+
+    // Whether the pad we're about to insert AFTER blocksInfo (right before
+    // the data blocks) actually ends up non-empty is data-dependent (it's
+    // blocksInfo.length's own alignment, which varies with node count and
+    // path string lengths) - flags bit 9 (0x200) must say so accurately,
+    // not just always read as absent, or a reader that correctly gates its
+    // own data-start alignment on this bit (see ubc_parse_header/
+    // ubc_decompress_data_blocks_to_temp_file above - this project's own
+    // reader included, as of the fix those functions describe) will fail
+    // to skip real padding we did insert. headerEndPos below mirrors
+    // exactly what ubc_parse_header computes: align16(stream position
+    // right after this flags field).
+    size_t headerEndPos = out.length + 4;
+    {
+        size_t rem = headerEndPos % 16;
+        if (rem != 0) headerEndPos += (16 - rem);
+    }
+    BOOL dataNeedsPad = ((headerEndPos + blocksInfo.length) % 16) != 0;
+    ubc_append_u32_be(out, dataNeedsPad ? (0x40 | 0x200) : 0x40); // flags: combined (+ needsPaddingAtStart iff real)
 
     {
         size_t rem = out.length % 16;

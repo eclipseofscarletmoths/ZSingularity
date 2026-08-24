@@ -33,12 +33,31 @@
 //                                              (unrelated to location; set on
 //                                              essentially every modern bundle)
 //                                    bit 7     blocks-info stored at EOF instead of here
-//                                    bit 9     blocks-info needs padding at its start
-//                                              (only meaningful when bit 7 is NOT set -
-//                                              see the alignment step below)
-//   [16-byte stream alignment, gated on flags bit 9, only when blocks-info is NOT at EOF]
+//                                    bit 9     data blocks need an extra 16-byte pad at
+//                                              their own start (see below - despite the
+//                                              name this project used to give it, it does
+//                                              NOT gate the alignment right below this
+//                                              flags field, and it is NOT specific to
+//                                              blocks-info being inline)
+//   [16-byte stream alignment, UNCONDITIONAL - applied right after the
+//    flags field regardless of blocksInfoAtEnd (bit 7) or bit 9. When
+//    blocksInfoAtEnd is set, this alignment still matters even though
+//    there's no inline blocks-info blob to skip past here - it's where
+//    the data blocks themselves start in that case.]
 //   <compressed blocks-info bytes, length = compressed size above,
 //    located either right here or at (archiveSize - compressedSize)>
+//   [16-byte stream alignment for the DATA blocks that follow - gated on
+//    bit 9 above, and ONLY on bit 9: not unconditional, and not keyed off
+//    blocksInfoAtEnd. Applies after the blocksInfoAtEnd branch either way
+//    (i.e. after skipping past inline blocks-info bytes, or immediately,
+//    when blocks-info lives at EOF instead). Cross-checked directly
+//    against AssetsTools.NET's own AssetBundleHeader06.GetFileDataOffset,
+//    since this project's samples confirm that library reads and
+//    transcodes them correctly - see ubc_parse_header's and
+//    ubc_decompress_data_blocks_to_temp_file's comments in the .m for the
+//    real-bundle bug this exact gating was needed to fix: two independent
+//    samples with bit 9 clear, where a PRIOR unconditional version of
+//    this alignment added 7 spurious padding bytes and broke reading.]
 //
 // Decompressed blocks-info:
 //   16 bytes                       uncompressed-data hash (unused here)
