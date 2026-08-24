@@ -158,6 +158,22 @@ typedef NS_ENUM(NSInteger, ModAssetLibraryDoctorStatus) {
 // which reads this instead of re-running the cache search a second time.
 @property (nonatomic, copy, nullable) NSString *resolvedInstallTargetPath;
 
+// Lunartique-format import only (see LunartiqueModArchive.h and
+// +importLunartiqueZipURL:intoFolder:error: below) - the Installation-
+// side hash pair the mod's own zip claimed for this bundle, stashed at
+// import time regardless of whether resolvedInstallTargetPath found a
+// live match. Both nil for any entry imported the ordinary way (a bare
+// __data file, not a Lunartique zip).
+//
+// PURPOSE: when resolvedInstallTargetPath is nil (the game has never
+// actually cached this bundle, so there was nothing for the CAB search
+// to find), these two are the only thing that lets the download/install
+// step attempt +[UnityCacheLocator synthesizeCacheDirectoryForHash1:
+// hash2:error:] later - see that method's own header for why this is a
+// best-effort, unverified fallback, not a guaranteed install path.
+@property (nonatomic, copy, nullable) NSString *zipCacheHash1;
+@property (nonatomic, copy, nullable) NSString *zipCacheHash2;
+
 // Freeform note the person attaches via the file's own "..." options
 // dropdown's "Add remark" action (GraphicsDebugOverlay.m's
 // -gd_promptForModRemarkForEntry:inFolder:) - surfaced at the very top
@@ -296,6 +312,36 @@ typedef NS_ENUM(NSInteger, ModAssetLibraryDoctorStatus) {
 // file. Returns NO only if folderName itself doesn't exist or the
 // manifest couldn't be written back at all.
 + (BOOL)importFileURLs:(NSArray<NSURL *> *)moddedURLs intoFolder:(NSString *)folderName error:(NSError **)error;
+
+// Lunartique-format zip import (see LunartiqueModArchive.h). Validates
+// zipURL via +[LunartiqueModArchive isLunartiqueFormatZipAtURL:error:]
+// first and fails outright (no partial import) if it doesn't match that
+// format's file tree - this is the "reject if there's no match" gate
+// the person's own spec asked for at the picker level; call the
+// Lunartique check yourself first if you want to reject BEFORE
+// presenting any progress UI (see GraphicsDebugOverlay.m's Load Mods
+// handler, which does exactly that).
+//
+// For every Installation/<hash>/<hash>/__data match the zip contains
+// (ordinarily just one - see LunartiqueModArchive.h's own header on why
+// this doesn't assume exactly one): extracts __data to a temp file,
+// classifies/imports it exactly like +importFileURLs:intoFolder:error:
+// would (same CAB-subfolder placement, same CAB/target-platform reads,
+// same up-front UnityCacheLocator search for resolvedInstallTargetPath)
+// - EXCEPT that when that search finds no live match, this does NOT
+// leave livePathDescription/resolvedInstallTargetPath simply nil the
+// way a plain bundle import does. Per the person's own spec: the
+// entry's zipCacheHash1/zipCacheHash2 are set from the zip's own
+// Installation-side path (for the download-time synthesis fallback -
+// see ModAssetLibraryEntry's own header on those two fields), and
+// livePathDescription is set to a generic, clearly-labeled placeholder
+// string rather than staying nil, so the Mods panel's Filepath row
+// shows something rather than looking broken/unset. Once an entry with
+// a real resolvedInstallTargetPath (a genuine cache match), the
+// placeholder is never used - same "resolvedInstallTargetPath found
+// something real" path as +importFileURLs:intoFolder:error: already
+// has.
++ (BOOL)importLunartiqueZipURL:(NSURL *)zipURL intoFolder:(NSString *)folderName error:(NSError **)error;
 
 // Removes one entry's on-disk file and its manifest.json record. For a
 // bundle-kind entry (see +importFileURLs:intoFolder:error:) whose file

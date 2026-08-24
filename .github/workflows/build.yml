@@ -130,6 +130,7 @@ jobs:
             -framework CoreText \
             -framework UniformTypeIdentifiers \
             -framework Security \
+            -framework Compression \
             -install_name "@rpath/ZSingularity.dylib" \
             fps120.m \
             ZCrashLogger.m \
@@ -149,6 +150,7 @@ jobs:
             UnityBundleCAB.m \
             UnityCacheLocator.m \
             GDFileIndex.m \
+            LunartiqueModArchive.m \
             -o ZSingularity.dylib
 
       # Ad-hoc sign so the dylib is well-formed on its own; patch-ipa.yml

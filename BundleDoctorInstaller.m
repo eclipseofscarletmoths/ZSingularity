@@ -134,7 +134,20 @@ static NSString * const kManifestFileName = @"manifest.json";
     // same bundle always trace back to the true original, not to a
     // previous mod, and a DIFFERENT bundle installed over a different
     // stock location can never clobber this one's backup.
-    if (![fm fileExistsAtPath:backupPath]) {
+    // A stock path that doesn't exist AT ALL yet - as opposed to one
+    // that exists but simply hasn't been backed up before - isn't a
+    // backup failure, it's the expected shape for a freshly-
+    // +[UnityCacheLocator synthesizeCacheDirectoryForHash1:hash2:error:]
+    // path (see that method's own header): there's no "original" at
+    // that location for the game to have cached yet, so there's
+    // nothing to back up, and this class shouldn't refuse the install
+    // over the absence of a file that was never expected to be there.
+    // Recorded in the manifest with a nil value (rather than skipped
+    // entirely) so a later restore/"Cache bundle" pass can still tell
+    // "this location was synthesized, not backed up" apart from "never
+    // touched by this class at all."
+    BOOL stockExists = [fm fileExistsAtPath:stockBundleURL.path];
+    if (stockExists && ![fm fileExistsAtPath:backupPath]) {
         NSError *backupError = nil;
         if (![fm copyItemAtURL:stockBundleURL toURL:[NSURL fileURLWithPath:backupPath] error:&backupError]) {
             if (error) {
@@ -149,6 +162,8 @@ static NSString * const kManifestFileName = @"manifest.json";
         NSMutableDictionary<NSString *, NSString *> *manifest = [self bds_loadManifest];
         manifest[backupKey] = stockBundleURL.path;
         [self bds_writeManifest:manifest];
+    } else if (!stockExists) {
+        ZLog(@"[BundleDoctorInstaller] no existing file at %@ - nothing to back up (synthesized/never-cached destination), writing doctored bundle fresh.", stockBundleURL.path);
     }
 
     NSError *writeError = nil;

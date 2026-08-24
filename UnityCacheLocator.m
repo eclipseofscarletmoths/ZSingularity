@@ -163,4 +163,43 @@ static void ucl_search(NSString *dirPath, NSUInteger depthRemaining, NSMutableAr
     return matches.firstObject;
 }
 
++ (nullable NSString *)synthesizeCacheDirectoryForHash1:(NSString *)hash1 hash2:(NSString *)hash2 error:(NSError **)error {
+    if (hash1.length == 0 || hash2.length == 0) {
+        if (error) *error = UCLError(UnityCacheLocatorErrorSynthesisFailed, @"Missing hash1/hash2 - nothing to synthesize a path from.");
+        return nil;
+    }
+
+    // Prefer an already-discovered UnityCache/Shared root (the game has
+    // cached SOMETHING before, even if not this bundle) so the
+    // synthesized directory sits alongside real cache entries rather
+    // than in a second, parallel UnityCache tree this class had to
+    // guess the location of. Only fall back to the canonical
+    // Library/UnityCache/Shared path outright when nothing's ever been
+    // cached at all - see +unityCacheSharedDirectories' own header for
+    // why that's still the confirmed on-device shape either way.
+    NSArray<NSString *> *roots = [self unityCacheSharedDirectories];
+    NSString *root = roots.firstObject;
+    if (!root) {
+        NSArray<NSString *> *libraryPaths = NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES);
+        NSString *libraryDir = libraryPaths.firstObject;
+        if (!libraryDir) {
+            if (error) *error = UCLError(UnityCacheLocatorErrorSynthesisFailed, @"Couldn't resolve this app's own Library directory.");
+            return nil;
+        }
+        root = [libraryDir stringByAppendingPathComponent:@"UnityCache/Shared"];
+    }
+
+    NSString *dirPath = [[root stringByAppendingPathComponent:hash1] stringByAppendingPathComponent:hash2];
+    NSFileManager *fm = NSFileManager.defaultManager;
+    NSError *mkdirErr = nil;
+    if (![fm createDirectoryAtPath:dirPath withIntermediateDirectories:YES attributes:nil error:&mkdirErr]) {
+        if (error) *error = mkdirErr ?: UCLError(UnityCacheLocatorErrorSynthesisFailed,
+            [NSString stringWithFormat:@"Couldn't create %@.", dirPath]);
+        return nil;
+    }
+
+    ZLog(@"[UnityCacheLocator] SYNTHESIZED (unverified) cache directory at %@ - see +synthesizeCacheDirectoryForHash1:hash2:error:'s own header caveat", dirPath);
+    return dirPath;
+}
+
 @end

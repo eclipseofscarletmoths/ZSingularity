@@ -49,6 +49,7 @@ typedef NS_ENUM(NSInteger, UnityCacheLocatorErrorCode) {
     UnityCacheLocatorErrorSourceCABUnreadable = 1, // couldn't get a CAB off the source (modded/doctored) bundle at all
     UnityCacheLocatorErrorSharedDirectoryNotFound, // no "UnityCache/Shared"-shaped directory found under Library
     UnityCacheLocatorErrorNoMatch,                 // searched every candidate root, nothing reported this CAB as its own
+    UnityCacheLocatorErrorSynthesisFailed,         // +synthesizeCacheDirectoryForHash1:hash2:error: couldn't create the destination directory
 };
 
 @interface UnityCacheLocator : NSObject
@@ -83,6 +84,36 @@ typedef NS_ENUM(NSInteger, UnityCacheLocatorErrorCode) {
 // directory found at all vs. searched but no file reported this CAB)
 // when there's nothing to return.
 + (nullable NSString *)locateBundlePathForCAB:(NSString *)cab error:(NSError **)error;
+
+// UNVERIFIED, ON PURPOSE - read this before calling it (same spirit as
+// BundleDoctorInstaller.h's own top-of-file caveat).
+//
+// Creates Library/UnityCache/Shared/<hash1>/<hash2> (mkdir -p) and
+// returns its path, for the case a Lunartique-format mod zip's own
+// embedded hash pair (see LunartiqueModArchive.h) has no existing match
+// under +unityCacheSharedDirectories - i.e. this app's own Unity client
+// has never actually downloaded/cached that bundle from its CDN.
+//
+// hash1/hash2 here are Unity's own Caching-subsystem bucket for a
+// SPECIFIC DOWNLOAD REQUEST, computed and looked up internally by
+// Unity's Caching API at the moment the game itself asks for that
+// bundle's URL - they are not a path this class (or a mod's own zip)
+// gets to freely assign. Writing __data/__info into a manufactured
+// directory at this path does NOT make Unity's Caching subsystem treat
+// it as a real cache hit for anything; there's no guarantee whatsoever
+// that the running game will ever read from a directory it didn't
+// itself create via its own cache-lookup path, since Caching validates
+// entries against internal state it derives from the request itself,
+// not merely "is there a plausibly-shaped folder sitting here." This
+// method is a best-effort placement only - it makes the bytes SIT at
+// the path the zip claims they belong at, nothing more. Treat any
+// caller of this as experimental; if the person confirms after
+// installing that the modded asset isn't actually loading in-game, the
+// resolution is the existing manual document-picker flow
+// (+[BundleDoctorInstaller installDoctoredBundleAtURL:toStockBundleURL:
+// error:] against a stock file the person points at directly), not a
+// retry of this method.
++ (nullable NSString *)synthesizeCacheDirectoryForHash1:(NSString *)hash1 hash2:(NSString *)hash2 error:(NSError **)error;
 
 @end
 

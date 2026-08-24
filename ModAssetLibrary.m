@@ -4,7 +4,15 @@
 #import "BankTransplant.h"
 #import "UnityBundleCAB.h" // isUnityFSBundleAtPath: / primaryCABForBundleAtPath:error: - see +importFileURLs:intoFolder:error: below
 #import "UnityCacheLocator.h" // locateBundlePathForCAB:error: - resolves resolvedInstallTargetPath at import time, see +importFileURLs:intoFolder:error: below
+#import "LunartiqueModArchive.h" // +importLunartiqueZipURL:intoFolder:error: below
 #import "ZTweakLog.h"
+
+// Shown in the Mods panel's Filepath row for a Lunartique-imported
+// bundle whose CAB had no live UnityCache match at import time - see
+// +importLunartiqueZipURL:intoFolder:error: and ModAssetLibraryEntry's
+// own header on zipCacheHash1/zipCacheHash2.
+static NSString * const kMALLunartiqueUnresolvedPlaceholder =
+    @"Not yet cached by the game - filepath will be assigned when this mod is downloaded/installed";
 
 NSString * const ModAssetLibraryErrorDomain = @"ModAssetLibraryErrorDomain";
 static NSString * const kMALManifestFileName = @"manifest.json";
@@ -27,6 +35,8 @@ static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
     d[@"dateAdded"] = self.dateAdded;
     if (self.livePathDescription) d[@"livePathDescription"] = self.livePathDescription;
     if (self.resolvedInstallTargetPath) d[@"resolvedInstallTargetPath"] = self.resolvedInstallTargetPath;
+    if (self.zipCacheHash1) d[@"zipCacheHash1"] = self.zipCacheHash1;
+    if (self.zipCacheHash2) d[@"zipCacheHash2"] = self.zipCacheHash2;
     if (self.remark.length > 0) d[@"remark"] = self.remark; // same "only written when non-default" convention as the rest of this method
     if (self.cachedFromFolder.length > 0) d[@"cachedFromFolder"] = self.cachedFromFolder; // 7 - only set while sitting in "Stored Bundles"
     if (self.isAssetBundle) d[@"isAssetBundle"] = @YES; // only written when true, same "stay compact" convention as the doctor-state fields below
@@ -56,6 +66,8 @@ static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
     e.dateAdded = [d[@"dateAdded"] isKindOfClass:NSString.class] ? d[@"dateAdded"] : @"";
     e.livePathDescription = [d[@"livePathDescription"] isKindOfClass:NSString.class] ? d[@"livePathDescription"] : nil;
     e.resolvedInstallTargetPath = [d[@"resolvedInstallTargetPath"] isKindOfClass:NSString.class] ? d[@"resolvedInstallTargetPath"] : nil; // absent on any manifest row written before this field existed - nil is the correct default (falls back to entry.path for display, manual picker for install)
+    e.zipCacheHash1 = [d[@"zipCacheHash1"] isKindOfClass:NSString.class] ? d[@"zipCacheHash1"] : nil; // Lunartique import only - absent for any other entry
+    e.zipCacheHash2 = [d[@"zipCacheHash2"] isKindOfClass:NSString.class] ? d[@"zipCacheHash2"] : nil;
     e.remark = [d[@"remark"] isKindOfClass:NSString.class] ? d[@"remark"] : nil; // absent on any manifest row written before 3.4 - nil is the correct default (no remark set)
     e.cachedFromFolder = [d[@"cachedFromFolder"] isKindOfClass:NSString.class] ? d[@"cachedFromFolder"] : nil; // 7 - absent for anything never cached
     // Absent entirely on any manifest row written before this field
@@ -457,6 +469,148 @@ static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
 
     if (importedCount == 0) {
         if (error) *error = MALError(ModAssetLibraryErrorCopyFailed, @"No file(s) could be imported - see syslog for per-file errors.");
+        return NO;
+    }
+
+    return [self mal_writeEntries:entries toFolder:folderName error:error];
+}
+
++ (BOOL)importLunartiqueZipURL:(NSURL *)zipURL intoFolder:(NSString *)folderName error:(NSError **)error {
+    NSError *formatErr = nil;
+    NSArray<LunartiqueModEntry *> *matches = [LunartiqueModArchive matchedEntriesInZipAtURL:zipURL error:&formatErr];
+    if (matches.count == 0) {
+        if (error) *error = formatErr ?: MALError(ModAssetLibraryErrorCopyFailed, @"Not a Lunartique-format mod zip.");
+        return NO;
+    }
+
+    NSString *root = [self modLibraryRootDirectory];
+    NSString *folderPath = root ? [root stringByAppendingPathComponent:folderName] : nil;
+    NSFileManager *fm = NSFileManager.defaultManager;
+    BOOL isDir = NO;
+    if (!folderPath || ![fm fileExistsAtPath:folderPath isDirectory:&isDir] || !isDir) {
+        if (error) *error = MALError(ModAssetLibraryErrorFolderNotFound,
+            [NSString stringWithFormat:@"No folder named \"%@\" - create it first.", folderName]);
+        return NO;
+    }
+
+    NSError *entriesErr = nil;
+    NSMutableArray<ModAssetLibraryEntry *> *entries =
+        [([self entriesInFolder:folderName error:&entriesErr] ?: @[]) mutableCopy];
+
+    NSDateFormatter *iso = [NSDateFormatter new];
+    iso.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"];
+    iso.dateFormat = @"yyyy-MM-dd'T'HH:mm:ss'Z'";
+    iso.timeZone = [NSTimeZone timeZoneForSecondsFromGMT:0];
+    NSString *now = [iso stringFromDate:[NSDate date]];
+
+    NSInteger importedCount = 0;
+    for (LunartiqueModEntry *lmaEntry in matches) {
+        NSURL *dataURL = nil, *infoURL = nil;
+        NSError *extractErr = nil;
+        if (![LunartiqueModArchive extractDataForEntry:lmaEntry fromZipAtURL:zipURL dataURL:&dataURL infoURL:&infoURL error:&extractErr]) {
+            ZLog(@"[ModAssetLibrary] couldn't extract %@ from %@: %@", lmaEntry.dataEntryName, zipURL.lastPathComponent, extractErr.localizedDescription);
+            continue;
+        }
+
+        // Not gated on +[UnityBundleCAB isUnityFSBundleAtPath:] the way
+        // +importFileURLs:intoFolder:error: gates a picker file - a
+        // Lunartique __data payload is trusted to already be a bundle
+        // by construction of the format, but the header-bytes check is
+        // still run (rather than assumed) so a malformed/corrupt entry
+        // still gets classified honestly instead of silently claiming
+        // isAssetBundle=YES for something that isn't.
+        BOOL isBundle = [UnityBundleCAB isUnityFSBundleAtPath:dataURL.path];
+
+        NSString *cabID = nil;
+        NSNumber *targetPlatformNumber = nil;
+        NSString *resolvedTargetPath = nil;
+        if (isBundle) {
+            NSError *cabErr = nil;
+            cabID = [UnityBundleCAB primaryCABForBundleAtPath:dataURL.path error:&cabErr];
+            if (cabID.length == 0) {
+                cabID = nil;
+                ZLog(@"[ModAssetLibrary] Lunartique entry %@ has a UnityFS header but its CAB id couldn't be read (%@).",
+                     lmaEntry.dataEntryName, cabErr.localizedDescription);
+            }
+            int32_t platform = 0;
+            NSError *platformErr = nil;
+            if ([UnityBundleCAB targetPlatform:&platform forBundleAtPath:dataURL.path error:&platformErr]) {
+                targetPlatformNumber = @(platform);
+            }
+            if (cabID) {
+                NSError *locateErr = nil;
+                NSString *matchPath = [UnityCacheLocator locateBundlePathForCAB:cabID error:&locateErr];
+                if (matchPath) {
+                    resolvedTargetPath = [self mal_sandboxRelativePath:matchPath];
+                } else {
+                    ZLog(@"[ModAssetLibrary] no cache match yet for Lunartique entry %@'s CAB (%@) - stashing zip hash pair %@/%@ for a best-effort synthesis attempt at install time: %@",
+                         lmaEntry.dataEntryName, cabID, lmaEntry.cacheHash1, lmaEntry.cacheHash2, locateErr.localizedDescription);
+                }
+            }
+        } else {
+            ZLog(@"[ModAssetLibrary] Lunartique entry %@ extracted fine but doesn't look like a UnityFS bundle - importing anyway, flagged unresolved.", lmaEntry.dataEntryName);
+        }
+
+        NSString *destPath = nil;
+        NSString *destName = nil;
+        NSString *cabOrHashFolderName = cabID ?: [NSString stringWithFormat:@"%@-%@", lmaEntry.cacheHash1, lmaEntry.cacheHash2];
+        NSString *subFolderName = [self mal_uniqueFolderNameFor:cabOrHashFolderName inParentFolder:folderPath];
+        NSString *subFolderPath = [folderPath stringByAppendingPathComponent:subFolderName];
+        NSError *mkdirErr = nil;
+        if ([fm createDirectoryAtPath:subFolderPath withIntermediateDirectories:YES attributes:nil error:&mkdirErr]) {
+            destName = @"__data";
+            destPath = [subFolderPath stringByAppendingPathComponent:destName];
+        } else {
+            ZLog(@"[ModAssetLibrary] couldn't create subfolder \"%@\" for Lunartique entry %@: %@ - skipping.",
+                 subFolderName, lmaEntry.dataEntryName, mkdirErr.localizedDescription);
+            continue;
+        }
+
+        NSError *copyErr = nil;
+        BOOL copied = [fm copyItemAtPath:dataURL.path toPath:destPath error:&copyErr];
+        if (!copied) {
+            ZLog(@"[ModAssetLibrary] couldn't copy extracted %@ into \"%@\": %@", lmaEntry.dataEntryName, folderName, copyErr.localizedDescription);
+            continue;
+        }
+
+        // Sibling __info, when the zip had one - kept alongside __data
+        // in this entry's own subfolder (untracked by manifest.json,
+        // same spirit as remark.txt) purely so the install-time
+        // synthesis fallback (see GraphicsDebugOverlay.m's
+        // -gd_doctorInstallUsingKnownTargetForDoctoredURL:...) has the
+        // mod's own __info bytes available to place alongside a
+        // synthesized __data, rather than fabricating one from
+        // scratch. Best-effort - a missing/uncopyable __info here just
+        // means the synthesis fallback later proceeds without one.
+        if (infoURL) {
+            [fm copyItemAtPath:infoURL.path toPath:[subFolderPath stringByAppendingPathComponent:@"__info"] error:nil];
+        }
+
+        NSDictionary<NSFileAttributeKey, id> *attrs = [fm attributesOfItemAtPath:destPath error:nil];
+
+        ModAssetLibraryEntry *entry = [ModAssetLibraryEntry new];
+        entry.fileName = destName;
+        entry.path = destPath;
+        entry.byteSize = attrs.fileSize;
+        entry.dateAdded = now;
+        entry.isAssetBundle = isBundle;
+        entry.cabIdentifier = cabID;
+        entry.targetPlatform = targetPlatformNumber;
+        entry.zipCacheHash1 = lmaEntry.cacheHash1;
+        entry.zipCacheHash2 = lmaEntry.cacheHash2;
+        entry.resolvedInstallTargetPath = resolvedTargetPath;
+        // Per spec: a real cache match still wins and gets its ordinary
+        // livePathDescription treatment (nil here, same as a plain
+        // bundle import - it's populated once actually installed, see
+        // GraphicsDebugOverlay.m). Only the unresolved case gets the
+        // generic placeholder instead of staying nil.
+        entry.livePathDescription = resolvedTargetPath ? nil : kMALLunartiqueUnresolvedPlaceholder;
+        [entries addObject:entry];
+        importedCount++;
+    }
+
+    if (importedCount == 0) {
+        if (error) *error = MALError(ModAssetLibraryErrorCopyFailed, @"No bundle(s) could be extracted from the Lunartique zip - see syslog for per-entry errors.");
         return NO;
     }
 

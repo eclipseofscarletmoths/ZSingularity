@@ -198,6 +198,8 @@
 // -gd_doctorInstallUsingKnownTargetForDoctoredURL:entryPath:inFolder:.
 #import "ModAssetLibrary.h"         // Mods Library accordion (organizational only) - see that file's header
 #import "UnityBundleCAB.h"          // isUnityFSBundleAtPath: - content-based bundle detection for Load Mods' picker handler, see -gd_handleLoadModsPickedURLs:intoFolder:
+#import "LunartiqueModArchive.h"    // Lunartique-format zip detection - see -gd_handleLoadModsPickedZipURLs:intoFolder:summaryLines:
+#import "UnityCacheLocator.h"       // +synthesizeCacheDirectoryForHash1:hash2:error: - see -gd_doctorInstallUsingKnownTargetForDoctoredURL:entryPath:inFolder:
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h> // UTType-based UIDocumentPickerViewController init, for the Mods section's "Import Bank Mod" button
 
 #import "GDEmbeddedFont.h" // kExcelsiorSansTTF / kExcelsiorSansTTFLength - see that file's header
@@ -5929,15 +5931,51 @@ static const CGFloat kContentFadeHeight = 22;
 // hang item 7 reported. Left OFF this file's classification loop
 // itself: that's just the cheap header sniff, not worth a spinner of
 // its own.
+// Lunartique-format zip handling (see LunartiqueModArchive.h) - split
+// out of the main loop below because a matching zip is imported via
+// its own +[ModAssetLibrary importLunartiqueZipURL:intoFolder:error:]
+// path (extracts __data internally) rather than being handed to
+// +importFileURLs:intoFolder:error: like an ordinary picked file, and a
+// NON-matching zip is rejected outright per the person's own spec
+// ("only those that roughly match the sample zip's file tree, if
+// there's no match, reject the zip") rather than falling through to
+// the "not a recognized bank or bundle" summary line every other
+// unrecognized file gets.
+- (void)gd_handleLoadModsPickedZipURLs:(NSArray<NSURL *> *)zipURLs intoFolder:(NSString *)folderName summaryLines:(NSMutableArray<NSString *> *)summaryLines {
+    for (NSURL *zipURL in zipURLs) {
+        BOOL accessing = [zipURL startAccessingSecurityScopedResource];
+        NSError *formatErr = nil;
+        BOOL isLunartique = [LunartiqueModArchive isLunartiqueFormatZipAtURL:zipURL error:&formatErr];
+        if (!isLunartique) {
+            if (accessing) [zipURL stopAccessingSecurityScopedResource];
+            [summaryLines addObject:[NSString stringWithFormat:@"%@: rejected - doesn't match the Lunartique mod format's file tree", zipURL.lastPathComponent]];
+            continue;
+        }
+
+        NSError *importErr = nil;
+        BOOL imported = [ModAssetLibrary importLunartiqueZipURL:zipURL intoFolder:folderName error:&importErr];
+        if (accessing) [zipURL stopAccessingSecurityScopedResource];
+
+        if (imported) {
+            [summaryLines addObject:[NSString stringWithFormat:@"%@: Lunartique mod imported - tap Dispatch when ready to send it for processing", zipURL.lastPathComponent]];
+        } else {
+            [summaryLines addObject:[NSString stringWithFormat:@"%@: Lunartique format matched, but import failed - %@", zipURL.lastPathComponent, importErr.localizedDescription ?: @"unknown error"]];
+        }
+    }
+}
+
 - (void)gd_handleLoadModsPickedURLs:(NSArray<NSURL *> *)urls intoFolder:(NSString *)folderName {
     if (urls.count == 0) return;
 
     NSMutableArray<NSURL *> *validURLs = [NSMutableArray array];
     NSMutableArray<NSURL *> *bankURLs = [NSMutableArray array];
+    NSMutableArray<NSURL *> *zipURLs = [NSMutableArray array];
     NSMutableArray<NSString *> *summaryLines = [NSMutableArray array];
 
     for (NSURL *url in urls) {
-        if ([url.pathExtension caseInsensitiveCompare:@"bank"] == NSOrderedSame) {
+        if ([url.pathExtension caseInsensitiveCompare:@"zip"] == NSOrderedSame) {
+            [zipURLs addObject:url];
+        } else if ([url.pathExtension caseInsensitiveCompare:@"bank"] == NSOrderedSame) {
             [bankURLs addObject:url];
             [validURLs addObject:url];
         } else if ([self gd_isRecognizedBundleURL:url]) {
@@ -5962,7 +6000,7 @@ static const CGFloat kContentFadeHeight = 22;
 
     self.loadModsSummaryLines = summaryLines;
 
-    if (validURLs.count == 0) {
+    if (validURLs.count == 0 && zipURLs.count == 0) {
         [self gd_processLoadModsBankURLs:bankURLs];
         return;
     }
@@ -5983,15 +6021,21 @@ static const CGFloat kContentFadeHeight = 22;
 
     __weak typeof(self) weakSelf = self;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
-        NSError *importError = nil;
-        BOOL imported = [ModAssetLibrary importFileURLs:validURLs intoFolder:folderName error:&importError];
-        if (!imported) {
-            ZLog(@"[Mods] couldn't add picked files to Mod Asset Library folder \"%@\": %@", folderName, importError);
+        if (validURLs.count > 0) {
+            NSError *importError = nil;
+            BOOL imported = [ModAssetLibrary importFileURLs:validURLs intoFolder:folderName error:&importError];
+            if (!imported) {
+                ZLog(@"[Mods] couldn't add picked files to Mod Asset Library folder \"%@\": %@", folderName, importError);
+            }
+        }
+        if (zipURLs.count > 0) {
+            [self gd_handleLoadModsPickedZipURLs:zipURLs intoFolder:folderName summaryLines:summaryLines];
         }
 
         dispatch_async(dispatch_get_main_queue(), ^{
             typeof(self) strongSelf = weakSelf;
             if (!strongSelf) return;
+            strongSelf.loadModsSummaryLines = summaryLines; // zip lines were appended off-main above
             void (^afterDismiss)(void) = ^{
                 [strongSelf gd_rebuildModsLibrary];
                 [strongSelf gd_processLoadModsBankURLs:bankURLs];
@@ -8649,6 +8693,37 @@ static NSURL *gd_mods_live_stock_url_for_entry(ModAssetLibraryEntry *entry) {
         NSString *absolute = [NSHomeDirectory() stringByAppendingPathComponent:relativeTarget];
         [self gd_doctorInstallDoctoredURL:doctoredURL toStockBundleURL:[NSURL fileURLWithPath:absolute] entryPath:entryPath inFolder:folderName];
         return;
+    }
+
+    // Lunartique best-effort fallback (see +[UnityCacheLocator
+    // synthesizeCacheDirectoryForHash1:hash2:error:]'s own header
+    // caveat - this is unverified, not a guaranteed working install) -
+    // only attempted for an entry that actually came from a Lunartique
+    // zip import (zipCacheHash1/2 non-nil); an ordinary bundle import
+    // with no cache match still falls straight to the manual picker
+    // below, same as before this fallback existed.
+    if (entry.zipCacheHash1.length > 0 && entry.zipCacheHash2.length > 0) {
+        NSError *synthErr = nil;
+        NSString *synthDir = [UnityCacheLocator synthesizeCacheDirectoryForHash1:entry.zipCacheHash1 hash2:entry.zipCacheHash2 error:&synthErr];
+        if (synthDir) {
+            NSString *synthDataPath = [synthDir stringByAppendingPathComponent:@"__data"];
+            // Carry over the mod's own __info sidecar, when this entry's
+            // Lunartique import stashed one alongside its library copy -
+            // see +[ModAssetLibrary importLunartiqueZipURL:intoFolder:
+            // error:]. Best-effort: a missing/uncopyable __info doesn't
+            // block the install itself, only the synthesized directory
+            // ends up without one.
+            NSString *storedInfoPath = [entryPath.stringByDeletingLastPathComponent stringByAppendingPathComponent:@"__info"];
+            if ([NSFileManager.defaultManager fileExistsAtPath:storedInfoPath]) {
+                [NSFileManager.defaultManager copyItemAtPath:storedInfoPath toPath:[synthDir stringByAppendingPathComponent:@"__info"] error:nil];
+            }
+            ZLog(@"[Mods Library] no import-time cache match for %@ - using SYNTHESIZED (unverified) target %@ from its Lunartique zip hash pair.",
+                 entryPath.lastPathComponent, synthDataPath);
+            [self gd_doctorInstallDoctoredURL:doctoredURL toStockBundleURL:[NSURL fileURLWithPath:synthDataPath] entryPath:entryPath inFolder:folderName];
+            return;
+        }
+        ZLog(@"[Mods Library] Lunartique cache-directory synthesis failed for %@: %@ - falling back to the manual picker.",
+             entryPath.lastPathComponent, synthErr.localizedDescription);
     }
 
     ZLog(@"[Mods Library] no import-time cache match on file for %@ - falling back to the manual picker.", entryPath.lastPathComponent);
