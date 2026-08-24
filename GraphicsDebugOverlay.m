@@ -426,7 +426,15 @@ static void gd_configure_glass_corners(UIView *view, CGFloat radius, BOOL concen
 //      takes its radius from -background.cornerRadius verbatim, instead of
 //      Capsule (glassButtonConfiguration's default), a system Large/Medium/
 //      Small constant, or Dynamic's type-size-scaled radius.
-//   2. configuration.background.cornerRadius = radius.
+//   2. configuration.background.cornerRadius = radius - and then write that
+//      mutated background back onto configuration via -setBackground:,
+//      since -background hands back a copy the same way -configuration
+//      does one level up (see 3 below) - mutating the fetched copy alone
+//      silently goes nowhere. Missing this exact step was, for a while,
+//      the reason this whole function looked like it worked (cornerStyle
+//      is a direct property on configuration, so Fixed's square-ish shape
+//      showed up) while the radius argument was quietly ignored no matter
+//      what was passed in.
 //   3. Write the mutated configuration back via -setConfiguration: so
 //      UIButton actually picks up the change - configuration structs/objects
 //      obtained via the getter are not observed in place.
@@ -464,6 +472,24 @@ static void gd_configure_glass_button_fixed_corner_radius(UIButton *button, CGFl
         SEL setCornerRadius = NSSelectorFromString(@"setCornerRadius:");
         if (background && [background respondsToSelector:setCornerRadius]) {
             ((void (*)(id, SEL, CGFloat))objc_msgSend)(background, setCornerRadius, radius);
+
+            // UIBackgroundConfiguration is a value-style config object -
+            // -background hands back a copy, not the live instance
+            // `configuration` holds internally. Mutating that copy (just
+            // above) silently goes nowhere unless it's explicitly written
+            // back via -setBackground: before -setConfiguration: below.
+            // This was the actual reason changing kGDAuthFieldCornerRadius
+            // had zero visible effect: -setCornerStyle: above IS a direct
+            // property on `configuration` so it took effect fine (that's
+            // why Fixed's square-ish shape showed up at all), but the
+            // radius value on the *background* was being thrown away every
+            // time, leaving whatever default radius Fixed falls back to
+            // with no custom background - no matter what this function
+            // was asked for.
+            SEL setBackground = NSSelectorFromString(@"setBackground:");
+            if ([configuration respondsToSelector:setBackground]) {
+                ((void (*)(id, SEL, id))objc_msgSend)(configuration, setBackground, background);
+            }
         }
     }
 
