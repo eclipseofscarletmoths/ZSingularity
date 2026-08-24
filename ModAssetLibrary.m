@@ -7,12 +7,15 @@
 #import "LunartiqueModArchive.h" // +importLunartiqueZipURL:intoFolder:error: below
 #import "ZTweakLog.h"
 
-// Shown in the Mods panel's Filepath row for a Lunartique-imported
-// bundle whose CAB had no live UnityCache match at import time - see
-// +importLunartiqueZipURL:intoFolder:error: and ModAssetLibraryEntry's
-// own header on zipCacheHash1/zipCacheHash2.
-static NSString * const kMALLunartiqueUnresolvedPlaceholder =
-    @"Not yet cached by the game - filepath will be assigned when this mod is downloaded/installed";
+// Formerly shown in the Mods panel's Filepath row for a Lunartique-
+// imported bundle whose CAB had no live UnityCache match at import
+// time. As of the "reject outright" CAB-index gate (see
+// +importFileURLs:intoFolder:rejectedFileLines:error: and
+// +importLunartiqueZipURL:intoFolder:rejectedEntryLines:error: below),
+// nothing newly imported ever reaches this state - an entry imported
+// before that change may still literally contain this exact string in
+// its on-disk manifest.json, which is why it's not being retroactively
+// rewritten, but no code needs to reference the string itself anymore.
 
 NSString * const ModAssetLibraryErrorDomain = @"ModAssetLibraryErrorDomain";
 static NSString * const kMALManifestFileName = @"manifest.json";
@@ -338,7 +341,20 @@ static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
     return [self mal_libraryRelativePath:path];
 }
 
-+ (BOOL)importFileURLs:(NSArray<NSURL *> *)moddedURLs intoFolder:(NSString *)folderName error:(NSError **)error {
+// Shared wording for a bundle rejected outright over its CAB - kept in
+// one place so +importFileURLs:intoFolder:rejectedFileLines:error: and
+// +importLunartiqueZipURL:intoFolder:rejectedEntryLines:error: never
+// drift apart on what the popup actually says (see
+// GraphicsDebugOverlay.m's own final summary alert, which is just these
+// lines joined and shown as-is).
+static NSString *MALCABRejectionLine(NSString *displayName) {
+    return [NSString stringWithFormat:@"%@: rejected - its CAB identifier could not be found, meaning it's either malformed or outdated", displayName];
+}
+
++ (BOOL)importFileURLs:(NSArray<NSURL *> *)moddedURLs
+             intoFolder:(NSString *)folderName
+        rejectedFileLines:(NSArray<NSString *> * _Nullable * _Nullable)rejectedFileLines
+                  error:(NSError **)error {
     NSString *root = [self modLibraryRootDirectory];
     NSString *folderPath = [root stringByAppendingPathComponent:folderName];
     NSFileManager *fm = NSFileManager.defaultManager;
@@ -359,6 +375,7 @@ static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
     iso.timeZone = [NSTimeZone timeZoneForSecondsFromGMT:0];
     NSString *now = [iso stringFromDate:[NSDate date]];
 
+    NSMutableArray<NSString *> *rejectedLines = [NSMutableArray array];
     NSInteger importedCount = 0;
     for (NSURL *url in moddedURLs) {
         BOOL accessing = [url startAccessingSecurityScopedResource];
@@ -381,8 +398,11 @@ static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
             cabID = [UnityBundleCAB primaryCABForBundleAtPath:url.path error:&cabErr];
             if (cabID.length == 0) {
                 cabID = nil;
-                ZLog(@"[ModAssetLibrary] %@ has a UnityFS header but its CAB id couldn't be read (%@).",
+                ZLog(@"[ModAssetLibrary] %@ has a UnityFS header but its CAB id couldn't be read (%@) - rejecting.",
                      url.lastPathComponent, cabErr.localizedDescription);
+                if (accessing) [url stopAccessingSecurityScopedResource];
+                [rejectedLines addObject:MALCABRejectionLine(url.lastPathComponent)];
+                continue;
             }
             int32_t platform = 0;
             NSError *platformErr = nil;
@@ -393,27 +413,26 @@ static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
                      url.lastPathComponent, platformErr.localizedDescription);
             }
 
-            // 7 - resolved HERE, once, at import time, rather than only
-            // once a doctor download is ready to install (previously a
-            // 2nd indexing pass over the same CAB - see
-            // ModAssetLibraryEntry.resolvedInstallTargetPath's own header
-            // for why this is a separate field from livePathDescription).
-            // This whole method already has to run off the main thread
-            // for the CAB/platform reads above (see this method's own
-            // caller, -gd_handleLoadModsPickedURLs:intoFolder: in
-            // GraphicsDebugOverlay.m), so adding this search here costs
-            // nothing further hang-risk-wise - it's the exact same search
-            // +[UnityCacheLocator locateBundlePathForCAB:error:] always
-            // did, just moved earlier rather than run twice.
-            if (cabID) {
-                NSError *locateErr = nil;
-                NSString *matchPath = [UnityCacheLocator locateBundlePathForCAB:cabID error:&locateErr];
-                if (matchPath) {
-                    resolvedTargetPath = [self mal_sandboxRelativePath:matchPath];
-                } else {
-                    ZLog(@"[ModAssetLibrary] no cache match yet for %@'s CAB (%@) - Filepath/install will fall back to the manual picker until one's found: %@",
-                         url.lastPathComponent, cabID, locateErr.localizedDescription);
-                }
+            // 2 - reads from GDFileIndex.h's own index (via
+            // +[UnityCacheLocator locateBundlePathForCAB:error:], which
+            // prefers that index and only live-scans if it hasn't been
+            // built yet this session) rather than a scan of its own -
+            // see this class's own +importFileURLs:...'s header comment.
+            // A miss here used to leave resolvedTargetPath nil and fall
+            // back to the manual picker at install time; per the
+            // person's own spec this is now a hard rejection instead -
+            // resolved HERE, once, at import time, same as before, just
+            // no longer optional.
+            NSError *locateErr = nil;
+            NSString *matchPath = [UnityCacheLocator locateBundlePathForCAB:cabID error:&locateErr];
+            if (matchPath) {
+                resolvedTargetPath = [self mal_sandboxRelativePath:matchPath];
+            } else {
+                ZLog(@"[ModAssetLibrary] no index match for %@'s CAB (%@) - rejecting: %@",
+                     url.lastPathComponent, cabID, locateErr.localizedDescription);
+                if (accessing) [url stopAccessingSecurityScopedResource];
+                [rejectedLines addObject:MALCABRejectionLine(url.lastPathComponent)];
+                continue;
             }
         }
 
@@ -467,15 +486,24 @@ static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
         importedCount++;
     }
 
+    if (rejectedFileLines) *rejectedFileLines = rejectedLines.count > 0 ? [rejectedLines copy] : nil;
+
     if (importedCount == 0) {
-        if (error) *error = MALError(ModAssetLibraryErrorCopyFailed, @"No file(s) could be imported - see syslog for per-file errors.");
+        if (error) {
+            *error = rejectedLines.count > 0
+                ? MALError(ModAssetLibraryErrorCABNotIndexed, @"Every file was rejected - see rejectedFileLines for per-file reasons.")
+                : MALError(ModAssetLibraryErrorCopyFailed, @"No file(s) could be imported - see syslog for per-file errors.");
+        }
         return NO;
     }
 
     return [self mal_writeEntries:entries toFolder:folderName error:error];
 }
 
-+ (BOOL)importLunartiqueZipURL:(NSURL *)zipURL intoFolder:(NSString *)folderName error:(NSError **)error {
++ (BOOL)importLunartiqueZipURL:(NSURL *)zipURL
+                    intoFolder:(NSString *)folderName
+             rejectedEntryLines:(NSArray<NSString *> * _Nullable * _Nullable)rejectedEntryLines
+                         error:(NSError **)error {
     NSError *formatErr = nil;
     NSArray<LunartiqueModEntry *> *matches = [LunartiqueModArchive matchedEntriesInZipAtURL:zipURL error:&formatErr];
     if (matches.count == 0) {
@@ -503,6 +531,7 @@ static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
     iso.timeZone = [NSTimeZone timeZoneForSecondsFromGMT:0];
     NSString *now = [iso stringFromDate:[NSDate date]];
 
+    NSMutableArray<NSString *> *rejectedLines = [NSMutableArray array];
     NSInteger importedCount = 0;
     for (LunartiqueModEntry *lmaEntry in matches) {
         NSURL *dataURL = nil, *infoURL = nil;
@@ -513,48 +542,58 @@ static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
         }
 
         // Not gated on +[UnityBundleCAB isUnityFSBundleAtPath:] the way
-        // +importFileURLs:intoFolder:error: gates a picker file - a
-        // Lunartique __data payload is trusted to already be a bundle
-        // by construction of the format, but the header-bytes check is
-        // still run (rather than assumed) so a malformed/corrupt entry
-        // still gets classified honestly instead of silently claiming
-        // isAssetBundle=YES for something that isn't.
+        // +importFileURLs:intoFolder:rejectedFileLines:error: gates a
+        // picker file - a Lunartique __data payload is trusted to
+        // already be a bundle by construction of the format, but the
+        // header-bytes check is still run (rather than assumed) so a
+        // malformed/corrupt entry still gets classified honestly instead
+        // of silently claiming isAssetBundle=YES for something that
+        // isn't. As of the person's own "reject outright" spec, failing
+        // this check is now itself a rejection (see this method's own
+        // header) rather than an import with isAssetBundle=NO.
         BOOL isBundle = [UnityBundleCAB isUnityFSBundleAtPath:dataURL.path];
-
-        NSString *cabID = nil;
-        NSNumber *targetPlatformNumber = nil;
-        NSString *resolvedTargetPath = nil;
-        if (isBundle) {
-            NSError *cabErr = nil;
-            cabID = [UnityBundleCAB primaryCABForBundleAtPath:dataURL.path error:&cabErr];
-            if (cabID.length == 0) {
-                cabID = nil;
-                ZLog(@"[ModAssetLibrary] Lunartique entry %@ has a UnityFS header but its CAB id couldn't be read (%@).",
-                     lmaEntry.dataEntryName, cabErr.localizedDescription);
-            }
-            int32_t platform = 0;
-            NSError *platformErr = nil;
-            if ([UnityBundleCAB targetPlatform:&platform forBundleAtPath:dataURL.path error:&platformErr]) {
-                targetPlatformNumber = @(platform);
-            }
-            if (cabID) {
-                NSError *locateErr = nil;
-                NSString *matchPath = [UnityCacheLocator locateBundlePathForCAB:cabID error:&locateErr];
-                if (matchPath) {
-                    resolvedTargetPath = [self mal_sandboxRelativePath:matchPath];
-                } else {
-                    ZLog(@"[ModAssetLibrary] no cache match yet for Lunartique entry %@'s CAB (%@) - stashing zip hash pair %@/%@ for a best-effort synthesis attempt at install time: %@",
-                         lmaEntry.dataEntryName, cabID, lmaEntry.cacheHash1, lmaEntry.cacheHash2, locateErr.localizedDescription);
-                }
-            }
-        } else {
-            ZLog(@"[ModAssetLibrary] Lunartique entry %@ extracted fine but doesn't look like a UnityFS bundle - importing anyway, flagged unresolved.", lmaEntry.dataEntryName);
+        if (!isBundle) {
+            ZLog(@"[ModAssetLibrary] Lunartique entry %@ extracted fine but doesn't look like a UnityFS bundle - rejecting.", lmaEntry.dataEntryName);
+            [rejectedLines addObject:MALCABRejectionLine(lmaEntry.dataEntryName)];
+            continue;
         }
+
+        NSError *cabErr = nil;
+        NSString *cabID = [UnityBundleCAB primaryCABForBundleAtPath:dataURL.path error:&cabErr];
+        if (cabID.length == 0) {
+            ZLog(@"[ModAssetLibrary] Lunartique entry %@ has a UnityFS header but its CAB id couldn't be read (%@) - rejecting.",
+                 lmaEntry.dataEntryName, cabErr.localizedDescription);
+            [rejectedLines addObject:MALCABRejectionLine(lmaEntry.dataEntryName)];
+            continue;
+        }
+        int32_t platform = 0;
+        NSError *platformErr = nil;
+        NSNumber *targetPlatformNumber = nil;
+        if ([UnityBundleCAB targetPlatform:&platform forBundleAtPath:dataURL.path error:&platformErr]) {
+            targetPlatformNumber = @(platform);
+        }
+
+        // 2 - reads from GDFileIndex.h's own index the same way
+        // +importFileURLs:intoFolder:rejectedFileLines:error: does - see
+        // that method's own comment. A miss here used to stash
+        // lmaEntry.cacheHash1/cacheHash2 for a best-effort synthesis
+        // attempt at install time and import anyway, flagged unresolved;
+        // per the person's own spec this is now a hard rejection instead.
+        NSError *locateErr = nil;
+        NSString *matchPath = [UnityCacheLocator locateBundlePathForCAB:cabID error:&locateErr];
+        if (!matchPath) {
+            ZLog(@"[ModAssetLibrary] no index match for Lunartique entry %@'s CAB (%@) - rejecting: %@",
+                 lmaEntry.dataEntryName, cabID, locateErr.localizedDescription);
+            [rejectedLines addObject:MALCABRejectionLine(lmaEntry.dataEntryName)];
+            continue;
+        }
+        NSString *resolvedTargetPath = [self mal_sandboxRelativePath:matchPath];
 
         NSString *destPath = nil;
         NSString *destName = nil;
-        NSString *cabOrHashFolderName = cabID ?: [NSString stringWithFormat:@"%@-%@", lmaEntry.cacheHash1, lmaEntry.cacheHash2];
-        NSString *subFolderName = [self mal_uniqueFolderNameFor:cabOrHashFolderName inParentFolder:folderPath];
+        // cabID is guaranteed non-nil past the rejection checks above -
+        // no hash-pair fallback name needed here anymore.
+        NSString *subFolderName = [self mal_uniqueFolderNameFor:cabID inParentFolder:folderPath];
         NSString *subFolderPath = [folderPath stringByAppendingPathComponent:subFolderName];
         NSError *mkdirErr = nil;
         if ([fm createDirectoryAtPath:subFolderPath withIntermediateDirectories:YES attributes:nil error:&mkdirErr]) {
@@ -599,18 +638,25 @@ static NSError *MALError(ModAssetLibraryErrorCode code, NSString *message) {
         entry.zipCacheHash1 = lmaEntry.cacheHash1;
         entry.zipCacheHash2 = lmaEntry.cacheHash2;
         entry.resolvedInstallTargetPath = resolvedTargetPath;
-        // Per spec: a real cache match still wins and gets its ordinary
-        // livePathDescription treatment (nil here, same as a plain
-        // bundle import - it's populated once actually installed, see
-        // GraphicsDebugOverlay.m). Only the unresolved case gets the
-        // generic placeholder instead of staying nil.
-        entry.livePathDescription = resolvedTargetPath ? nil : kMALLunartiqueUnresolvedPlaceholder;
+        // resolvedTargetPath is guaranteed non-nil past the rejection
+        // checks above, so this always gets the ordinary (nil)
+        // livePathDescription treatment now - same as a plain bundle
+        // import, populated once actually installed (see
+        // GraphicsDebugOverlay.m). kMALLunartiqueUnresolvedPlaceholder
+        // no longer gets set on anything newly imported here.
+        entry.livePathDescription = nil;
         [entries addObject:entry];
         importedCount++;
     }
 
+    if (rejectedEntryLines) *rejectedEntryLines = rejectedLines.count > 0 ? [rejectedLines copy] : nil;
+
     if (importedCount == 0) {
-        if (error) *error = MALError(ModAssetLibraryErrorCopyFailed, @"No bundle(s) could be extracted from the Lunartique zip - see syslog for per-entry errors.");
+        if (error) {
+            *error = rejectedLines.count > 0
+                ? MALError(ModAssetLibraryErrorCABNotIndexed, @"Every bundle in the Lunartique zip was rejected - see rejectedEntryLines for per-entry reasons.")
+                : MALError(ModAssetLibraryErrorCopyFailed, @"No bundle(s) could be extracted from the Lunartique zip - see syslog for per-entry errors.");
+        }
         return NO;
     }
 

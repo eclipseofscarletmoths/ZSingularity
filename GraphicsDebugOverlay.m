@@ -200,6 +200,7 @@
 #import "UnityBundleCAB.h"          // isUnityFSBundleAtPath: - content-based bundle detection for Load Mods' picker handler, see -gd_handleLoadModsPickedURLs:intoFolder:
 #import "LunartiqueModArchive.h"    // Lunartique-format zip detection - see -gd_handleLoadModsPickedZipURLs:intoFolder:summaryLines:
 #import "UnityCacheLocator.h"       // +synthesizeCacheDirectoryForHash1:hash2:error: - see -gd_doctorInstallUsingKnownTargetForDoctoredURL:entryPath:inFolder:
+#import "GDFileIndex.h"             // +forceReindex - Config section's "Manually Index Files" button, see -manuallyIndexFilesTapped below
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h> // UTType-based UIDocumentPickerViewController init, for the Mods section's "Import Bank Mod" button
 
 #import "GDEmbeddedFont.h" // kExcelsiorSansTTF / kExcelsiorSansTTFLength - see that file's header
@@ -5489,6 +5490,21 @@ static const CGFloat kContentFadeHeight = 22;
     [lz4hcRow.toggle addTarget:self action:@selector(lz4hcCompressionDisableChanged:) forControlEvents:UIControlEventValueChanged];
     [self.stack addArrangedSubview:lz4hcRow];
 
+    // Manually Index Files - full-width, non-destructive, so no
+    // hold-to-confirm (unlike Hard Assets Reset/Delete Stored Bundles in
+    // Proxy just below). Forces +[GDFileIndex forceReindex] to run right
+    // now rather than waiting on +ensureIndexUpToDate's own fingerprint
+    // short-circuit (see that method's header) - the CAB-index gate the
+    // Mods import path now rejects files against (see ModAssetLibrary.h)
+    // is only ever as fresh as the last time this ran, so this is the
+    // person's own manual escape hatch for "I just changed something
+    // under UnityCache/Shared or the FMOD builds folder and don't want
+    // to wait for a relaunch to pick it up."
+    GDRow *manualIndexRow = gd_make_single_button_row(@"Manually Index Files", [UIColor colorWithRed:0.42 green:0.62 blue:1.0 alpha:1.0]);
+    UIButton *manualIndexButton = objc_getAssociatedObject(manualIndexRow, "gd_button");
+    [manualIndexButton addTarget:self action:@selector(manuallyIndexFilesTapped) forControlEvents:UIControlEventTouchUpInside];
+    [self.stack addArrangedSubview:manualIndexRow];
+
     GDRow *configRow = gd_make_button_pair_row(
         @"Reset Settings", [UIColor colorWithRed:1.0 green:0.42 blue:0.42 alpha:1.0],
         @"Reapply Settings", [UIColor colorWithRed:0.42 green:0.62 blue:1.0 alpha:1.0]);
@@ -5621,6 +5637,52 @@ static const CGFloat kContentFadeHeight = 22;
 
     UIImpactFeedbackGenerator *haptic = [[UIImpactFeedbackGenerator alloc] initWithStyle:UIImpactFeedbackStyleLight];
     [haptic impactOccurred];
+}
+
+#pragma mark Config (Manually Index Files)
+
+// Forces +[GDFileIndex forceReindex] right now, off-main behind the same
+// "Indexing…" spinner shape -gd_handleLoadModsPickedURLs:intoFolder:
+// already presents for the automatic pass at import time - this is a
+// real UnityCache/Shared walk-plus-CAB-parse, same cost, just triggered
+// by hand instead of implicitly. No hold-to-confirm: unlike Hard Assets
+// Reset/Delete Stored Bundles in Proxy this touches nothing but this
+// tweak's own cached index, and re-running it is always safe.
+- (void)manuallyIndexFilesTapped {
+    UIViewController *presenter = gd_key_window().rootViewController;
+    UIAlertController *indexing = [UIAlertController alertControllerWithTitle:@"Indexing\u2026"
+                                                                        message:@"Reading bundle identifiers and matching them against the game's cache."
+                                                                 preferredStyle:UIAlertControllerStyleAlert];
+    UIActivityIndicatorView *spinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
+    spinner.translatesAutoresizingMaskIntoConstraints = NO;
+    [indexing.view addSubview:spinner];
+    [spinner startAnimating];
+    [NSLayoutConstraint activateConstraints:@[
+        [spinner.centerXAnchor constraintEqualToAnchor:indexing.view.centerXAnchor],
+        [spinner.bottomAnchor constraintEqualToAnchor:indexing.view.bottomAnchor constant:-16],
+    ]];
+    if (presenter) [presenter presentViewController:indexing animated:YES completion:nil];
+
+    __weak typeof(self) weakSelf = self;
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+        [GDFileIndex forceReindex];
+
+        dispatch_async(dispatch_get_main_queue(), ^{
+            typeof(self) strongSelf = weakSelf;
+            if (!strongSelf) return;
+            UINotificationFeedbackGenerator *haptic = [UINotificationFeedbackGenerator new];
+            [haptic notificationOccurred:UINotificationFeedbackTypeSuccess];
+            void (^afterDismiss)(void) = ^{
+                [strongSelf gd_presentModsAlertWithTitle:@"Manually Index Files"
+                                                  message:@"File index rebuilt."];
+            };
+            if (indexing.presentingViewController) {
+                [indexing dismissViewControllerAnimated:YES completion:afterDismiss];
+            } else {
+                afterDismiss();
+            }
+        });
+    });
 }
 
 #pragma mark Config (Hard Assets Reset)
@@ -5953,12 +6015,23 @@ static const CGFloat kContentFadeHeight = 22;
         }
 
         NSError *importErr = nil;
-        BOOL imported = [ModAssetLibrary importLunartiqueZipURL:zipURL intoFolder:folderName error:&importErr];
+        NSArray<NSString *> *rejectedEntryLines = nil;
+        BOOL imported = [ModAssetLibrary importLunartiqueZipURL:zipURL intoFolder:folderName rejectedEntryLines:&rejectedEntryLines error:&importErr];
         if (accessing) [zipURL stopAccessingSecurityScopedResource];
+
+        // Per-entry CAB-index rejections (see ModAssetLibrary.h) get
+        // their own line each regardless of whether the zip as a whole
+        // is reported as imported or failed below - a multi-entry zip
+        // can have some entries rejected and others still land fine.
+        if (rejectedEntryLines.count > 0) {
+            [summaryLines addObjectsFromArray:rejectedEntryLines];
+        }
 
         if (imported) {
             [summaryLines addObject:[NSString stringWithFormat:@"%@: Lunartique mod imported - tap Dispatch when ready to send it for processing", zipURL.lastPathComponent]];
-        } else {
+        } else if (rejectedEntryLines.count == 0) {
+            // Only add a generic failure line when nothing more specific
+            // (a per-entry rejection line above) already explains why.
             [summaryLines addObject:[NSString stringWithFormat:@"%@: Lunartique format matched, but import failed - %@", zipURL.lastPathComponent, importErr.localizedDescription ?: @"unknown error"]];
         }
     }
@@ -6023,9 +6096,27 @@ static const CGFloat kContentFadeHeight = 22;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         if (validURLs.count > 0) {
             NSError *importError = nil;
-            BOOL imported = [ModAssetLibrary importFileURLs:validURLs intoFolder:folderName error:&importError];
-            if (!imported) {
+            NSArray<NSString *> *rejectedFileLines = nil;
+            BOOL imported = [ModAssetLibrary importFileURLs:validURLs intoFolder:folderName rejectedFileLines:&rejectedFileLines error:&importError];
+            if (!imported && rejectedFileLines.count == 0) {
                 ZLog(@"[Mods] couldn't add picked files to Mod Asset Library folder \"%@\": %@", folderName, importError);
+            }
+            // Each rejected file already has its own optimistic "added
+            // to Mods Library" line queued above (classification ran
+            // before this import call actually resolved anything) - swap
+            // that out for the real per-file rejection reason so the
+            // final popup doesn't claim success for a file that got
+            // turned away.
+            for (NSString *rejectedLine in rejectedFileLines) {
+                NSString *rejectedFileName = [[rejectedLine componentsSeparatedByString:@": rejected"] firstObject];
+                NSUInteger existingIdx = [summaryLines indexOfObjectPassingTest:^BOOL(NSString *line, NSUInteger idx, BOOL *stop) {
+                    return [line hasPrefix:[rejectedFileName stringByAppendingString:@": "]];
+                }];
+                if (existingIdx != NSNotFound) {
+                    summaryLines[existingIdx] = rejectedLine;
+                } else {
+                    [summaryLines addObject:rejectedLine];
+                }
             }
         }
         if (zipURLs.count > 0) {
@@ -7531,7 +7622,8 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
     __weak typeof(self) weakSelf = self;
     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
         NSError *importError = nil;
-        BOOL imported = [ModAssetLibrary importFileURLs:@[bundleURL] intoFolder:folderName error:&importError];
+        NSArray<NSString *> *rejectedFileLines = nil;
+        BOOL imported = [ModAssetLibrary importFileURLs:@[bundleURL] intoFolder:folderName rejectedFileLines:&rejectedFileLines error:&importError];
 
         dispatch_async(dispatch_get_main_queue(), ^{
             typeof(self) strongSelf = weakSelf;
@@ -7540,8 +7632,14 @@ static const NSTimeInterval kDoctorPollInterval = 6.0; // person's own spec: "po
                 [strongSelf.processedBundleInstallInFlight removeObject:release.tagName];
                 UINotificationFeedbackGenerator *errHaptic = [UINotificationFeedbackGenerator new];
                 [errHaptic notificationOccurred:UINotificationFeedbackTypeError];
+                // A CAB-index rejection (see ModAssetLibrary.h) means the
+                // doctor pipeline just produced a bundle whose CAB isn't
+                // one this device's own cache actually has right now -
+                // surface the specific per-file reason instead of the
+                // generic error when that's what happened.
+                NSString *failureMessage = rejectedFileLines.firstObject ?: (importError.localizedDescription ?: @"Unknown error.");
                 [strongSelf gd_presentModsAlertWithTitle:@"Import Failed"
-                                                  message:importError.localizedDescription ?: @"Unknown error."];
+                                                  message:failureMessage];
                 [strongSelf gd_rebuildModsLibrary];
                 return;
             }

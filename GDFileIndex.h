@@ -66,6 +66,23 @@ NS_ASSUME_NONNULL_BEGIN
 // of its own.
 + (void)ensureIndexUpToDate;
 
+// Unconditionally re-runs the expensive per-file CAB-parsing pass over
+// both folders and overwrites the saved index in
+// GraphicsDebugOverlaySettings.json, regardless of whether either
+// folder's fingerprint looks unchanged from last time. For the Config
+// section's "Manually Index Files" button (GraphicsDebugOverlay.m):
+// +ensureIndexUpToDate's fingerprint short-circuit (see this file's own
+// header) is a coarse (file count, total byte size, newest mod date)
+// heuristic, so this gives the person a way to force a real rebuild by
+// hand - e.g. right after installing/updating the game, or if a
+// same-count/same-size swap happens to net out to the exact fingerprint
+// collision that method's own header already calls out as its one
+// accepted false negative. Safe to call from a background thread, same
+// as +ensureIndexUpToDate; blocks for as long as the CAB parse pass
+// takes (thousands of cached files can mean several seconds), so
+// callers on the main thread should still hop off it first.
++ (void)forceReindex;
+
 // Cached equivalent of the old +[UnityCacheLocator
 // allBundlePathsForCAB:] live scan - every Library/UnityCache/Shared
 // path this index currently has on file for `cab`, newest-modified

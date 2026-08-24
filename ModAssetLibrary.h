@@ -38,6 +38,7 @@ typedef NS_ENUM(NSInteger, ModAssetLibraryErrorCode) {
     ModAssetLibraryErrorManifestWriteFailed,
     ModAssetLibraryErrorDeleteFailed,
     ModAssetLibraryErrorEntryNotFound,          // +updateDoctorStateForEntry:... couldn't find a manifest row matching entry.path
+    ModAssetLibraryErrorCABNotIndexed,          // every candidate file/entry was rejected outright because its CAB id had no match in GDFileIndex - see +importFileURLs:.../+importLunartiqueZipURL:... below
 };
 
 // Where one entry sits in the (new, opt-in) manual dispatch flow for the
@@ -306,12 +307,33 @@ typedef NS_ENUM(NSInteger, ModAssetLibraryDoctorStatus) {
 //     renamed on collision by appending " 2", " 3", ... before the
 //     extension - never silently overwrites an existing tracked file.
 //
-// Partial success is possible (some files copy, one doesn't) - this
-// still returns YES if at least one file made it in, with the failures
-// logged via ZLog rather than aborting the whole import over one bad
-// file. Returns NO only if folderName itself doesn't exist or the
-// manifest couldn't be written back at all.
-+ (BOOL)importFileURLs:(NSArray<NSURL *> *)moddedURLs intoFolder:(NSString *)folderName error:(NSError **)error;
+// A file whose header parses as a UnityFS bundle is additionally
+// required to resolve against GDFileIndex.h's own CAB -> cached-path
+// map (read via +[UnityCacheLocator locateBundlePathForCAB:error:],
+// which prefers that index and only live-scans if it hasn't been built
+// yet this session - see that method's own header) before it's allowed
+// in at all: a bundle whose CAB can't even be read, OR whose CAB reads
+// fine but has no match in the index, is rejected outright rather than
+// imported unresolved/flagged-for-later the way this used to work.
+// Rejected files never touch folderName or its manifest. rejectedFileLines,
+// when non-NULL, is set to one human-readable "<filename>: rejected - ..."
+// line per rejected file (same wording +importLunartiqueZipURL:...
+// below uses for its own per-entry rejections) - nil if nothing was
+// rejected. This gate does not apply to a non-bundle file (e.g. a
+// .bank) - those are placed exactly as before.
+//
+// Partial success is possible (some files copy, one doesn't, one gets
+// rejected for an unindexed CAB) - this still returns YES if at least
+// one file made it in, with plain copy failures logged via ZLog rather
+// than aborting the whole import over one bad file. Returns NO only if
+// folderName itself doesn't exist, the manifest couldn't be written
+// back at all, or every candidate file was rejected (in which case
+// error is filled with ModAssetLibraryErrorCABNotIndexed when that was
+// the reason).
++ (BOOL)importFileURLs:(NSArray<NSURL *> *)moddedURLs
+             intoFolder:(NSString *)folderName
+        rejectedFileLines:(NSArray<NSString *> * _Nullable * _Nullable)rejectedFileLines
+                  error:(NSError **)error;
 
 // Lunartique-format zip import (see LunartiqueModArchive.h). Validates
 // zipURL via +[LunartiqueModArchive isLunartiqueFormatZipAtURL:error:]
@@ -327,21 +349,23 @@ typedef NS_ENUM(NSInteger, ModAssetLibraryDoctorStatus) {
 // this doesn't assume exactly one): extracts __data to a temp file,
 // classifies/imports it exactly like +importFileURLs:intoFolder:error:
 // would (same CAB-subfolder placement, same CAB/target-platform reads,
-// same up-front UnityCacheLocator search for resolvedInstallTargetPath)
-// - EXCEPT that when that search finds no live match, this does NOT
-// leave livePathDescription/resolvedInstallTargetPath simply nil the
-// way a plain bundle import does. Per the person's own spec: the
-// entry's zipCacheHash1/zipCacheHash2 are set from the zip's own
-// Installation-side path (for the download-time synthesis fallback -
-// see ModAssetLibraryEntry's own header on those two fields), and
-// livePathDescription is set to a generic, clearly-labeled placeholder
-// string rather than staying nil, so the Mods panel's Filepath row
-// shows something rather than looking broken/unset. Once an entry with
-// a real resolvedInstallTargetPath (a genuine cache match), the
-// placeholder is never used - same "resolvedInstallTargetPath found
-// something real" path as +importFileURLs:intoFolder:error: already
-// has.
-+ (BOOL)importLunartiqueZipURL:(NSURL *)zipURL intoFolder:(NSString *)folderName error:(NSError **)error;
+// same up-front UnityCacheLocator search for resolvedInstallTargetPath).
+//
+// As of the person's own "reject outright" spec, an extracted __data
+// that doesn't parse as UnityFS at all, whose CAB can't be read, or
+// whose CAB reads fine but has no match in GDFileIndex, is no longer
+// imported flagged-unresolved with a placeholder livePathDescription
+// for a later download-time synthesis attempt - that entry is skipped
+// entirely instead, and gets its own line (same wording
+// +importFileURLs:intoFolder:error: uses) appended to rejectedEntryLines
+// when non-NULL. zipCacheHash1/zipCacheHash2 and
+// kMALLunartiqueUnresolvedPlaceholder therefore only ever populate an
+// entry actually written before this change shipped - nothing new
+// imported through this method leaves an entry unresolved.
++ (BOOL)importLunartiqueZipURL:(NSURL *)zipURL
+                    intoFolder:(NSString *)folderName
+             rejectedEntryLines:(NSArray<NSString *> * _Nullable * _Nullable)rejectedEntryLines
+                         error:(NSError **)error;
 
 // Removes one entry's on-disk file and its manifest.json record. For a
 // bundle-kind entry (see +importFileURLs:intoFolder:error:) whose file

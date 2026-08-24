@@ -181,6 +181,45 @@ static BOOL s_hasIndex = NO;
     }
 }
 
++ (void)forceReindex {
+    @synchronized (self) {
+        NSArray<NSString *> *unityRoots = [UnityCacheLocator unityCacheSharedDirectories];
+        NSDictionary *currentUnityFP = [self gdfi_fingerprintForRoots:unityRoots];
+
+        NSString *fmodDir = [BankTransplant mobileFMODBuildsDirectory];
+        NSDictionary *currentFMODFP = [self gdfi_fingerprintForRoots:fmodDir ? @[fmodDir] : @[]];
+
+        // Both passes always run here, unlike +ensureIndexUpToDate -
+        // that's the entire point of this method (see this file's own
+        // header on why the fingerprint short-circuit sometimes needs
+        // to be bypassed by hand).
+        NSDictionary<NSString *, NSArray<NSString *> *> *cabMap = [self gdfi_buildCABMapForRoots:unityRoots];
+        NSArray<NSString *> *fmodNamesArr = fmodDir ? ([NSFileManager.defaultManager contentsOfDirectoryAtPath:fmodDir error:nil] ?: @[]) : @[];
+
+        s_cabMap = cabMap;
+        s_fmodNames = [NSSet setWithArray:fmodNamesArr];
+        s_hasIndex = YES;
+
+        // Always rewritten here (unlike +ensureIndexUpToDate, which
+        // skips the write when nothing changed) - the person tapped a
+        // button specifically to force this, so the on-disk snapshot's
+        // timestamp/content should reflect that even if it happens to
+        // come out identical to what was already there.
+        NSDictionary *snapshot = @{
+            @"unityCacheFingerprint": currentUnityFP,
+            @"fmodFingerprint": currentFMODFP,
+            @"unityCacheCABMap": cabMap,
+            @"fmodFileNames": fmodNamesArr,
+        };
+        gd_set_file_index_snapshot(snapshot);
+
+        NSUInteger totalIndexedFiles = 0;
+        for (NSArray<NSString *> *paths in cabMap.allValues) totalIndexedFiles += paths.count;
+        ZLog(@"[GDFileIndex] manual re-index forced: %lu CAB(s) across %lu file(s), %lu FMOD file name(s)",
+             (unsigned long)cabMap.count, (unsigned long)totalIndexedFiles, (unsigned long)fmodNamesArr.count);
+    }
+}
+
 + (nullable NSArray<NSString *> *)cachedPathsForCAB:(NSString *)cab {
     if (!s_hasIndex) return nil;
     NSArray<NSString *> *paths = s_cabMap[cab];
