@@ -1,0 +1,225 @@
+name: Bisect - Build Every Commit
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_ref:
+        description: 'Build every commit reachable from this ref'
+        required: false
+        default: 'main'
+      since_ref:
+        description: 'Optional: only include commits after this ref/SHA (leave empty for full history)'
+        required: false
+        default: ''
+
+env:
+  LZ4_REF: v1.10.0
+
+jobs:
+  discover-commits:
+    runs-on: ubuntu-latest
+    outputs:
+      commits: ${{ steps.list.outputs.commits }}
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.base_ref }}
+
+      - name: List commit SHAs oldest-first
+        id: list
+        run: |
+          set -euo pipefail
+          if [ -n "${{ inputs.since_ref }}" ]; then
+            RANGE="${{ inputs.since_ref }}..HEAD"
+          else
+            RANGE="HEAD"
+          fi
+          SHAS=$(git log --format=%H "$RANGE" | tac)
+          COUNT=$(echo "$SHAS" | wc -l | tr -d ' ')
+          echo "Found $COUNT commits in range - will build sequentially in this order"
+          JSON=$(printf '%s\n' "$SHAS" | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          echo "commits=$JSON" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: discover-commits
+    runs-on: macos-26
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.base_ref }}
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app
+
+      - name: Resolve iOS SDK path
+        id: sdk
+        run: echo "path=$(xcrun --sdk iphoneos --show-sdk-path)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache LZ4 reference library
+        id: lz4-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            lz4.h
+            lz4.c
+            lz4hc.h
+            lz4hc.c
+            lz4-checksums.txt
+          key: lz4-${{ env.LZ4_REF }}
+
+      - name: Fetch LZ4 reference library
+        if: steps.lz4-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          BASE="https://raw.githubusercontent.com/lz4/lz4/${LZ4_REF}/lib"
+          for f in lz4.h lz4.c lz4hc.h lz4hc.c; do
+            curl -fsSL "${BASE}/${f}" -o "$f"
+          done
+          shasum -a 256 lz4.h lz4.c lz4hc.h lz4hc.c > lz4-checksums.txt
+          shasum -a 256 -c lz4-checksums.txt
+
+      - name: Verify cached LZ4 checksums
+        if: steps.lz4-cache.outputs.cache-hit == 'true'
+        run: shasum -a 256 -c lz4-checksums.txt
+
+      - name: Build every commit sequentially
+        id: build
+        run: |
+          set +e
+          set -u
+          set -o pipefail
+
+          COMMITS='${{ needs.discover-commits.outputs.commits }}'
+          mkdir -p results/dylibs results/logs
+
+          {
+            echo "index,short_sha,full_sha,status,note"
+          } > results/manifest.csv
+
+          {
+            echo "| # | Commit | Status | Note |"
+            echo "|---|--------|--------|------|"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          build_commit() {
+            local full_sha="$1"
+            local idx="$2"
+            local short_sha
+            short_sha=$(git rev-parse --short=12 "$full_sha")
+            local label
+            label=$(printf '%04d' "$idx")
+
+            echo "::group::[$label] $short_sha"
+
+            if ! git checkout --quiet --force "$full_sha"; then
+              echo "checkout failed"
+              echo "$idx,$short_sha,$full_sha,failed,checkout error" >> results/manifest.csv
+              echo "| $idx | $short_sha | FAILED | checkout error |" >> "$GITHUB_STEP_SUMMARY"
+              echo "::endgroup::"
+              return
+            fi
+
+            local src_files
+            src_files=$(find . -name '*.m' -not -path './.git/*' -not -path './.github/*' | sort)
+            if [ -z "$src_files" ]; then
+              echo "no .m source files - skipping"
+              echo "$idx,$short_sha,$full_sha,skipped,no source files at this commit" >> results/manifest.csv
+              echo "| $idx | $short_sha | SKIPPED | no source files |" >> "$GITHUB_STEP_SUMMARY"
+              echo "::endgroup::"
+              return
+            fi
+
+            local include_dirs include_flags
+            include_dirs=$(find . -type d -not -path './.git*' -not -path './.github*' | sort)
+            include_flags=$(printf -- '-I%s ' $include_dirs)
+
+            local sectcreate_flag="" resource_path
+            resource_path=$(find . -name 'Enkephalin.gif' -not -path './.git/*' | head -n1)
+            if [ -n "$resource_path" ]; then
+              sectcreate_flag="-Wl,-sectcreate,__DATA,__enkephalin,${resource_path#./}"
+            fi
+
+            local output="results/dylibs/${label}-${short_sha}.dylib"
+            local log="results/logs/${label}-${short_sha}.log"
+
+            clang \
+              -dynamiclib \
+              -O2 \
+              -fobjc-arc \
+              -fmodules \
+              -isysroot "${{ steps.sdk.outputs.path }}" \
+              -arch arm64 \
+              -miphoneos-version-min=15.0 \
+              -DZS_BUILD_NUMBER=${{ github.run_number }} \
+              -DZS_BUILD_CHANNEL=bisect \
+              -DZS_BUILD_BRANCH="\"$short_sha\"" \
+              -framework Foundation \
+              -framework UIKit \
+              -framework QuartzCore \
+              -framework CoreText \
+              -framework ImageIO \
+              -framework UniformTypeIdentifiers \
+              -framework Security \
+              -lcompression \
+              -lc++ \
+              -stdlib=libc++ \
+              -install_name "@rpath/ZSingularity.dylib" \
+              -Wl,-ld_classic \
+              $sectcreate_flag \
+              $include_flags \
+              $src_files \
+              lz4.c \
+              lz4hc.c \
+              -o "$output" > "$log" 2>&1
+            local status=$?
+
+            if [ $status -ne 0 ]; then
+              echo "compile failed (exit $status) - see $log"
+              rm -f "$output"
+              echo "$idx,$short_sha,$full_sha,failed,compile error exit $status" >> results/manifest.csv
+              echo "| $idx | $short_sha | FAILED | compile error |" >> "$GITHUB_STEP_SUMMARY"
+              echo "::endgroup::"
+              return
+            fi
+
+            codesign -f -s - "$output"
+            rm -f "$log"
+            echo "built $output"
+            echo "$idx,$short_sha,$full_sha,ok," >> results/manifest.csv
+            echo "| $idx | $short_sha | ok | |" >> "$GITHUB_STEP_SUMMARY"
+            echo "::endgroup::"
+          }
+
+          INDEX=1
+          echo "$COMMITS" | jq -r '.[]' | while read -r sha; do
+            build_commit "$sha" "$INDEX"
+            INDEX=$((INDEX + 1))
+          done
+
+      - name: Publish bisect release
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          REPO="${{ github.repository }}"
+          TAG="bisect-all-${{ github.run_number }}"
+          ASSETS=(results/manifest.csv)
+          if compgen -G "results/dylibs/*.dylib" > /dev/null; then
+            ASSETS+=(results/dylibs/*.dylib)
+          fi
+          if compgen -G "results/logs/*.log" > /dev/null; then
+            (cd results/logs && zip -q ../failed-build-logs.zip *.log)
+            ASSETS+=(results/failed-build-logs.zip)
+          fi
+          gh release create "$TAG" "${ASSETS[@]}" \
+            --repo "$REPO" \
+            --title "Bisect batch build ${{ github.run_number }}" \
+            --notes "Every commit built in order, oldest first. Filenames are <index>-<short-sha>.dylib so sorting by name gives you the exact commit sequence. manifest.csv lists ok/failed/skipped per commit; failed-build-logs.zip has the clang output for anything that didn't compile." \
+            --prerelease
